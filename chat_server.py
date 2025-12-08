@@ -2,6 +2,61 @@ import argparse
 import socket
 import threading
 from datetime import datetime
+import sqlite3
+import time
+import os
+import base64
+import hmac
+import hashlib
+import json
+
+
+class UnreadStore:
+    def __init__(self):
+        self._mem = {}
+        self._client = None
+        url = os.environ.get("REDIS_URL")
+        if url:
+            try:
+                import redis
+                self._client = redis.Redis.from_url(url)
+            except Exception:
+                self._client = None
+
+    def inc(self, user: str, conv: str):
+        if self._client:
+            try:
+                self._client.hincrby(f"unread:{user}", conv, 1)
+                return
+            except Exception:
+                pass
+        m = self._mem.setdefault(user, {})
+        m[conv] = m.get(conv, 0) + 1
+
+    def reset(self, user: str, conv: str):
+        if self._client:
+            try:
+                self._client.hset(f"unread:{user}", conv, 0)
+                return
+            except Exception:
+                pass
+        m = self._mem.setdefault(user, {})
+        m[conv] = 0
+
+    def all(self, user: str):
+        if self._client:
+            try:
+                d = self._client.hgetall(f"unread:{user}")
+                out = {}
+                for k, v in d.items():
+                    try:
+                        out[k.decode("utf-8")] = int(v)
+                    except Exception:
+                        pass
+                return out
+            except Exception:
+                pass
+        return dict(self._mem.get(user, {}))
 
 
 class Hub:
@@ -9,6 +64,7 @@ class Hub:
         self.rooms = {}
         self.conn_info = {}
         self.lock = threading.Lock()
+        self.store = UnreadStore()
 
     def add(self, conn: socket.socket, username: str, room: str):
         with self.lock:
@@ -37,17 +93,21 @@ class Hub:
 
     def broadcast_text(self, room: str, origin: socket.socket, username: str, text: str):
         msg = f"{username}> {text}\n".encode("utf-8")
-        to_send = []
+        targets = []
         with self.lock:
-            for c in list(self.rooms.get(room, {}).keys()):
+            m = self.rooms.get(room, {})
+            for c, u in list(m.items()):
                 if c is origin:
                     continue
-                to_send.append(c)
-        for c in to_send:
+                targets.append((c, u))
+        for c, u in targets:
             try:
                 c.sendall(msg)
             except Exception:
                 pass
+        save_message(conv_group(room), username, text)
+        for _, u in targets:
+            self.store.inc(u, conv_group(room))
 
     def broadcast_sys(self, room: str, line: str):
         payload = (line + "\n").encode("utf-8")
@@ -63,11 +123,161 @@ class Hub:
         users = ",".join(self.users(room))
         self.broadcast_sys(room, f"[SYS] USERS {room} {users}")
 
+    def send_dm(self, room: str, origin: socket.socket, origin_user: str, target_user: str, text: str):
+        targets = []
+        with self.lock:
+            for c, u in self.rooms.get(room, {}).items():
+                if u == target_user:
+                    targets.append(c)
+        payload_target = f"[DM] FROM {origin_user} {text}\n".encode("utf-8")
+        payload_origin = f"[DM] TO {target_user} {text}\n".encode("utf-8")
+        for c in targets:
+            try:
+                c.sendall(payload_target)
+            except Exception:
+                pass
+        try:
+            origin.sendall(payload_origin)
+        except Exception:
+            pass
+        save_message(conv_dm(origin_user, target_user), origin_user, text)
+        self.store.inc(target_user, conv_dm(origin_user, target_user))
+
+    def _unread_inc(self, user: str, conv: str):
+        self.store.inc(user, conv)
+
+    def _unread_reset(self, user: str, conv: str):
+        self.store.reset(user, conv)
+
+    def _unread_all(self, user: str):
+        return self.store.all(user)
+
+
+DB_PATH = os.path.join(os.getcwd(), "chat_history.db")
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.execute(
+    "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conv TEXT, sender TEXT, ts INTEGER, text TEXT)"
+)
+db.commit()
+
+def conv_group(room: str):
+    return f"group:{room}"
+
+def conv_dm(a: str, b: str):
+    x, y = sorted([a, b])
+    return f"dm:{x}&{y}"
+
+def save_message(conv: str, sender: str, text: str):
+    try:
+        ts = int(time.time())
+        db.execute("INSERT INTO messages (conv, sender, ts, text) VALUES (?,?,?,?)", (conv, sender, ts, text))
+        db.commit()
+    except Exception:
+        pass
+
+def load_recent(conv: str, limit: int):
+    try:
+        cur = db.execute("SELECT sender, ts, text FROM messages WHERE conv=? ORDER BY id DESC LIMIT ?", (conv, limit))
+        rows = cur.fetchall()
+        rows.reverse()
+        return rows
+    except Exception:
+        return []
+
 
 def handle_client(conn: socket.socket, addr, hub: Hub):
     f = conn.makefile("r", encoding="utf-8", newline="\n")
     username = addr[0]
     room = "general"
+    def parse_dm(line: str):
+        s = line.strip()
+        if not s:
+            return None
+        if s[:2].upper() == "DM" and (len(s) == 2 or s[2] == " "):
+            parts = s.split(" ", 2)
+            if len(parts) >= 3 and parts[1]:
+                return (parts[1], parts[2])
+        return None
+    def parse_seq(line: str):
+        s = line.strip()
+        if s.startswith("SEQ "):
+            parts = s.split(" ", 2)
+            if len(parts) >= 2:
+                try:
+                    n = int(parts[1])
+                except Exception:
+                    n = None
+                rest = parts[2] if len(parts) >= 3 else ""
+                return (n, rest)
+        return (None, line)
+    def parse_hist(line: str):
+        s = line.strip()
+        if s.startswith("HIST "):
+            parts = s.split()
+            if len(parts) >= 2 and parts[1].upper() == "GROUP":
+                n = int(parts[2]) if len(parts) >= 3 else 50
+                return ("GROUP", room, n)
+            if len(parts) >= 3 and parts[1].upper() == "DM":
+                peer = parts[2]
+                n = int(parts[3]) if len(parts) >= 4 else 50
+                return ("DM", peer, n)
+        return None
+    def parse_unread(line: str):
+        s = line.strip()
+        if s.upper() == "UNREAD":
+            return True
+        return False
+    def parse_read(line: str):
+        s = line.strip()
+        if s.startswith("READ "):
+            parts = s.split()
+            if len(parts) >= 2 and parts[1].upper() == "GROUP":
+                return ("GROUP", room)
+            if len(parts) >= 3 and parts[1].upper() == "DM":
+                return ("DM", parts[2])
+        return None
+    SECRET = os.environ.get("CHAT_SECRET")
+    JWT_SECRET = os.environ.get("JWT_SECRET")
+    authed = (SECRET is None and JWT_SECRET is None)
+
+    def b64url_decode(s: str):
+        pad = "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s + pad)
+
+    def try_auth(body: str):
+        if JWT_SECRET and body.startswith("AUTH_JWT "):
+            token = body.split(" ", 1)[1]
+            parts = token.split(".")
+            if len(parts) != 3:
+                return None
+            try:
+                header = json.loads(b64url_decode(parts[0]).decode("utf-8"))
+                payload = json.loads(b64url_decode(parts[1]).decode("utf-8"))
+            except Exception:
+                return None
+            if header.get("alg") != "HS256":
+                return None
+            mac = hmac.new(JWT_SECRET.encode("utf-8"), (parts[0] + "." + parts[1]).encode("utf-8"), hashlib.sha256).digest()
+            sig = base64.urlsafe_b64encode(mac).rstrip(b"=")
+            if not hmac.compare_digest(sig, parts[2].encode("utf-8")):
+                return None
+            sub = payload.get("sub")
+            if not sub:
+                return None
+            return (sub, True)
+        if SECRET and body.startswith("AUTH "):
+            parts = body.split()
+            if len(parts) >= 4:
+                user = parts[1]
+                ts = parts[2]
+                mac_hex = parts[3]
+                want = hmac.new(SECRET.encode("utf-8"), f"{user}:{ts}".encode("utf-8"), hashlib.sha256).hexdigest()
+                if hmac.compare_digest(want, mac_hex):
+                    return (user, True)
+            # legacy: full secret
+            if body.strip() == f"AUTH {SECRET}":
+                return (username, True)
+        return None
     try:
         first = f.readline()
         if first.startswith("HELLO "):
@@ -77,17 +287,150 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                 room = parts[2] or "general"
             else:
                 username = first[len("HELLO ") :].rstrip("\n") or addr[0]
+            hub.add(conn, username, room)
+            print(f"joined {username}@{addr[0]}:{addr[1]} room={room}")
         else:
             text = first.rstrip("\n")
             hub.add(conn, username, room)
             print(f"joined {username}@{addr[0]}:{addr[1]} room={room}")
             if text:
-                hub.broadcast_text(room, conn, username, text)
+                seq, body = parse_seq(text)
+                if body.startswith("PING "):
+                    try:
+                        conn.sendall(("PONG " + body[5:] + "\n").encode("utf-8"))
+                    except Exception:
+                        pass
+                else:
+                    do_process = True
+                    if not authed:
+                        auth_res = try_auth(body)
+                        if auth_res:
+                            username, authed = auth_res[0], True
+                        else:
+                            do_process = False
+                            if seq is not None:
+                                try:
+                                    conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
+                                except Exception:
+                                    pass
+                    if do_process:
+                        h = parse_hist(body)
+                        if h:
+                            kind, p, n = h
+                            if kind == "GROUP":
+                                for sender, ts, txt in load_recent(conv_group(room), n):
+                                    try:
+                                        conn.sendall(f"[SYS] HISTORY GROUP {room} {sender} {ts} {txt}\n".encode("utf-8"))
+                                    except Exception:
+                                        pass
+                            else:
+                                for sender, ts, txt in load_recent(conv_dm(username, p), n):
+                                    try:
+                                        conn.sendall(f"[SYS] HISTORY DM {p} {sender} {ts} {txt}\n".encode("utf-8"))
+                                    except Exception:
+                                        pass
+                        else:
+                            if parse_unread(body):
+                                for conv, cnt in hub._unread_all(username).items():
+                                    try:
+                                        conn.sendall(f"[SYS] UNREAD {conv} {cnt}\n".encode("utf-8"))
+                                    except Exception:
+                                        pass
+                            else:
+                                r = parse_read(body)
+                                if r:
+                                    kind, p = r
+                                    if kind == "GROUP":
+                                        hub._unread_reset(username, conv_group(room))
+                                    else:
+                                        hub._unread_reset(username, conv_dm(username, p))
+                                else:
+                                    dm = parse_dm(body)
+                                    if dm:
+                                        target, payload = dm
+                                        hub.send_dm(room, conn, username, target, payload)
+                                    else:
+                                        if body.startswith("MSG "):
+                                            hub.broadcast_text(room, conn, username, body[4:])
+                                        else:
+                                            hub.broadcast_text(room, conn, username, body)
+                    if seq is not None and do_process:
+                        try:
+                            conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
+                        except Exception:
+                            pass
             for line in f:
                 t = line.rstrip("\n")
                 if not t:
                     continue
-                hub.broadcast_text(room, conn, username, t)
+                seq, body = parse_seq(t)
+                if body.startswith("PING "):
+                    try:
+                        conn.sendall(("PONG " + body[5:] + "\n").encode("utf-8"))
+                    except Exception:
+                        pass
+                    continue
+                if not authed:
+                    auth_res = try_auth(body)
+                    if auth_res:
+                        username, authed = auth_res[0], True
+                    else:
+                        if seq is not None:
+                            try:
+                                conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
+                            except Exception:
+                                pass
+                        continue
+                h = parse_hist(body)
+                if h:
+                    kind, p, n = h
+                    if kind == "GROUP":
+                        for sender, ts, txt in load_recent(conv_group(room), n):
+                            try:
+                                conn.sendall(f"[SYS] HISTORY GROUP {room} {sender} {ts} {txt}\n".encode("utf-8"))
+                            except Exception:
+                                pass
+                    else:
+                        for sender, ts, txt in load_recent(conv_dm(username, p), n):
+                            try:
+                                conn.sendall(f"[SYS] HISTORY DM {p} {sender} {ts} {txt}\n".encode("utf-8"))
+                            except Exception:
+                                pass
+                    if seq is not None:
+                        try:
+                            conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
+                        except Exception:
+                            pass
+                    continue
+                if parse_unread(body):
+                    for conv, cnt in hub._unread_all(username).items():
+                        try:
+                            conn.sendall(f"[SYS] UNREAD {conv} {cnt}\n".encode("utf-8"))
+                        except Exception:
+                            pass
+                else:
+                    r = parse_read(body)
+                    if r:
+                        kind, p = r
+                        if kind == "GROUP":
+                            hub._unread_reset(username, conv_group(room))
+                        else:
+                            hub._unread_reset(username, conv_dm(username, p))
+                    else:
+                        dm = parse_dm(body)
+                        if dm:
+                            target, payload = dm
+                            hub.send_dm(room, conn, username, target, payload)
+                        else:
+                            if body.startswith("MSG "):
+                                hub.broadcast_text(room, conn, username, body[4:])
+                            else:
+                                hub.broadcast_text(room, conn, username, body)
+                if seq is not None:
+                    try:
+                        conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
+                    except Exception:
+                        pass
             return
         hub.add(conn, username, room)
         print(f"joined {username}@{addr[0]}:{addr[1]} room={room}")
@@ -95,7 +438,74 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
             t = line.rstrip("\n")
             if not t:
                 continue
-            hub.broadcast_text(room, conn, username, t)
+            seq, body = parse_seq(t)
+            if body.startswith("PING "):
+                try:
+                    conn.sendall(("PONG " + body[5:] + "\n").encode("utf-8"))
+                except Exception:
+                    pass
+                continue
+            if not authed:
+                auth_res = try_auth(body)
+                if auth_res:
+                    username, authed = auth_res[0], True
+                else:
+                    if seq is not None:
+                        try:
+                            conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
+                        except Exception:
+                            pass
+                    continue
+            h = parse_hist(body)
+            if h:
+                kind, p, n = h
+                if kind == "GROUP":
+                    for sender, ts, txt in load_recent(conv_group(room), n):
+                        try:
+                            conn.sendall(f"[SYS] HISTORY GROUP {room} {sender} {ts} {txt}\n".encode("utf-8"))
+                        except Exception:
+                            pass
+                else:
+                    for sender, ts, txt in load_recent(conv_dm(username, p), n):
+                        try:
+                            conn.sendall(f"[SYS] HISTORY DM {p} {sender} {ts} {txt}\n".encode("utf-8"))
+                        except Exception:
+                            pass
+                if seq is not None:
+                    try:
+                        conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
+                    except Exception:
+                        pass
+                continue
+            if parse_unread(body):
+                for conv, cnt in hub._unread_all(username).items():
+                    try:
+                        conn.sendall(f"[SYS] UNREAD {conv} {cnt}\n".encode("utf-8"))
+                    except Exception:
+                        pass
+            else:
+                r = parse_read(body)
+                if r:
+                    kind, p = r
+                    if kind == "GROUP":
+                        hub._unread_reset(username, conv_group(room))
+                    else:
+                        hub._unread_reset(username, conv_dm(username, p))
+                else:
+                    dm = parse_dm(body)
+                    if dm:
+                        target, payload = dm
+                        hub.send_dm(room, conn, username, target, payload)
+                    else:
+                        if body.startswith("MSG "):
+                            hub.broadcast_text(room, conn, username, body[4:])
+                        else:
+                            hub.broadcast_text(room, conn, username, body)
+            if seq is not None:
+                try:
+                    conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
+                except Exception:
+                    pass
     except Exception:
         pass
     finally:
