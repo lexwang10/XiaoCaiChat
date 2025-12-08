@@ -45,6 +45,8 @@ class ChatModel(QtCore.QAbstractListModel):
     FileNameRole = QtCore.Qt.UserRole + 7
     MimeRole = QtCore.Qt.UserRole + 8
     AvatarRole = QtCore.Qt.UserRole + 9
+    SelStartRole = QtCore.Qt.UserRole + 10
+    SelEndRole = QtCore.Qt.UserRole + 11
 
     def __init__(self):
         super().__init__()
@@ -76,6 +78,10 @@ class ChatModel(QtCore.QAbstractListModel):
             return item.get("mime")
         if role == ChatModel.AvatarRole:
             return item.get("avatar")
+        if role == ChatModel.SelStartRole:
+            return item.get("sel_start")
+        if role == ChatModel.SelEndRole:
+            return item.get("sel_end")
         return None
 
     def add(self, kind: str, sender: str, text: str, is_self: bool, avatar: Optional[QtGui.QPixmap] = None):
@@ -114,6 +120,20 @@ class ChatModel(QtCore.QAbstractListModel):
             del self.items[row]
             self.endRemoveRows()
 
+    def set_selection(self, row: int, start: int, end: int):
+        if 0 <= row < len(self.items):
+            self.items[row]["sel_start"] = start
+            self.items[row]["sel_end"] = end
+            idx = self.index(row)
+            self.dataChanged.emit(idx, idx)
+
+    def clear_selection(self, row: int):
+        if 0 <= row < len(self.items):
+            if "sel_start" in self.items[row] or "sel_end" in self.items[row]:
+                self.items[row].pop("sel_start", None)
+                self.items[row].pop("sel_end", None)
+                idx = self.index(row)
+                self.dataChanged.emit(idx, idx)
     def set_sender_avatar(self, name: str, pixmap: QtGui.QPixmap):
         changed_start = None
         changed_end = None
@@ -188,10 +208,19 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             return
         maxw = int(r.width() * 0.65)
         fm = option.fontMetrics
-        br = fm.boundingRect(0, 0, maxw, 0, QtCore.Qt.TextWordWrap, text)
+        doc = QtGui.QTextDocument()
+        opt = QtGui.QTextOption()
+        opt.setWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        doc.setDefaultFont(option.font)
+        doc.setDefaultTextOption(opt)
+        doc.setDocumentMargin(0)
+        w0 = fm.horizontalAdvance(text)
+        text_w = min(w0, maxw)
+        doc.setTextWidth(text_w)
+        doc.setPlainText(text)
         pad = 12
-        bubble_w = br.width() + pad * 2
-        bubble_h = br.height() + pad * 2
+        bubble_w = int(text_w) + pad * 2
+        bubble_h = int(doc.size().height()) + pad * 2
         margin = 10
         avatar_size = 22
         avatar_pad = 8
@@ -212,7 +241,23 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         painter.drawRoundedRect(bubble_rect, 12, 12)
         painter.setPen(text_color)
         text_rect = bubble_rect.adjusted(pad, pad, -pad, -pad)
-        painter.drawText(text_rect, QtCore.Qt.TextWordWrap | align, text)
+        painter.save()
+        painter.translate(text_rect.topLeft())
+        ctx = QtGui.QAbstractTextDocumentLayout.PaintContext()
+        sel_start = index.data(ChatModel.SelStartRole) or None
+        sel_end = index.data(ChatModel.SelEndRole) or None
+        if isinstance(sel_start, int) and isinstance(sel_end, int) and sel_end != sel_start:
+            s = QtGui.QAbstractTextDocumentLayout.Selection()
+            cur = QtGui.QTextCursor(doc)
+            cur.setPosition(sel_start)
+            cur.setPosition(sel_end, QtGui.QTextCursor.KeepAnchor)
+            s.cursor = cur
+            fmt = QtGui.QTextCharFormat()
+            fmt.setBackground(QtGui.QBrush(QtGui.QColor(255, 255, 0, 120)))
+            s.format = fmt
+            ctx.selections = [s]
+        doc.documentLayout().draw(painter, ctx)
+        painter.restore()
         name_color = QtGui.QColor(120, 120, 120)
         painter.setPen(name_color)
         name_y = bubble_rect.top() - 4
@@ -252,10 +297,19 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             return QtCore.QSize(option.rect.width(), h)
         fm = option.fontMetrics
         maxw = int(option.rect.width() * 0.65)
-        br = fm.boundingRect(0, 0, maxw, 0, QtCore.Qt.TextWordWrap, text)
+        doc = QtGui.QTextDocument()
+        opt = QtGui.QTextOption()
+        opt.setWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        doc.setDefaultFont(option.font)
+        doc.setDefaultTextOption(opt)
+        doc.setDocumentMargin(0)
+        w0 = fm.horizontalAdvance(text)
+        text_w = min(w0, maxw)
+        doc.setTextWidth(text_w)
+        doc.setPlainText(text)
         is_self = bool(index.data(ChatModel.SelfRole))
         pad = 12
-        bubble_h = br.height() + pad * 2
+        bubble_h = int(doc.size().height()) + pad * 2
         extra_top = 0 if is_self else fm.height()
         extra_bottom = fm.height()
         spacing = 16
@@ -293,6 +347,9 @@ class ChatWindow(QtWidgets.QWidget):
         self.setWindowTitle(f"群聊 - {username} @ {host}:{port} / {room}")
         self.view = QtWidgets.QListView()
         self.view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.view.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
+        self.view.setUniformItemSizes(False)
         self.conv_models = {}
         self.current_model = None
         self.view.setItemDelegate(BubbleDelegate())
@@ -301,14 +358,20 @@ class ChatWindow(QtWidgets.QWidget):
         self.view.viewport().setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.view.viewport().customContextMenuRequested.connect(self.on_view_context_menu)
         self.view.viewport().installEventFilter(self)
+        self.view.doubleClicked.connect(self.on_view_double_click)
+        try:
+            self.view.setMouseTracking(True)
+            self.view.viewport().setMouseTracking(True)
+        except Exception:
+            pass
+        self.copy_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Copy, self.view)
+        self.copy_shortcut.activated.connect(self.copy_selected)
         self.conv_list = QtWidgets.QListWidget()
         self.conv_list.setIconSize(QtCore.QSize(24, 24))
         self.entry = QtWidgets.QLineEdit()
         self.send_btn = QtWidgets.QPushButton("发送")
-        self.dm_label = QtWidgets.QLabel("私聊对象：无")
-        self.clear_dm_btn = QtWidgets.QPushButton("清除私聊")
         self.send_file_btn = QtWidgets.QPushButton("发送文件")
-        for b in (self.send_btn, self.clear_dm_btn, self.send_file_btn):
+        for b in (self.send_btn, self.send_file_btn):
             try:
                 b.setAttribute(QtCore.Qt.WA_MacSmallSize, True)
                 b.setMaximumHeight(28)
@@ -321,18 +384,12 @@ class ChatWindow(QtWidgets.QWidget):
                 pass
         layout = QtWidgets.QHBoxLayout()
         left = QtWidgets.QVBoxLayout()
-        left.addWidget(QtWidgets.QLabel("会话"))
         left.addWidget(self.conv_list, 1)
         left_container = QtWidgets.QWidget()
         left_container.setLayout(left)
         layout.addWidget(left_container, 2)
         right = QtWidgets.QVBoxLayout()
         right.addWidget(self.view, 5)
-        info = QtWidgets.QHBoxLayout()
-        info.addWidget(self.dm_label)
-        info.addStretch(1)
-        info.addWidget(self.clear_dm_btn)
-        right.addLayout(info)
         h = QtWidgets.QHBoxLayout()
         h.addWidget(self.entry)
         h.addWidget(self.send_btn)
@@ -345,7 +402,6 @@ class ChatWindow(QtWidgets.QWidget):
 
         self.entry.returnPressed.connect(self.on_send)
         self.send_btn.clicked.connect(self.on_send)
-        self.clear_dm_btn.clicked.connect(self.on_clear_dm)
         self.conv_list.itemDoubleClicked.connect(self.on_pick_conv)
         self.send_file_btn.clicked.connect(self.on_send_file)
         self._connect()
@@ -626,7 +682,7 @@ class ChatWindow(QtWidgets.QWidget):
             pass
 
     def on_clear_dm(self):
-        self.switch_conv(f"group:{self.room}")
+        pass
 
     def on_pick_conv(self, item: QtWidgets.QListWidgetItem):
         text = item.text()
@@ -775,11 +831,9 @@ class ChatWindow(QtWidgets.QWidget):
         self.current_conv = key
         if key.startswith("group:"):
             self.dm_target = None
-            self.dm_label.setText("私聊对象：无")
         else:
             name = key.split(":",1)[1]
             self.dm_target = name
-            self.dm_label.setText(f"私聊对象：{self.dm_target}")
         self.current_model = self.conv_models[key]
         self.view.setModel(self.current_model)
         self._reset_unread(key)
@@ -817,6 +871,17 @@ class ChatWindow(QtWidgets.QWidget):
             index = self.view.currentIndex()
         menu = QtWidgets.QMenu(self)
         kind = index.data(ChatModel.KindRole) if index.isValid() else None
+        act_copy = menu.addAction("复制文本")
+        act_copy.setEnabled(index.isValid() and kind in ("msg", "file"))
+        def do_copy():
+            self._copy_index(index)
+        act_copy.triggered.connect(do_copy)
+        if kind == "msg":
+            act_view = menu.addAction("查看/复制...")
+            def do_view():
+                txt = index.data(ChatModel.TextRole) or ""
+                self._open_text_viewer(txt)
+            act_view.triggered.connect(do_view)
         act_del = menu.addAction("删除此消息")
         can_del = index.isValid() and kind in ("msg", "file")
         act_del.setEnabled(can_del)
@@ -831,6 +896,33 @@ class ChatWindow(QtWidgets.QWidget):
                 self.store.delete_message(self.current_conv, sender_name, kind, store_text, is_self, filename, mime)
                 self.current_model.remove_row(index.row())
             act_del.triggered.connect(do_del)
+        if kind == "file":
+            filename = index.data(ChatModel.FileNameRole)
+            mime = index.data(ChatModel.MimeRole) or ""
+            act_open = menu.addAction("打开文件")
+            def do_open_file():
+                path = self._attachment_path(filename)
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
+            act_open.triggered.connect(do_open_file)
+            act_open_dir = menu.addAction("打开所在文件夹")
+            def do_open_dir():
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_dir()))
+            act_open_dir.triggered.connect(do_open_dir)
+            act_preview = menu.addAction("预览")
+            pix = index.data(ChatModel.PixmapRole)
+            act_preview.setEnabled(bool(pix) and mime.startswith("image/"))
+            def do_preview():
+                if not pix:
+                    return
+                dlg = QtWidgets.QDialog(self)
+                dlg.setWindowTitle(filename or "预览")
+                lbl = QtWidgets.QLabel()
+                lbl.setPixmap(pix.scaled(600, 600, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+                lay = QtWidgets.QVBoxLayout()
+                lay.addWidget(lbl)
+                dlg.setLayout(lay)
+                dlg.exec()
+            act_preview.triggered.connect(do_preview)
         act_clear = menu.addAction("清空当前会话")
         def do_clear():
             res = QtWidgets.QMessageBox.question(self, "确认", "确定清空当前会话的聊天记录？", QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
@@ -840,11 +932,76 @@ class ChatWindow(QtWidgets.QWidget):
         act_clear.triggered.connect(do_clear)
         menu.exec(global_pos)
 
+    def on_view_double_click(self, index: QtCore.QModelIndex):
+        if not index.isValid():
+            return
+        kind = index.data(ChatModel.KindRole)
+        if kind == "file":
+            filename = index.data(ChatModel.FileNameRole)
+            if filename:
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_path(filename)))
+        elif kind == "msg":
+            txt = index.data(ChatModel.TextRole) or ""
+            self._open_text_viewer(txt)
+
     def eventFilter(self, obj, ev):
-        if obj is self.view.viewport() and ev.type() == QtCore.QEvent.ContextMenu:
-            self.on_view_context_menu(ev.pos())
-            return True
+        if obj is self.view.viewport():
+            if ev.type() == QtCore.QEvent.ContextMenu:
+                self.on_view_context_menu(ev.position().toPoint())
+                return True
+            if ev.type() == QtCore.QEvent.MouseButtonPress and ev.button() == QtCore.Qt.LeftButton:
+                idx = self.view.indexAt(ev.position().toPoint())
+                if idx.isValid() and idx.data(ChatModel.KindRole) == "msg":
+                    p = self._text_pos_from_event(idx, ev.position().toPoint())
+                    if p is not None:
+                        self.sel_row = idx.row()
+                        self.sel_anchor = p
+                        self.sel_pos = p
+                        self.current_model.set_selection(self.sel_row, self.sel_anchor, self.sel_pos)
+                return False
+            if ev.type() == QtCore.QEvent.MouseMove and getattr(self, 'sel_row', None) is not None:
+                idx = self.view.indexAt(ev.position().toPoint())
+                if idx.isValid() and idx.row() == self.sel_row:
+                    p = self._text_pos_from_event(idx, ev.position().toPoint())
+                    if p is not None:
+                        self.sel_pos = p
+                        a, b = sorted([self.sel_anchor, self.sel_pos])
+                        self.current_model.set_selection(self.sel_row, a, b)
+                return False
+            if ev.type() == QtCore.QEvent.MouseMove and getattr(self, 'sel_row', None) is None:
+                idx = self.view.indexAt(ev.position().toPoint())
+                want_ibeam = False
+                if idx.isValid() and idx.data(ChatModel.KindRole) == "msg":
+                    if self._bubble_contains(idx, ev.position().toPoint()):
+                        want_ibeam = True
+                if want_ibeam:
+                    self.view.viewport().setCursor(QtGui.QCursor(QtCore.Qt.IBeamCursor))
+                else:
+                    self.view.viewport().unsetCursor()
+                return False
+            if ev.type() in (QtCore.QEvent.Leave, QtCore.QEvent.MouseButtonRelease):
+                self.view.viewport().unsetCursor()
+                return False
+            if ev.type() == QtCore.QEvent.MouseButtonRelease and getattr(self, 'sel_row', None) is not None:
+                return False
         return super().eventFilter(obj, ev)
+
+    def copy_selected(self):
+        idx = self.view.currentIndex()
+        if idx.isValid():
+            self._copy_index(idx)
+
+    def _copy_index(self, index: QtCore.QModelIndex):
+        if not index.isValid():
+            return
+        kind = index.data(ChatModel.KindRole)
+        if kind == "msg":
+            text = index.data(ChatModel.TextRole) or ""
+            QtWidgets.QApplication.clipboard().setText(text)
+        elif kind == "file":
+            fn = index.data(ChatModel.FileNameRole) or ""
+            path = self._attachment_path(fn)
+            QtWidgets.QApplication.clipboard().setText(path if os.path.exists(path) else fn)
 
     def _bootstrap_local(self):
         peers = self.store.peers()
@@ -925,6 +1082,106 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _attachment_dir(self) -> str:
+        return os.path.join(self.store.root, "attachments")
+
+    def _attachment_path(self, filename: str) -> str:
+        return os.path.join(self._attachment_dir(), filename)
+
+    def _open_text_viewer(self, text: str):
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("查看/复制")
+        edit = QtWidgets.QPlainTextEdit()
+        edit.setPlainText(text)
+        edit.setReadOnly(True)
+        edit.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        btn_copy_sel = QtWidgets.QPushButton("复制选中")
+        btn_copy_all = QtWidgets.QPushButton("复制全部")
+        layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(edit)
+        h = QtWidgets.QHBoxLayout()
+        h.addStretch(1)
+        h.addWidget(btn_copy_sel)
+        h.addWidget(btn_copy_all)
+        layout.addLayout(h)
+        dlg.setLayout(layout)
+        def do_copy_sel():
+            QtWidgets.QApplication.clipboard().setText(edit.textCursor().selectedText())
+        def do_copy_all():
+            QtWidgets.QApplication.clipboard().setText(text)
+        btn_copy_sel.clicked.connect(do_copy_sel)
+        btn_copy_all.clicked.connect(do_copy_all)
+        dlg.resize(600, 400)
+        dlg.exec()
+
+    def _text_pos_from_event(self, index: QtCore.QModelIndex, vp_pos: QtCore.QPoint):
+        r = self.view.visualRect(index)
+        kind = index.data(ChatModel.KindRole)
+        if kind != "msg":
+            return None
+        text = index.data(ChatModel.TextRole) or ""
+        is_self = bool(index.data(ChatModel.SelfRole))
+        fm = self.view.fontMetrics()
+        maxw = int(r.width() * 0.65)
+        doc = QtGui.QTextDocument()
+        opt = QtGui.QTextOption()
+        opt.setWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        doc.setDefaultFont(self.view.font())
+        doc.setDefaultTextOption(opt)
+        w0 = fm.horizontalAdvance(text)
+        text_w = min(w0, maxw)
+        doc.setTextWidth(text_w)
+        doc.setPlainText(text)
+        pad = 12
+        bubble_w = int(text_w) + pad * 2
+        bubble_h = int(doc.size().height()) + pad * 2
+        margin = 10
+        avatar_size = 22
+        avatar_pad = 8
+        bubble_x = r.right() - bubble_w - margin - avatar_size - avatar_pad if is_self else r.left() + margin + avatar_size + avatar_pad
+        bubble_y = r.top() + 26
+        text_rect = QtCore.QRect(bubble_x + pad, bubble_y + pad, bubble_w - 2*pad, bubble_h - 2*pad)
+        if not text_rect.contains(vp_pos):
+            return None
+        local = QtCore.QPointF(vp_pos.x() - text_rect.x(), vp_pos.y() - text_rect.y())
+        layout = doc.documentLayout()
+        try:
+            pos = layout.hitTest(local, QtCore.Qt.FuzzyHit)
+            if pos < 0:
+                return None
+            return pos
+        except Exception:
+            return None
+
+    def _bubble_contains(self, index: QtCore.QModelIndex, vp_pos: QtCore.QPoint) -> bool:
+        r = self.view.visualRect(index)
+        kind = index.data(ChatModel.KindRole)
+        if kind != "msg":
+            return False
+        text = index.data(ChatModel.TextRole) or ""
+        is_self = bool(index.data(ChatModel.SelfRole))
+        fm = self.view.fontMetrics()
+        maxw = int(r.width() * 0.65)
+        doc = QtGui.QTextDocument()
+        opt = QtGui.QTextOption()
+        opt.setWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        doc.setDefaultFont(self.view.font())
+        doc.setDefaultTextOption(opt)
+        w0 = fm.horizontalAdvance(text)
+        text_w = min(w0, maxw)
+        doc.setTextWidth(text_w)
+        doc.setPlainText(text)
+        pad = 12
+        bubble_w = int(text_w) + pad * 2
+        bubble_h = int(doc.size().height()) + pad * 2
+        margin = 10
+        avatar_size = 22
+        avatar_pad = 8
+        bubble_x = r.right() - bubble_w - margin - avatar_size - avatar_pad if is_self else r.left() + margin + avatar_size + avatar_pad
+        bubble_y = r.top() + 26
+        bubble_rect = QtCore.QRect(bubble_x, bubble_y, bubble_w, bubble_h)
+        return bubble_rect.contains(vp_pos)
+
     def closeEvent(self, e):
         try:
             if self.rx:
@@ -957,12 +1214,14 @@ def parse_args():
     p.add_argument("--username", type=str, default=getpass.getuser())
     p.add_argument("--log-dir", type=str, default=os.path.join(os.getcwd(), "chat_logs"))
     p.add_argument("--room", type=str, default="general")
+    p.add_argument("--theme", type=str, default="dark")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     app = QtWidgets.QApplication([])
+    _apply_theme(app, args.theme)
     icon_dir = os.path.join(os.getcwd(), "icons", "user")
     dlg = QtWidgets.QDialog()
     dlg.setWindowTitle("登录")
@@ -1110,6 +1369,29 @@ def _save_profile(base_dir: str, username: str, avatar_filename: Optional[str]):
     except Exception:
         pass
 
+def _apply_theme(app: QtWidgets.QApplication, name: str):
+    base = os.path.join(os.getcwd(), "themes", f"{name}.qss")
+    if os.path.exists(base):
+        try:
+            with open(base, "r", encoding="utf-8") as f:
+                app.setStyleSheet(f.read())
+        except Exception:
+            pass
+
 
 if __name__ == "__main__":
     main()
+    def copy_selected(self):
+        idx = self.view.currentIndex()
+        if idx.isValid():
+            self._copy_index(idx)
+
+    def _copy_index(self, index: QtCore.QModelIndex):
+        kind = index.data(ChatModel.KindRole)
+        if kind == "msg":
+            text = index.data(ChatModel.TextRole) or ""
+            QtWidgets.QApplication.clipboard().setText(text)
+        elif kind == "file":
+            fn = index.data(ChatModel.FileNameRole) or ""
+            path = self._attachment_path(fn)
+            QtWidgets.QApplication.clipboard().setText(path if os.path.exists(path) else fn)
