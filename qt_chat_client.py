@@ -44,6 +44,7 @@ class ChatModel(QtCore.QAbstractListModel):
     PixmapRole = QtCore.Qt.UserRole + 6
     FileNameRole = QtCore.Qt.UserRole + 7
     MimeRole = QtCore.Qt.UserRole + 8
+    AvatarRole = QtCore.Qt.UserRole + 9
 
     def __init__(self):
         super().__init__()
@@ -73,20 +74,22 @@ class ChatModel(QtCore.QAbstractListModel):
             return item.get("filename")
         if role == ChatModel.MimeRole:
             return item.get("mime")
+        if role == ChatModel.AvatarRole:
+            return item.get("avatar")
         return None
 
-    def add(self, kind: str, sender: str, text: str, is_self: bool):
+    def add(self, kind: str, sender: str, text: str, is_self: bool, avatar: Optional[QtGui.QPixmap] = None):
         now = QtCore.QDateTime.currentDateTime()
         self._maybe_time_separator(now)
         self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
-        self.items.append({"kind": kind, "sender": sender, "text": text, "self": is_self, "time": now})
+        self.items.append({"kind": kind, "sender": sender, "text": text, "self": is_self, "time": now, "avatar": avatar})
         self.endInsertRows()
 
-    def add_file(self, sender: str, filename: str, mime: str, pixmap: Optional[QtGui.QPixmap], is_self: bool):
+    def add_file(self, sender: str, filename: str, mime: str, pixmap: Optional[QtGui.QPixmap], is_self: bool, avatar: Optional[QtGui.QPixmap] = None):
         now = QtCore.QDateTime.currentDateTime()
         self._maybe_time_separator(now)
         self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
-        self.items.append({"kind": "file", "sender": sender, "text": filename, "self": is_self, "time": now, "pixmap": pixmap, "filename": filename, "mime": mime})
+        self.items.append({"kind": "file", "sender": sender, "text": filename, "self": is_self, "time": now, "pixmap": pixmap, "filename": filename, "mime": mime, "avatar": avatar})
         self.endInsertRows()
 
     def _maybe_time_separator(self, now: QtCore.QDateTime):
@@ -110,6 +113,20 @@ class ChatModel(QtCore.QAbstractListModel):
             self.beginRemoveRows(QtCore.QModelIndex(), row, row)
             del self.items[row]
             self.endRemoveRows()
+
+    def set_sender_avatar(self, name: str, pixmap: QtGui.QPixmap):
+        changed_start = None
+        changed_end = None
+        for i, it in enumerate(self.items):
+            if it.get("sender") == name and it.get("kind") in ("msg", "file"):
+                it["avatar"] = pixmap
+                if changed_start is None:
+                    changed_start = i
+                changed_end = i
+        if changed_start is not None:
+            top = self.index(changed_start)
+            bottom = self.index(changed_end)
+            self.dataChanged.emit(top, bottom)
 
 
 class BubbleDelegate(QtWidgets.QStyledItemDelegate):
@@ -188,7 +205,7 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             bubble_color = QtGui.QColor(235, 235, 235)
             text_color = QtGui.QColor(0, 0, 0)
             align = QtCore.Qt.AlignLeft
-        bubble_y = r.top() + 20
+        bubble_y = r.top() + 26
         bubble_rect = QtCore.QRect(bubble_x, bubble_y, bubble_w, bubble_h)
         painter.setPen(QtCore.Qt.NoPen)
         painter.setBrush(bubble_color)
@@ -207,19 +224,23 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             painter.drawText(QtCore.QRect(bubble_rect.left(), bubble_rect.bottom() + 4, bubble_w, fm.height()), QtCore.Qt.AlignRight, time_text)
         else:
             painter.drawText(QtCore.QRect(bubble_rect.left(), bubble_rect.bottom() + 4, bubble_w, fm.height()), QtCore.Qt.AlignLeft, time_text)
-        hue = (sum(ord(c) for c in sender) % 360)
-        avatar_color = QtGui.QColor.fromHsl(hue, 160, 160)
-        painter.setBrush(avatar_color)
-        painter.setPen(QtCore.Qt.NoPen)
+        avatar = index.data(ChatModel.AvatarRole)
         if is_self:
             ax = r.right() - margin - avatar_size
         else:
             ax = r.left() + margin
         ay = bubble_rect.top()
-        painter.drawEllipse(QtCore.QRect(ax, ay, avatar_size, avatar_size))
-        painter.setPen(QtGui.QColor(255, 255, 255))
-        letter = sender[:1] if sender else "?"
-        painter.drawText(QtCore.QRect(ax, ay, avatar_size, avatar_size), QtCore.Qt.AlignCenter, letter)
+        if isinstance(avatar, QtGui.QPixmap):
+            painter.drawPixmap(QtCore.QRect(ax, ay, avatar_size, avatar_size), avatar.scaled(avatar_size, avatar_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        else:
+            hue = (sum(ord(c) for c in sender) % 360)
+            avatar_color = QtGui.QColor.fromHsl(hue, 160, 160)
+            painter.setBrush(avatar_color)
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.drawEllipse(QtCore.QRect(ax, ay, avatar_size, avatar_size))
+            painter.setPen(QtGui.QColor(255, 255, 255))
+            letter = sender[:1] if sender else "?"
+            painter.drawText(QtCore.QRect(ax, ay, avatar_size, avatar_size), QtCore.Qt.AlignCenter, letter)
         painter.restore()
 
     def sizeHint(self, option, index):
@@ -227,17 +248,25 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         text = index.data(ChatModel.TextRole)
         if kind == "sys":
             fm = option.fontMetrics
-            h = fm.height() + 16
+            h = fm.height() + 20
             return QtCore.QSize(option.rect.width(), h)
         fm = option.fontMetrics
         maxw = int(option.rect.width() * 0.65)
         br = fm.boundingRect(0, 0, maxw, 0, QtCore.Qt.TextWordWrap, text)
-        h = max(br.height() + 28 + fm.height(), 22 + 24)
+        is_self = bool(index.data(ChatModel.SelfRole))
+        pad = 12
+        bubble_h = br.height() + pad * 2
+        extra_top = 0 if is_self else fm.height()
+        extra_bottom = fm.height()
+        spacing = 16
+        avatar_block = 22 + 24
+        h = bubble_h + extra_top + extra_bottom + spacing
+        h = max(h, avatar_block)
         return QtCore.QSize(option.rect.width(), h)
 
 
 class ChatWindow(QtWidgets.QWidget):
-    def __init__(self, host: str, port: int, username: str, log_dir: str, room: str):
+    def __init__(self, host: str, port: int, username: str, log_dir: str, room: str, avatar_path: Optional[str] = None):
         super().__init__()
         self.host = host
         self.port = port
@@ -249,6 +278,17 @@ class ChatWindow(QtWidgets.QWidget):
         self.dm_target: Optional[str] = None
         self.seq = 1
         self.store = LocalStore(log_dir, username)
+        self.avatar_pixmap = None
+        self.avatar_filename = None
+        if avatar_path and os.path.exists(avatar_path):
+            try:
+                self.avatar_pixmap = QtGui.QPixmap(avatar_path)
+                self.avatar_filename = os.path.basename(avatar_path)
+            except Exception:
+                self.avatar_pixmap = None
+                self.avatar_filename = None
+        self.peer_avatars = {}
+        self.pending_dm = set()
 
         self.setWindowTitle(f"群聊 - {username} @ {host}:{port} / {room}")
         self.view = QtWidgets.QListView()
@@ -262,6 +302,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.view.viewport().customContextMenuRequested.connect(self.on_view_context_menu)
         self.view.viewport().installEventFilter(self)
         self.conv_list = QtWidgets.QListWidget()
+        self.conv_list.setIconSize(QtCore.QSize(24, 24))
         self.entry = QtWidgets.QLineEdit()
         self.send_btn = QtWidgets.QPushButton("发送")
         self.dm_label = QtWidgets.QLabel("私聊对象：无")
@@ -272,6 +313,10 @@ class ChatWindow(QtWidgets.QWidget):
                 b.setAttribute(QtCore.Qt.WA_MacSmallSize, True)
                 b.setMaximumHeight(28)
                 b.setMinimumHeight(22)
+                sp = b.sizePolicy()
+                sp.setVerticalPolicy(QtWidgets.QSizePolicy.Fixed)
+                b.setSizePolicy(sp)
+                b.setStyleSheet("QPushButton { min-height: 24px; max-height: 28px; padding: 4px 10px; }")
             except Exception:
                 pass
         layout = QtWidgets.QHBoxLayout()
@@ -306,7 +351,10 @@ class ChatWindow(QtWidgets.QWidget):
         self._connect()
         self.conv_unread = {}
         self._init_conversations()
-        self.conv_list.addItem(f"群聊:{self.room}")
+        gpath = os.path.join(os.getcwd(), "icons", "user", "group.png")
+        gicon = QtGui.QIcon(gpath) if os.path.exists(gpath) else QtGui.QIcon(self._letter_pixmap("群"))
+        gi = QtWidgets.QListWidgetItem(gicon, f"群聊:{self.room}")
+        self.conv_list.addItem(gi)
         self._bootstrap_local()
 
     def _connect(self):
@@ -358,6 +406,15 @@ class ChatWindow(QtWidgets.QWidget):
                 except Exception:
                     pass
         self._send_seq("UNREAD")
+        if self.avatar_filename:
+            try:
+                self._send_seq(f"AVATAR {self.avatar_filename}")
+            except Exception:
+                pass
+        try:
+            _save_profile(log_dir, self.username, self.avatar_filename)
+        except Exception:
+            pass
 
     def on_received(self, text: str):
         self.logger.write("recv", self.host, text)
@@ -368,7 +425,7 @@ class ChatWindow(QtWidgets.QWidget):
                 n = int(text.split()[1])
                 m = self.conv_models.get(self.current_conv)
                 if m:
-                    m.add("sys", "", f"已送达 {n}", False)
+                    m.add("sys", "", f"已送达 {n}", False, None)
                     self.view.scrollToBottom()
             except Exception:
                 pass
@@ -381,7 +438,7 @@ class ChatWindow(QtWidgets.QWidget):
                 if room == self.room:
                     m = self.conv_models.get(f"group:{self.room}")
                     if m:
-                        m.add("sys", "", f"系统: {user} 加入 {room}", False)
+                        m.add("sys", "", f"系统: {user} 加入 {room}", False, None)
                     self.store.add(f"group:{self.room}", "", f"系统: {user} 加入 {room}", "sys", False)
                     if user != self.username:
                         self._add_conv_dm(user)
@@ -393,7 +450,7 @@ class ChatWindow(QtWidgets.QWidget):
                 if room == self.room:
                     m = self.conv_models.get(f"group:{self.room}")
                     if m:
-                        m.add("sys", "", f"系统: {user} 离开 {room}", False)
+                        m.add("sys", "", f"系统: {user} 离开 {room}", False, None)
                     self.store.add(f"group:{self.room}", "", f"系统: {user} 离开 {room}", "sys", False)
                     if user != self.username:
                         self._remove_conv_dm(user)
@@ -405,19 +462,37 @@ class ChatWindow(QtWidgets.QWidget):
                 if room == self.room:
                     users = [x for x in users_csv.split(",") if x]
                     for u in users:
+                        uname = u
+                        avatar = None
+                        if ":" in u:
+                            uname, avatar = u.split(":",1)
                         found = False
+                        title = f"群聊:{self.room}"
                         for i in range(self.conv_list.count()):
-                            if self.conv_list.item(i).text() == f"群聊:{self.room}":
+                            base = self.conv_list.item(i).text().split(" (",1)[0]
+                            if base == title:
                                 found = True
                                 break
                         if not found:
-                            self.conv_list.addItem(f"群聊:{self.room}")
-                        if u != self.username:
-                            self._add_conv_dm(u)
+                            gpath = os.path.join(os.getcwd(), "icons", "user", "group.png")
+                            gicon = QtGui.QIcon(gpath) if os.path.exists(gpath) else QtGui.QIcon(self._letter_pixmap("群"))
+                            self.conv_list.addItem(QtWidgets.QListWidgetItem(gicon, title))
+                        if uname != self.username:
+                            if avatar:
+                                self._set_peer_avatar(uname, avatar)
+                            # 即使没有头像也先添加会话，后续收到头像再刷新
+                            self._add_conv_dm(uname)
+                return
+            if len(parts) >= 5 and parts[1] == "AVATAR":
+                room = parts[2]
+                user = parts[3]
+                filename = parts[4]
+                if room == self.room and user != self.username:
+                    self._set_peer_avatar(user, filename)
                 return
             if len(parts) >= 6 and parts[1] == "HISTORY":
                 kind = parts[2]
-                if kind == "GROUP" and len(parts) >= 6:
+                if kind == "GROUP":
                     room = parts[3]
                     sender = parts[4]
                     ts = parts[5]
@@ -427,11 +502,13 @@ class ChatWindow(QtWidgets.QWidget):
                         fn, mime, b64 = self._parse_file(payload)
                         pix = self._pix_from_b64(mime, b64)
                         self._save_attachment(fn, b64)
-                        self.conv_models[f"group:{room}"].add_file(sender, fn, mime, pix, sender == self.username)
+                        av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                        self.conv_models[f"group:{room}"].add_file(sender, fn, mime, pix, sender == self.username, av)
                     else:
-                        self.conv_models[f"group:{room}"].add("msg", sender, payload, sender == self.username)
+                        av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                        self.conv_models[f"group:{room}"].add("msg", sender, payload, sender == self.username, av)
                     return
-                if kind == "DM" and len(parts) >= 6:
+                if kind == "DM":
                     peer = parts[3]
                     sender = parts[4]
                     ts = parts[5]
@@ -441,9 +518,11 @@ class ChatWindow(QtWidgets.QWidget):
                         fn, mime, b64 = self._parse_file(payload)
                         pix = self._pix_from_b64(mime, b64)
                         self._save_attachment(fn, b64)
-                        self.conv_models[f"dm:{peer}"].add_file(sender, fn, mime, pix, sender == self.username)
+                        av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                        self.conv_models[f"dm:{peer}"].add_file(sender, fn, mime, pix, sender == self.username, av)
                     else:
-                        self.conv_models[f"dm:{peer}"].add("msg", sender, payload, sender == self.username)
+                        av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                        self.conv_models[f"dm:{peer}"].add("msg", sender, payload, sender == self.username, av)
                     return
             if len(parts) >= 4 and parts[1] == "UNREAD":
                 conv = parts[2]
@@ -470,11 +549,13 @@ class ChatWindow(QtWidgets.QWidget):
                     pix = self._pix_from_b64(mime, b64)
                     self._save_attachment(fn, b64)
                     self._ensure_conv(f"dm:{name}")
-                    self.conv_models[f"dm:{name}"].add_file(name, fn, mime, pix, False)
+                    av = self.peer_avatars.get(name)
+                    self.conv_models[f"dm:{name}"].add_file(name, fn, mime, pix, False, av)
                     self.store.add(f"dm:{name}", name, f"[FILE] {fn} {mime}", "file", False)
                 else:
                     self._ensure_conv(f"dm:{name}")
-                    self.conv_models[f"dm:{name}"].add("msg", name, msg, False)
+                    av = self.peer_avatars.get(name)
+                    self.conv_models[f"dm:{name}"].add("msg", name, msg, False, av)
                     self.store.add(f"dm:{name}", name, msg, "msg", False)
                 self.view.scrollToBottom()
                 self._add_conv_dm(name)
@@ -491,11 +572,11 @@ class ChatWindow(QtWidgets.QWidget):
                     pix = self._pix_from_b64(mime, b64)
                     self._save_attachment(fn, b64)
                     self._ensure_conv(f"dm:{target}")
-                    self.conv_models[f"dm:{target}"].add_file(self.username, fn, mime, pix, True)
+                    self.conv_models[f"dm:{target}"].add_file(self.username, fn, mime, pix, True, self.avatar_pixmap)
                     self.store.add(f"dm:{target}", self.username, f"[FILE] {fn} {mime}", "file", True)
                 else:
                     self._ensure_conv(f"dm:{target}")
-                    self.conv_models[f"dm:{target}"].add("msg", self.username, msg, True)
+                    self.conv_models[f"dm:{target}"].add("msg", self.username, msg, True, self.avatar_pixmap)
                     self.store.add(f"dm:{target}", self.username, msg, "msg", True)
                 self.view.scrollToBottom()
                 self._add_conv_dm(target)
@@ -509,11 +590,13 @@ class ChatWindow(QtWidgets.QWidget):
                 pix = self._pix_from_b64(mime, b64)
                 self._save_attachment(fn, b64)
                 self._ensure_conv(f"group:{self.room}")
-                self.conv_models[f"group:{self.room}"].add_file(name, fn, mime, pix, name == self.username)
+                av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
+                self.conv_models[f"group:{self.room}"].add_file(name, fn, mime, pix, name == self.username, av)
                 self.store.add(f"group:{self.room}", name, f"[FILE] {fn} {mime}", "file", name == self.username)
             else:
                 self._ensure_conv(f"group:{self.room}")
-                self.conv_models[f"group:{self.room}"].add("msg", name, msg, name == self.username)
+                av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
+                self.conv_models[f"group:{self.room}"].add("msg", name, msg, name == self.username, av)
                 self.store.add(f"group:{self.room}", name, msg, "msg", name == self.username)
             self.view.scrollToBottom()
             if self.current_conv != f"group:{self.room}":
@@ -529,13 +612,13 @@ class ChatWindow(QtWidgets.QWidget):
                 self._send_seq(f"DM {target} {text}")
                 self.store.add(f"dm:{target}", self.username, text, "msg", True)
                 self._ensure_conv(self.current_conv)
-                self.conv_models[self.current_conv].add("msg", self.username, text, True)
+                self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
                 self.view.scrollToBottom()
             else:
                 self._send_seq(f"MSG {text}")
                 self.store.add(f"group:{self.room}", self.username, text, "msg", True)
                 self._ensure_conv(self.current_conv)
-                self.conv_models[self.current_conv].add("msg", self.username, text, True)
+                self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
                 self.view.scrollToBottom()
             self.logger.write("sent", self.username, text)
             self.entry.clear()
@@ -556,11 +639,12 @@ class ChatWindow(QtWidgets.QWidget):
     def _add_conv_dm(self, name: str):
         exists = False
         for i in range(self.conv_list.count()):
-            if self.conv_list.item(i).text() == name:
+            if self.conv_list.item(i).text().split(" (",1)[0] == name:
                 exists = True
                 break
         if not exists:
-            self.conv_list.addItem(name)
+            it = QtWidgets.QListWidgetItem(self._icon_for_name(name), name)
+            self.conv_list.addItem(it)
         self._ensure_unread_key(f"dm:{name}")
         self._ensure_conv(f"dm:{name}")
 
@@ -599,7 +683,7 @@ class ChatWindow(QtWidgets.QWidget):
                     self.logger.write("sent", self.username, payload_text)
                     pix = self._pix_from_b64(mime, b64)
                     self._ensure_conv(self.current_conv)
-                    self.conv_models[self.current_conv].add_file(self.username, name, mime, pix, True)
+                    self.conv_models[self.current_conv].add_file(self.username, name, mime, pix, True, self.avatar_pixmap)
                     self.view.scrollToBottom()
                 except Exception:
                     pass
@@ -638,6 +722,54 @@ class ChatWindow(QtWidgets.QWidget):
         if key not in self.conv_models:
             self.conv_models[key] = ChatModel()
 
+    def _letter_pixmap(self, name: str, size: int = 24) -> QtGui.QPixmap:
+        pm = QtGui.QPixmap(size, size)
+        pm.fill(QtCore.Qt.transparent)
+        p = QtGui.QPainter(pm)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        hue = (sum(ord(c) for c in name) % 360)
+        color = QtGui.QColor.fromHsl(hue, 160, 160)
+        p.setBrush(color)
+        p.setPen(QtCore.Qt.NoPen)
+        p.drawEllipse(0, 0, size, size)
+        p.setPen(QtGui.QColor(255, 255, 255))
+        f = p.font()
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QtCore.QRect(0, 0, size, size), QtCore.Qt.AlignCenter, name[:1] if name else "?")
+        p.end()
+        return pm
+
+    def _icon_for_name(self, name: str) -> QtGui.QIcon:
+        if name == self.username and self.avatar_pixmap:
+            return QtGui.QIcon(self.avatar_pixmap)
+        pm = self.peer_avatars.get(name)
+        if pm:
+            return QtGui.QIcon(pm)
+        return QtGui.QIcon(self._letter_pixmap(name))
+
+    def _refresh_conv_icon(self, name: str):
+        for i in range(self.conv_list.count()):
+            item = self.conv_list.item(i)
+            base = item.text().split(" (",1)[0]
+            if base == name:
+                item.setIcon(self._icon_for_name(name))
+                break
+
+    def _set_peer_avatar(self, name: str, filename: str):
+        try:
+            path = os.path.join(os.getcwd(), "icons", "user", filename)
+            if os.path.exists(path):
+                self.peer_avatars[name] = QtGui.QPixmap(path)
+                self._refresh_conv_icon(name)
+                try:
+                    for m in self.conv_models.values():
+                        m.set_sender_avatar(name, self.peer_avatars[name])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def switch_conv(self, key: str):
         self._ensure_conv(key)
         self.current_conv = key
@@ -662,11 +794,13 @@ class ChatWindow(QtWidgets.QWidget):
                 if kind == "file" and text.startswith("[FILE] "):
                     fn, mime, _ = self._parse_file(text)
                     pix = None
-                    self.current_model.add_file(sender, fn, mime, pix, bool(selfflag))
+                    av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                    self.current_model.add_file(sender, fn, mime, pix, bool(selfflag), av)
                 elif kind == "sys":
-                    self.current_model.add("sys", "", text, False)
+                    self.current_model.add("sys", "", text, False, None)
                 else:
-                    self.current_model.add("msg", sender, text, bool(selfflag))
+                    av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                    self.current_model.add("msg", sender, text, bool(selfflag), av)
             if len(self.current_model.items) == 0:
                 if key.startswith("group:"):
                     self._send_seq("HIST GROUP 50")
@@ -722,11 +856,13 @@ class ChatWindow(QtWidgets.QWidget):
             if kind == "file" and text.startswith("[FILE] "):
                 fn, mime, _ = self._parse_file(text)
                 pix = None
-                self.conv_models[f"group:{self.room}"].add_file(sender, fn, mime, pix, bool(selfflag))
+                av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                self.conv_models[f"group:{self.room}"].add_file(sender, fn, mime, pix, bool(selfflag), av)
             elif kind == "sys":
-                self.conv_models[f"group:{self.room}"].add("sys", "", text, False)
+                self.conv_models[f"group:{self.room}"].add("sys", "", text, False, None)
             else:
-                self.conv_models[f"group:{self.room}"].add("msg", sender, text, bool(selfflag))
+                av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                self.conv_models[f"group:{self.room}"].add("msg", sender, text, bool(selfflag), av)
         if len(self.current_model.items) == 0:
             if self.current_conv.startswith("group:"):
                 self._send_seq("HIST GROUP 50")
@@ -780,7 +916,7 @@ class ChatWindow(QtWidgets.QWidget):
         return name, mime, b64
 
     def _save_attachment(self, filename: str, b64: str):
-        att_dir = os.path.join(os.getcwd(), "chat_logs", "attachments")
+        att_dir = os.path.join(self.store.root, "attachments")
         os.makedirs(att_dir, exist_ok=True)
         try:
             data = base64.b64decode(b64)
@@ -827,10 +963,152 @@ def parse_args():
 def main():
     args = parse_args()
     app = QtWidgets.QApplication([])
-    win = ChatWindow(args.host, args.port, args.username, args.log_dir, args.room)
+    icon_dir = os.path.join(os.getcwd(), "icons", "user")
+    dlg = QtWidgets.QDialog()
+    dlg.setWindowTitle("登录")
+    name_edit = QtWidgets.QLineEdit()
+    name_edit.setPlaceholderText("用户名")
+    try:
+        name_edit.setText(args.username)
+    except Exception:
+        pass
+    prof_list = QtWidgets.QListWidget()
+    prof_list.setIconSize(QtCore.QSize(48, 48))
+    prof_list.setViewMode(QtWidgets.QListView.IconMode)
+    prof_list.setResizeMode(QtWidgets.QListView.Adjust)
+    prof_list.setMovement(QtWidgets.QListView.Static)
+    prof_list.setSpacing(6)
+    prof_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+    listw = QtWidgets.QListWidget()
+    listw.setIconSize(QtCore.QSize(64, 64))
+    listw.setViewMode(QtWidgets.QListView.IconMode)
+    listw.setResizeMode(QtWidgets.QListView.Adjust)
+    listw.setMovement(QtWidgets.QListView.Static)
+    listw.setSpacing(8)
+    btn_ok = QtWidgets.QPushButton("进入")
+    btn_cancel = QtWidgets.QPushButton("取消")
+    v = QtWidgets.QVBoxLayout()
+    form = QtWidgets.QFormLayout()
+    form.addRow("用户名", name_edit)
+    v.addWidget(QtWidgets.QLabel("最近登录用户"))
+    v.addWidget(prof_list)
+    v.addLayout(form)
+    v.addWidget(QtWidgets.QLabel("选择头像"))
+    v.addWidget(listw, 1)
+    h = QtWidgets.QHBoxLayout()
+    h.addStretch(1)
+    h.addWidget(btn_ok)
+    h.addWidget(btn_cancel)
+    v.addLayout(h)
+    dlg.setLayout(v)
+    # load profiles
+    profiles = _load_profiles(args.log_dir)
+    try:
+        for uname, afn in profiles.items():
+            path = os.path.join(icon_dir, afn) if afn else None
+            if path and os.path.exists(path):
+                it = QtWidgets.QListWidgetItem(QtGui.QIcon(path), uname)
+            else:
+                # fallback letter icon
+                pm = QtGui.QPixmap(48, 48)
+                pm.fill(QtCore.Qt.transparent)
+                p = QtGui.QPainter(pm)
+                p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+                hue = (sum(ord(c) for c in uname) % 360)
+                color = QtGui.QColor.fromHsl(hue, 160, 160)
+                p.setBrush(color)
+                p.setPen(QtCore.Qt.NoPen)
+                p.drawEllipse(0, 0, 48, 48)
+                p.setPen(QtGui.QColor(255, 255, 255))
+                f = p.font(); f.setBold(True); p.setFont(f)
+                p.drawText(QtCore.QRect(0, 0, 48, 48), QtCore.Qt.AlignCenter, uname[:1])
+                p.end()
+                it = QtWidgets.QListWidgetItem(QtGui.QIcon(pm), uname)
+            it.setData(QtCore.Qt.UserRole, os.path.join(icon_dir, afn) if afn else None)
+            prof_list.addItem(it)
+    except Exception:
+        pass
+    try:
+        prof_list.clearSelection()
+        prof_list.setCurrentRow(-1)
+    except Exception:
+        pass
+    try:
+        for fn in sorted(os.listdir(icon_dir)):
+            path = os.path.join(icon_dir, fn)
+            if os.path.isfile(path) and fn.lower().endswith((".png", ".jpg", ".jpeg")):
+                it = QtWidgets.QListWidgetItem(QtGui.QIcon(path), "")
+                it.setData(QtCore.Qt.UserRole, path)
+                listw.addItem(it)
+    except Exception:
+        pass
+    btn_ok.clicked.connect(dlg.accept)
+    btn_cancel.clicked.connect(dlg.reject)
+    listw.itemDoubleClicked.connect(lambda *_: dlg.accept())
+    prof_list.itemDoubleClicked.connect(lambda *_: dlg.accept())
+    prof_list.itemClicked.connect(lambda it: name_edit.setText(it.text()))
+    if dlg.exec() != QtWidgets.QDialog.Accepted:
+        return
+    # prefer profile selection only if user explicitly selected
+    sel = prof_list.selectedItems()
+    if sel:
+        pitem = sel[0]
+        name = pitem.text().strip() or args.username
+        avatar = pitem.data(QtCore.Qt.UserRole)
+    else:
+        name = name_edit.text().strip()
+        if not name:
+            QtWidgets.QMessageBox.warning(None, "提示", "请输入用户名")
+            return
+        it = listw.currentItem()
+        avatar = it.data(QtCore.Qt.UserRole) if it else None
+    win = ChatWindow(args.host, args.port, name, args.log_dir, args.room, avatar)
     win.resize(700, 500)
     win.show()
     app.exec()
+
+def _load_profiles(base_dir: str):
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        p = os.path.join(base_dir, "profiles.json")
+        data = {}
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                try:
+                    data = json.load(f) or {}
+                except Exception:
+                    data = {}
+        # fallback: scan subdirectories as usernames
+        try:
+            for entry in os.listdir(base_dir):
+                d = os.path.join(base_dir, entry)
+                if os.path.isdir(d) and entry not in data:
+                    if entry == "attachments":
+                        continue
+                    if os.path.isfile(os.path.join(d, "local.db")):
+                        data[entry] = ""
+        except Exception:
+            pass
+        return data
+    except Exception:
+        return {}
+
+def _save_profile(base_dir: str, username: str, avatar_filename: Optional[str]):
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        p = os.path.join(base_dir, "profiles.json")
+        d = {}
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                try:
+                    d = json.load(f)
+                except Exception:
+                    d = {}
+        d[username] = avatar_filename or ""
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

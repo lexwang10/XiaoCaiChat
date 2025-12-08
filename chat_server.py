@@ -65,6 +65,7 @@ class Hub:
         self.conn_info = {}
         self.lock = threading.Lock()
         self.store = UnreadStore()
+        self.avatars = {}
 
     def add(self, conn: socket.socket, username: str, room: str):
         with self.lock:
@@ -120,8 +121,22 @@ class Hub:
                 pass
 
     def broadcast_users(self, room: str):
-        users = ",".join(self.users(room))
+        names = self.users(room)
+        parts = []
+        for u in names:
+            fn = self.avatars.get(u)
+            if fn:
+                parts.append(f"{u}:{fn}")
+            else:
+                parts.append(u)
+        users = ",".join(parts)
         self.broadcast_sys(room, f"[SYS] USERS {room} {users}")
+
+    def set_avatar(self, room: str, username: str, filename: str):
+        with self.lock:
+            self.avatars[username] = filename
+        self.broadcast_sys(room, f"[SYS] AVATAR {room} {username} {filename}")
+        self.broadcast_users(room)
 
     def send_dm(self, room: str, origin: socket.socket, origin_user: str, target_user: str, text: str):
         targets = []
@@ -236,6 +251,13 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
             if len(parts) >= 3 and parts[1].upper() == "DM":
                 return ("DM", parts[2])
         return None
+    def parse_avatar(line: str):
+        s = line.strip()
+        if s.startswith("AVATAR "):
+            parts = s.split()
+            if len(parts) >= 2:
+                return parts[1]
+        return None
     SECRET = os.environ.get("CHAT_SECRET")
     JWT_SECRET = os.environ.get("JWT_SECRET")
     authed = (SECRET is None and JWT_SECRET is None)
@@ -336,29 +358,33 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                                         conn.sendall(f"[SYS] UNREAD {conv} {cnt}\n".encode("utf-8"))
                                     except Exception:
                                         pass
+                    else:
+                        r = parse_read(body)
+                        if r:
+                            kind, p = r
+                            if kind == "GROUP":
+                                hub._unread_reset(username, conv_group(room))
                             else:
-                                r = parse_read(body)
-                                if r:
-                                    kind, p = r
-                                    if kind == "GROUP":
-                                        hub._unread_reset(username, conv_group(room))
-                                    else:
-                                        hub._unread_reset(username, conv_dm(username, p))
+                                hub._unread_reset(username, conv_dm(username, p))
+                        else:
+                            av = parse_avatar(body)
+                            if av:
+                                hub.set_avatar(room, username, av)
+                            else:
+                                dm = parse_dm(body)
+                                if dm:
+                                    target, payload = dm
+                                    hub.send_dm(room, conn, username, target, payload)
                                 else:
-                                    dm = parse_dm(body)
-                                    if dm:
-                                        target, payload = dm
-                                        hub.send_dm(room, conn, username, target, payload)
+                                    if body.startswith("MSG "):
+                                        hub.broadcast_text(room, conn, username, body[4:])
                                     else:
-                                        if body.startswith("MSG "):
-                                            hub.broadcast_text(room, conn, username, body[4:])
-                                        else:
-                                            hub.broadcast_text(room, conn, username, body)
-                    if seq is not None and do_process:
-                        try:
-                            conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
-                        except Exception:
-                            pass
+                                        hub.broadcast_text(room, conn, username, body)
+                        if seq is not None and do_process:
+                            try:
+                                conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
+                            except Exception:
+                                pass
             for line in f:
                 t = line.rstrip("\n")
                 if not t:
@@ -417,15 +443,19 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                         else:
                             hub._unread_reset(username, conv_dm(username, p))
                     else:
-                        dm = parse_dm(body)
-                        if dm:
-                            target, payload = dm
-                            hub.send_dm(room, conn, username, target, payload)
+                        av = parse_avatar(body)
+                        if av:
+                            hub.set_avatar(room, username, av)
                         else:
-                            if body.startswith("MSG "):
-                                hub.broadcast_text(room, conn, username, body[4:])
+                            dm = parse_dm(body)
+                            if dm:
+                                target, payload = dm
+                                hub.send_dm(room, conn, username, target, payload)
                             else:
-                                hub.broadcast_text(room, conn, username, body)
+                                if body.startswith("MSG "):
+                                    hub.broadcast_text(room, conn, username, body[4:])
+                                else:
+                                    hub.broadcast_text(room, conn, username, body)
                 if seq is not None:
                     try:
                         conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
