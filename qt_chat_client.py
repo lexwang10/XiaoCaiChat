@@ -99,6 +99,18 @@ class ChatModel(QtCore.QAbstractListModel):
         else:
             self.last_time = now
 
+    def clear(self):
+        self.beginResetModel()
+        self.items = []
+        self.last_time = None
+        self.endResetModel()
+
+    def remove_row(self, row: int):
+        if 0 <= row < len(self.items):
+            self.beginRemoveRows(QtCore.QModelIndex(), row, row)
+            del self.items[row]
+            self.endRemoveRows()
+
 
 class BubbleDelegate(QtWidgets.QStyledItemDelegate):
     def paint(self, painter, option, index):
@@ -164,13 +176,15 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         bubble_w = br.width() + pad * 2
         bubble_h = br.height() + pad * 2
         margin = 10
+        avatar_size = 22
+        avatar_pad = 8
         if is_self:
-            bubble_x = r.right() - bubble_w - margin
+            bubble_x = r.right() - bubble_w - margin - avatar_size - avatar_pad
             bubble_color = QtGui.QColor(88, 185, 87)
             text_color = QtGui.QColor(255, 255, 255)
             align = QtCore.Qt.AlignRight
         else:
-            bubble_x = r.left() + margin
+            bubble_x = r.left() + margin + avatar_size + avatar_pad
             bubble_color = QtGui.QColor(235, 235, 235)
             text_color = QtGui.QColor(0, 0, 0)
             align = QtCore.Qt.AlignLeft
@@ -193,15 +207,14 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             painter.drawText(QtCore.QRect(bubble_rect.left(), bubble_rect.bottom() + 4, bubble_w, fm.height()), QtCore.Qt.AlignRight, time_text)
         else:
             painter.drawText(QtCore.QRect(bubble_rect.left(), bubble_rect.bottom() + 4, bubble_w, fm.height()), QtCore.Qt.AlignLeft, time_text)
-        avatar_size = 22
         hue = (sum(ord(c) for c in sender) % 360)
         avatar_color = QtGui.QColor.fromHsl(hue, 160, 160)
         painter.setBrush(avatar_color)
         painter.setPen(QtCore.Qt.NoPen)
         if is_self:
-            ax = bubble_rect.right() + 8
+            ax = r.right() - margin - avatar_size
         else:
-            ax = bubble_rect.left() - avatar_size - 8
+            ax = r.left() + margin
         ay = bubble_rect.top()
         painter.drawEllipse(QtCore.QRect(ax, ay, avatar_size, avatar_size))
         painter.setPen(QtGui.QColor(255, 255, 255))
@@ -219,7 +232,7 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         fm = option.fontMetrics
         maxw = int(option.rect.width() * 0.65)
         br = fm.boundingRect(0, 0, maxw, 0, QtCore.Qt.TextWordWrap, text)
-        h = br.height() + 28 + fm.height()
+        h = max(br.height() + 28 + fm.height(), 22 + 24)
         return QtCore.QSize(option.rect.width(), h)
 
 
@@ -243,12 +256,24 @@ class ChatWindow(QtWidgets.QWidget):
         self.conv_models = {}
         self.current_model = None
         self.view.setItemDelegate(BubbleDelegate())
+        self.view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self.on_view_context_menu)
+        self.view.viewport().setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.view.viewport().customContextMenuRequested.connect(self.on_view_context_menu)
+        self.view.viewport().installEventFilter(self)
         self.conv_list = QtWidgets.QListWidget()
         self.entry = QtWidgets.QLineEdit()
         self.send_btn = QtWidgets.QPushButton("发送")
         self.dm_label = QtWidgets.QLabel("私聊对象：无")
         self.clear_dm_btn = QtWidgets.QPushButton("清除私聊")
         self.send_file_btn = QtWidgets.QPushButton("发送文件")
+        for b in (self.send_btn, self.clear_dm_btn, self.send_file_btn):
+            try:
+                b.setAttribute(QtCore.Qt.WA_MacSmallSize, True)
+                b.setMaximumHeight(28)
+                b.setMinimumHeight(22)
+            except Exception:
+                pass
         layout = QtWidgets.QHBoxLayout()
         left = QtWidgets.QVBoxLayout()
         left.addWidget(QtWidgets.QLabel("会话"))
@@ -503,15 +528,17 @@ class ChatWindow(QtWidgets.QWidget):
                 target = self.current_conv.split(":",1)[1]
                 self._send_seq(f"DM {target} {text}")
                 self.store.add(f"dm:{target}", self.username, text, "msg", True)
-            else:
-                self._send_seq(f"MSG {text}")
-                self.store.add(f"group:{self.room}", self.username, text, "msg", True)
-            self.logger.write("sent", self.username, text)
-            self.entry.clear()
-            if self.current_conv.startswith("group:"):
                 self._ensure_conv(self.current_conv)
                 self.conv_models[self.current_conv].add("msg", self.username, text, True)
                 self.view.scrollToBottom()
+            else:
+                self._send_seq(f"MSG {text}")
+                self.store.add(f"group:{self.room}", self.username, text, "msg", True)
+                self._ensure_conv(self.current_conv)
+                self.conv_models[self.current_conv].add("msg", self.username, text, True)
+                self.view.scrollToBottom()
+            self.logger.write("sent", self.username, text)
+            self.entry.clear()
         except Exception:
             pass
 
@@ -647,6 +674,44 @@ class ChatWindow(QtWidgets.QWidget):
                     peer = key.split(":",1)[1]
                     self._send_seq(f"HIST DM {peer} 50")
 
+    def on_view_context_menu(self, pos):
+        sender = self.sender()
+        global_pos = sender.mapToGlobal(pos) if hasattr(sender, 'mapToGlobal') else QtGui.QCursor.pos()
+        vp_pos = self.view.viewport().mapFromGlobal(global_pos)
+        index = self.view.indexAt(vp_pos)
+        if not index.isValid():
+            index = self.view.currentIndex()
+        menu = QtWidgets.QMenu(self)
+        kind = index.data(ChatModel.KindRole) if index.isValid() else None
+        act_del = menu.addAction("删除此消息")
+        can_del = index.isValid() and kind in ("msg", "file")
+        act_del.setEnabled(can_del)
+        if can_del:
+            def do_del():
+                sender_name = index.data(ChatModel.SenderRole)
+                text = index.data(ChatModel.TextRole)
+                is_self = bool(index.data(ChatModel.SelfRole))
+                filename = index.data(ChatModel.FileNameRole)
+                mime = index.data(ChatModel.MimeRole)
+                store_text = text if kind == "msg" else (f"[FILE] {filename} {mime}" if filename and mime else text)
+                self.store.delete_message(self.current_conv, sender_name, kind, store_text, is_self, filename, mime)
+                self.current_model.remove_row(index.row())
+            act_del.triggered.connect(do_del)
+        act_clear = menu.addAction("清空当前会话")
+        def do_clear():
+            res = QtWidgets.QMessageBox.question(self, "确认", "确定清空当前会话的聊天记录？", QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
+            if res == QtWidgets.QMessageBox.Yes:
+                self.store.delete_conv(self.current_conv)
+                self.current_model.clear()
+        act_clear.triggered.connect(do_clear)
+        menu.exec(global_pos)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.view.viewport() and ev.type() == QtCore.QEvent.ContextMenu:
+            self.on_view_context_menu(ev.pos())
+            return True
+        return super().eventFilter(obj, ev)
+
     def _bootstrap_local(self):
         peers = self.store.peers()
         for p in peers:
@@ -728,6 +793,15 @@ class ChatWindow(QtWidgets.QWidget):
         try:
             if self.rx:
                 self.rx.stop()
+                try:
+                    self.rx.wait(1000)
+                except Exception:
+                    pass
+            try:
+                if hasattr(self, 'hb') and self.hb:
+                    self.hb.stop()
+            except Exception:
+                pass
             if self.sock:
                 self.sock.shutdown(socket.SHUT_RDWR)
         except Exception:
