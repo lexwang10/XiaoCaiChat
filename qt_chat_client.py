@@ -2,6 +2,8 @@ import argparse
 import socket
 from typing import Optional
 import os
+import sys
+import shutil
 import getpass
 import base64
 import json
@@ -10,29 +12,83 @@ import hashlib
 import time
 
 from PySide6 import QtCore, QtWidgets, QtGui
+import threading
 from chat_utils import ChatLogger
 from chat_local_store import LocalStore
 
 
-class Receiver(QtCore.QThread):
+class Receiver(QtCore.QObject):
     received = QtCore.Signal(str)
 
     def __init__(self, sock: socket.socket):
         super().__init__()
         self.sock = sock
-        self.running = True
+        self.running = False
+        self.f = None
+        self._thread: Optional[threading.Thread] = None
 
-    def run(self):
-        f = self.sock.makefile("r", encoding="utf-8", newline="\n")
-        for line in f:
-            if not self.running:
-                break
-            t = line.rstrip("\n")
-            if t:
-                self.received.emit(t)
+    @QtCore.Slot(str)
+    def _emit_line(self, s: str):
+        self.received.emit(s)
+
+    def _loop(self):
+        try:
+            self.f = self.sock.makefile("r", encoding="utf-8", newline="\n")
+        except Exception:
+            self.f = None
+        try:
+            while self.running:
+                if not self.f:
+                    break
+                line = self.f.readline()
+                if not line:
+                    break
+                t = line.rstrip("\n")
+                if t:
+                    try:
+                        QtCore.QMetaObject.invokeMethod(self, "_emit_line", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, t))
+                    except Exception:
+                        pass
+            try:
+                QtCore.QMetaObject.invokeMethod(self, "_emit_line", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, "[SYS] DISCONNECT"))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def wait(self, msecs: int = 0):
+        try:
+            if self._thread:
+                self._thread.join(timeout=(msecs/1000.0 if msecs and msecs > 0 else None))
+        except Exception:
+            pass
 
     def stop(self):
         self.running = False
+        try:
+            if self.f:
+                try:
+                    self.f.close()
+                except Exception:
+                    pass
+            if self.sock:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 class ChatModel(QtCore.QAbstractListModel):
@@ -45,13 +101,12 @@ class ChatModel(QtCore.QAbstractListModel):
     FileNameRole = QtCore.Qt.UserRole + 7
     MimeRole = QtCore.Qt.UserRole + 8
     AvatarRole = QtCore.Qt.UserRole + 9
-    SelStartRole = QtCore.Qt.UserRole + 10
-    SelEndRole = QtCore.Qt.UserRole + 11
 
     def __init__(self):
         super().__init__()
         self.items = []
         self.last_time = None
+        self.last_sep_minute = None
 
     def rowCount(self, parent=QtCore.QModelIndex()):
         return len(self.items)
@@ -78,40 +133,37 @@ class ChatModel(QtCore.QAbstractListModel):
             return item.get("mime")
         if role == ChatModel.AvatarRole:
             return item.get("avatar")
-        if role == ChatModel.SelStartRole:
-            return item.get("sel_start")
-        if role == ChatModel.SelEndRole:
-            return item.get("sel_end")
         return None
 
-    def add(self, kind: str, sender: str, text: str, is_self: bool, avatar: Optional[QtGui.QPixmap] = None):
-        now = QtCore.QDateTime.currentDateTime()
+    def add(self, kind: str, sender: str, text: str, is_self: bool, avatar: Optional[QtGui.QPixmap] = None, ts: Optional[int] = None):
+        now = QtCore.QDateTime.fromSecsSinceEpoch(int(ts)) if ts is not None else QtCore.QDateTime.currentDateTime()
         self._maybe_time_separator(now)
         self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
         self.items.append({"kind": kind, "sender": sender, "text": text, "self": is_self, "time": now, "avatar": avatar})
         self.endInsertRows()
 
-    def add_file(self, sender: str, filename: str, mime: str, pixmap: Optional[QtGui.QPixmap], is_self: bool, avatar: Optional[QtGui.QPixmap] = None):
-        now = QtCore.QDateTime.currentDateTime()
+    def add_file(self, sender: str, filename: str, mime: str, pixmap: Optional[QtGui.QPixmap], is_self: bool, avatar: Optional[QtGui.QPixmap] = None, ts: Optional[int] = None):
+        now = QtCore.QDateTime.fromSecsSinceEpoch(int(ts)) if ts is not None else QtCore.QDateTime.currentDateTime()
         self._maybe_time_separator(now)
         self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
         self.items.append({"kind": "file", "sender": sender, "text": filename, "self": is_self, "time": now, "pixmap": pixmap, "filename": filename, "mime": mime, "avatar": avatar})
         self.endInsertRows()
 
     def _maybe_time_separator(self, now: QtCore.QDateTime):
-        if self.last_time is None or self.last_time.secsTo(now) >= 300:
+        cur_min = now.toString("yyyy-MM-dd HH:mm")
+        if self.last_sep_minute is None or self.last_sep_minute != cur_min:
             ts = now.toString("HH:mm")
             self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
             self.items.append({"kind": "sys", "sender": "", "text": f"—— {ts} ——", "self": False, "time": now})
             self.endInsertRows()
-            self.last_time = now
-        else:
-            self.last_time = now
+            self.last_sep_minute = cur_min
+        self.last_time = now
 
     def clear(self):
         self.beginResetModel()
         self.items = []
         self.last_time = None
+        self.last_sep_minute = None
         self.endResetModel()
 
     def remove_row(self, row: int):
@@ -120,20 +172,6 @@ class ChatModel(QtCore.QAbstractListModel):
             del self.items[row]
             self.endRemoveRows()
 
-    def set_selection(self, row: int, start: int, end: int):
-        if 0 <= row < len(self.items):
-            self.items[row]["sel_start"] = start
-            self.items[row]["sel_end"] = end
-            idx = self.index(row)
-            self.dataChanged.emit(idx, idx)
-
-    def clear_selection(self, row: int):
-        if 0 <= row < len(self.items):
-            if "sel_start" in self.items[row] or "sel_end" in self.items[row]:
-                self.items[row].pop("sel_start", None)
-                self.items[row].pop("sel_end", None)
-                idx = self.index(row)
-                self.dataChanged.emit(idx, idx)
     def set_sender_avatar(self, name: str, pixmap: QtGui.QPixmap):
         changed_start = None
         changed_end = None
@@ -172,38 +210,58 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         if kind == "file":
             pix = index.data(ChatModel.PixmapRole)
             filename = index.data(ChatModel.FileNameRole)
+            mime = (index.data(ChatModel.MimeRole) or "").lower()
+            fm = option.fontMetrics
+            margin = 10
+            avatar_size = 22
+            avatar_pad = 8
+            maxw = int(r.width() * 0.5)
+            if mime.startswith("image/") and isinstance(pix, QtGui.QPixmap):
+                img_w = min(maxw, pix.width())
+                img_h = int(pix.height() * (img_w / max(1, pix.width())))
+                if is_self:
+                    x = r.right() - img_w - margin - avatar_size - avatar_pad
+                else:
+                    x = r.left() + margin + avatar_size + avatar_pad
+                y = r.top() + 8
+                painter.save()
+                path = QtGui.QPainterPath()
+                path.addRoundedRect(QtCore.QRectF(x, y, img_w, img_h), 8, 8)
+                painter.setClipPath(path)
+                painter.drawPixmap(QtCore.QRect(x, y, img_w, img_h), pix)
+                painter.restore()
+                # draw avatar
+                avatar = index.data(ChatModel.AvatarRole)
+                ax = (r.right() - margin - avatar_size) if is_self else (r.left() + margin)
+                ay = y
+                if isinstance(avatar, QtGui.QPixmap):
+                    painter.drawPixmap(QtCore.QRect(ax, ay, avatar_size, avatar_size), avatar.scaled(avatar_size, avatar_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+                else:
+                    hue = (sum(ord(c) for c in sender) % 360)
+                    avatar_color = QtGui.QColor.fromHsl(hue, 160, 160)
+                    painter.setBrush(avatar_color)
+                    painter.setPen(QtCore.Qt.NoPen)
+                    painter.drawEllipse(QtCore.QRect(ax, ay, avatar_size, avatar_size))
+                    painter.setPen(QtGui.QColor(255, 255, 255))
+                    letter = sender[:1] if sender else "?"
+                    painter.drawText(QtCore.QRect(ax, ay, avatar_size, avatar_size), QtCore.Qt.AlignCenter, letter)
+                painter.restore()
+                return
+            # non-image files fallback to bubble with filename
             fm = option.fontMetrics
             pad = 12
-            margin = 10
-            maxw = int(r.width() * 0.5)
-            if pix is not None:
-                img_w = min(maxw, pix.width())
-                img_h = int(pix.height() * (img_w / pix.width()))
-                bubble_w = img_w + pad * 2
-                bubble_h = img_h + pad * 2 + fm.height()
-            else:
-                br = fm.boundingRect(filename)
-                bubble_w = br.width() + pad * 2
-                bubble_h = br.height() + pad * 2
-            if is_self:
-                bubble_x = r.right() - bubble_w - margin
-                bubble_color = QtGui.QColor(88, 185, 87)
-            else:
-                bubble_x = r.left() + margin
-                bubble_color = QtGui.QColor(235, 235, 235)
+            bubble_color = QtGui.QColor(88, 185, 87) if is_self else QtGui.QColor(235, 235, 235)
+            br = fm.boundingRect(filename)
+            bubble_w = min(maxw, br.width() + pad * 2)
+            bubble_h = br.height() + pad * 2
+            bubble_x = (r.right() - bubble_w - margin - avatar_size - avatar_pad) if is_self else (r.left() + margin + avatar_size + avatar_pad)
             bubble_y = r.top() + 8
             bubble_rect = QtCore.QRect(bubble_x, bubble_y, bubble_w, bubble_h)
             painter.setPen(QtCore.Qt.NoPen)
             painter.setBrush(bubble_color)
             painter.drawRoundedRect(bubble_rect, 12, 12)
-            content_rect = bubble_rect.adjusted(pad, pad, -pad, -pad)
-            if pix is not None:
-                painter.drawPixmap(QtCore.QRect(content_rect.x(), content_rect.y(), img_w, img_h), pix)
-                painter.setPen(QtGui.QColor(0, 0, 0))
-                painter.drawText(QtCore.QRect(content_rect.x(), content_rect.y() + img_h + 4, img_w, fm.height()), QtCore.Qt.AlignLeft, filename)
-            else:
-                painter.setPen(QtGui.QColor(0, 0, 0) if not is_self else QtGui.QColor(255, 255, 255))
-                painter.drawText(content_rect, QtCore.Qt.TextWordWrap, filename)
+            painter.setPen(QtGui.QColor(0, 0, 0) if not is_self else QtGui.QColor(255, 255, 255))
+            painter.drawText(bubble_rect.adjusted(pad, pad, -pad, -pad), QtCore.Qt.TextWordWrap, filename)
             painter.restore()
             return
         maxw = int(r.width() * 0.65)
@@ -243,32 +301,14 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         text_rect = bubble_rect.adjusted(pad, pad, -pad, -pad)
         painter.save()
         painter.translate(text_rect.topLeft())
-        ctx = QtGui.QAbstractTextDocumentLayout.PaintContext()
-        sel_start = index.data(ChatModel.SelStartRole) or None
-        sel_end = index.data(ChatModel.SelEndRole) or None
-        if isinstance(sel_start, int) and isinstance(sel_end, int) and sel_end != sel_start:
-            s = QtGui.QAbstractTextDocumentLayout.Selection()
-            cur = QtGui.QTextCursor(doc)
-            cur.setPosition(sel_start)
-            cur.setPosition(sel_end, QtGui.QTextCursor.KeepAnchor)
-            s.cursor = cur
-            fmt = QtGui.QTextCharFormat()
-            fmt.setBackground(QtGui.QBrush(QtGui.QColor(255, 255, 0, 120)))
-            s.format = fmt
-            ctx.selections = [s]
-        doc.documentLayout().draw(painter, ctx)
+        doc.drawContents(painter, QtCore.QRectF(0, 0, text_rect.width(), text_rect.height()))
         painter.restore()
         name_color = QtGui.QColor(120, 120, 120)
         painter.setPen(name_color)
         name_y = bubble_rect.top() - 4
         if not is_self:
             painter.drawText(QtCore.QRect(bubble_x, name_y - fm.height(), bubble_w, fm.height()), QtCore.Qt.AlignLeft, sender)
-        time_text = when.toString("HH:mm") if isinstance(when, QtCore.QDateTime) else ""
-        painter.setPen(QtGui.QColor(150, 150, 150))
-        if is_self:
-            painter.drawText(QtCore.QRect(bubble_rect.left(), bubble_rect.bottom() + 4, bubble_w, fm.height()), QtCore.Qt.AlignRight, time_text)
-        else:
-            painter.drawText(QtCore.QRect(bubble_rect.left(), bubble_rect.bottom() + 4, bubble_w, fm.height()), QtCore.Qt.AlignLeft, time_text)
+        # no per-bubble time; time separators handled by system rows
         avatar = index.data(ChatModel.AvatarRole)
         if is_self:
             ax = r.right() - margin - avatar_size
@@ -295,6 +335,19 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             fm = option.fontMetrics
             h = fm.height() + 20
             return QtCore.QSize(option.rect.width(), h)
+        if kind == "file":
+            fm = option.fontMetrics
+            maxw = int(option.rect.width() * 0.5)
+            mime = (index.data(ChatModel.MimeRole) or "").lower()
+            pix = index.data(ChatModel.PixmapRole)
+            if mime.startswith("image/") and isinstance(pix, QtGui.QPixmap):
+                img_w = min(maxw, pix.width())
+                img_h = int(pix.height() * (img_w / max(1, pix.width())))
+                spacing = 16
+                h = img_h + spacing
+                avatar_block = 22 + 24
+                h = max(h, avatar_block)
+                return QtCore.QSize(option.rect.width(), h)
         fm = option.fontMetrics
         maxw = int(option.rect.width() * 0.65)
         doc = QtGui.QTextDocument()
@@ -318,6 +371,187 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         h = max(h, avatar_block)
         return QtCore.QSize(option.rect.width(), h)
 
+
+class ChatInput(QtWidgets.QTextEdit):
+    imagePasted = QtCore.Signal(object, object, str, str)
+    sendRequested = QtCore.Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptRichText(True)
+        self.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
+
+    def insertFromMimeData(self, source: QtCore.QMimeData):
+        try:
+            if source and source.hasUrls():
+                for u in source.urls():
+                    p = u.toLocalFile()
+                    if p and os.path.isfile(p):
+                        ext_mime = self._guess_mime(p)
+                        if ext_mime.startswith("image/"):
+                            reader = QtGui.QImageReader(p)
+                            qimg = reader.read()
+                            if not qimg.isNull():
+                                self._insert_preview_image(qimg)
+                            with open(p, "rb") as f:
+                                data = f.read()
+                            pm = QtGui.QPixmap.fromImage(qimg) if not qimg.isNull() else QtGui.QPixmap(p)
+                            name = os.path.basename(p)
+                            self.imagePasted.emit(data, pm, ext_mime, name)
+                            return
+        except Exception:
+            pass
+        try:
+            if source and source.hasImage():
+                qobj = source.imageData()
+                qimg = None
+                if isinstance(qobj, QtGui.QImage):
+                    qimg = qobj
+                elif isinstance(qobj, QtGui.QPixmap):
+                    qimg = qobj.toImage()
+                elif hasattr(qobj, 'toImage'):
+                    try:
+                        qimg = qobj.toImage()
+                    except Exception:
+                        qimg = None
+                if isinstance(qimg, QtGui.QImage) and not qimg.isNull():
+                    self._insert_preview_image(qimg)
+                    buf = QtCore.QBuffer()
+                    buf.open(QtCore.QIODevice.WriteOnly)
+                    qimg.save(buf, "PNG")
+                    data = bytes(buf.data())
+                    name = "paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png"
+                    pm = QtGui.QPixmap.fromImage(qimg)
+                    self.imagePasted.emit(data, pm, "image/png", name)
+                    return
+        except Exception:
+            pass
+        try:
+            if source and source.hasHtml():
+                html = source.html() or ""
+                if "data:image" in html and "base64," in html:
+                    start = html.find("base64,") + len("base64,")
+                    end = html.find("'", start)
+                    b64 = html[start:end] if end != -1 else html[start:]
+                    data = base64.b64decode(b64)
+                    qimg = QtGui.QImage()
+                    qimg.loadFromData(data)
+                    if not qimg.isNull():
+                        self._insert_preview_image(qimg)
+                        pm = QtGui.QPixmap.fromImage(qimg)
+                        name = "paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png"
+                        self.imagePasted.emit(data, pm, "image/png", name)
+                        return
+        except Exception:
+            pass
+        super().insertFromMimeData(source)
+
+    def keyPressEvent(self, ev: QtGui.QKeyEvent):
+        try:
+            if ev.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) and not (ev.modifiers() & QtCore.Qt.ShiftModifier):
+                self.sendRequested.emit()
+                return
+        except Exception:
+            pass
+        super().keyPressEvent(ev)
+
+    def _insert_preview_datauri(self, data: bytes, mime: str):
+        try:
+            b64 = base64.b64encode(data).decode("ascii")
+            w = self._preview_target_width()
+            html = f"<img src='data:{mime};base64,{b64}' style='max-width:{w}px; height:auto;'/>"
+            self.textCursor().insertHtml(html)
+        except Exception:
+            pass
+
+    def _insert_preview_image(self, qimg: QtGui.QImage):
+        try:
+            if qimg.isNull():
+                return
+            name = "inline-" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch()))
+            w = min(self._preview_target_width(), qimg.width())
+            h = int(qimg.height() * (w / max(1, qimg.width())))
+            fmt = QtGui.QTextImageFormat()
+            fmt.setName(name)
+            fmt.setWidth(float(w))
+            fmt.setHeight(float(h))
+            self.document().addResource(QtGui.QTextDocument.ImageResource, QtCore.QUrl(name), qimg)
+            cur = self.textCursor()
+            cur.insertImage(fmt)
+        except Exception:
+            try:
+                self.textCursor().insertImage(qimg)
+            except Exception:
+                pass
+
+    def _preview_target_width(self) -> int:
+        try:
+            vw = self.viewport().width()
+            w = int(vw * 0.8) if vw > 0 else 300
+            return max(200, min(w, 600))
+        except Exception:
+            return 300
+
+class SidebarItem(QtWidgets.QFrame):
+    clicked = QtCore.Signal()
+
+    def __init__(self, icon_path: str, text: str):
+        super().__init__()
+        self.setObjectName("SidebarItem")
+        vl = QtWidgets.QVBoxLayout()
+        try:
+            vl.setContentsMargins(6, 6, 6, 6)
+            vl.setSpacing(4)
+        except Exception:
+            pass
+        self.icon = QtWidgets.QLabel()
+        self.icon.setFixedSize(24, 24)
+        try:
+            self.icon.setPixmap(QtGui.QIcon(icon_path).pixmap(24, 24))
+        except Exception:
+            pass
+        self.label = QtWidgets.QLabel(text)
+        try:
+            self.label.setAlignment(QtCore.Qt.AlignHCenter)
+            self.label.setWordWrap(True)
+        except Exception:
+            pass
+        self.badge = QtWidgets.QLabel()
+        self.badge.setVisible(False)
+        try:
+            self.badge.setStyleSheet("QLabel{background:#F44336;color:#fff;border-radius:8px;padding:0 6px;font:11px 'Helvetica Neue';}")
+        except Exception:
+            pass
+        vl.addWidget(self.icon, 0, QtCore.Qt.AlignHCenter)
+        vl.addWidget(self.label, 0, QtCore.Qt.AlignHCenter)
+        vl.addWidget(self.badge, 0, QtCore.Qt.AlignHCenter)
+        self.setLayout(vl)
+        self.setSelected(False)
+
+    def mouseReleaseEvent(self, ev: QtGui.QMouseEvent):
+        try:
+            self.clicked.emit()
+        except Exception:
+            pass
+
+    def setSelected(self, sel: bool):
+        try:
+            if sel:
+                self.setStyleSheet("QFrame#SidebarItem{background:#e6f0ff;border:1px solid #cfe3ff;border-radius:6px;}")
+            else:
+                self.setStyleSheet("QFrame#SidebarItem{background:transparent;border:none;}")
+        except Exception:
+            pass
+
+    def _guess_mime(self, path: str) -> str:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in [".png"]:
+            return "image/png"
+        if ext in [".jpg", ".jpeg"]:
+            return "image/jpeg"
+        if ext in [".gif"]:
+            return "image/gif"
+        return "application/octet-stream"
 
 class ChatWindow(QtWidgets.QWidget):
     def __init__(self, host: str, port: int, username: str, log_dir: str, room: str, avatar_path: Optional[str] = None):
@@ -368,77 +602,171 @@ class ChatWindow(QtWidgets.QWidget):
         self.copy_shortcut.activated.connect(self.copy_selected)
         self.conv_list = QtWidgets.QListWidget()
         self.conv_list.setIconSize(QtCore.QSize(24, 24))
-        self.entry = QtWidgets.QLineEdit()
-        self.send_btn = QtWidgets.QPushButton("发送")
-        self.send_file_btn = QtWidgets.QPushButton("发送文件")
-        for b in (self.send_btn, self.send_file_btn):
-            try:
-                b.setAttribute(QtCore.Qt.WA_MacSmallSize, True)
-                b.setMaximumHeight(28)
-                b.setMinimumHeight(22)
-                sp = b.sizePolicy()
-                sp.setVerticalPolicy(QtWidgets.QSizePolicy.Fixed)
-                b.setSizePolicy(sp)
-                b.setStyleSheet("QPushButton { min-height: 24px; max-height: 28px; padding: 4px 10px; }")
-            except Exception:
-                pass
+        try:
+            self.conv_list.setFrameShape(QtWidgets.QFrame.NoFrame)
+            self.conv_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self.conv_list.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            self.conv_list.setFocusPolicy(QtCore.Qt.NoFocus)
+            self.conv_list.setStyleSheet(
+                "QListWidget{border:none;background:transparent;}"
+                "QListWidget::item{border:none;padding:6px;}"
+                "QListWidget::item:selected{background:transparent;border:1px solid #cfe3ff;border-radius:6px;}"
+                "QListWidget::item:hover{background:#f5f7fa;}"
+            )
+        except Exception:
+            pass
+        # 左侧功能栏（头像 + 私聊入口）
+        self.sidebar = QtWidgets.QFrame()
+        self.sidebar.setFixedWidth(64)
+        sb = QtWidgets.QVBoxLayout()
+        try:
+            sb.setContentsMargins(8, 8, 8, 8)
+            sb.setSpacing(12)
+        except Exception:
+            pass
+        self.avatar_label = QtWidgets.QLabel()
+        self.avatar_label.setFixedSize(40, 40)
+        self.avatar_label.setScaledContents(True)
+        try:
+            pm = self.avatar_pixmap if self.avatar_pixmap else self._letter_pixmap(self.username, 40)
+            self.avatar_label.setPixmap(pm.scaled(40, 40, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        except Exception:
+            pass
+        msg_icon_path = os.path.join(os.getcwd(), "icons", "ui", "message.png")
+        self.msg_item = SidebarItem(msg_icon_path, "消息")
+        self.msg_item.clicked.connect(self.on_sidebar_message)
+        self.msg_badge = self.msg_item.badge
+        setting_icon_path = os.path.join(os.getcwd(), "icons", "ui", "setting.png")
+        self.setting_item = SidebarItem(setting_icon_path, "设置")
+        self.setting_item.clicked.connect(self.on_sidebar_setting)
+        sb.addWidget(self.avatar_label, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
+        sb.addWidget(self.msg_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
+        sb.addWidget(self.setting_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
+        sb.addStretch(1)
+        self.sidebar.setLayout(sb)
+        self.entry = ChatInput()
+        self.entry.imagePasted.connect(self._on_image_pasted)
+        try:
+            self.entry.setMinimumHeight(90)
+            self.entry.setMaximumHeight(180)
+        except Exception:
+            pass
+        self.pending_image_bytes = None
+        self.pending_image_mime = None
+        self.pending_image_name = None
+        self.pending_image_pixmap = None
+        # shortcuts bound to entry
+        try:
+            self.send_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self.entry)
+            self.send_shortcut.activated.connect(self.on_send)
+            self.send_shortcut2 = QtGui.QShortcut(QtGui.QKeySequence("Meta+Return"), self.entry)
+            self.send_shortcut2.activated.connect(self.on_send)
+        except Exception:
+            pass
+        self.entry.sendRequested.connect(self.on_send)
         layout = QtWidgets.QHBoxLayout()
+        try:
+            layout.setContentsMargins(8, 8, 8, 8)
+            layout.setSpacing(8)
+        except Exception:
+            pass
+        layout.addWidget(self.sidebar, 0)
+        self.side_divider = QtWidgets.QFrame()
+        try:
+            self.side_divider.setFrameShape(QtWidgets.QFrame.VLine)
+            self.side_divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+        except Exception:
+            pass
+        layout.addWidget(self.side_divider, 0)
         left = QtWidgets.QVBoxLayout()
+        try:
+            left.setContentsMargins(0, 0, 0, 0)
+            left.setSpacing(6)
+        except Exception:
+            pass
         left.addWidget(self.conv_list, 1)
         left_container = QtWidgets.QWidget()
         left_container.setLayout(left)
-        layout.addWidget(left_container, 2)
         right = QtWidgets.QVBoxLayout()
+        try:
+            right.setContentsMargins(0, 0, 0, 0)
+            right.setSpacing(6)
+        except Exception:
+            pass
         right.addWidget(self.view, 5)
         h = QtWidgets.QHBoxLayout()
+        try:
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+        except Exception:
+            pass
         h.addWidget(self.entry)
-        h.addWidget(self.send_btn)
-        h.addWidget(self.send_file_btn)
         right.addLayout(h)
-        container = QtWidgets.QWidget()
-        container.setLayout(right)
-        layout.addWidget(container, 5)
+        chat_container = QtWidgets.QWidget()
+        chat_container.setLayout(right)
+        self.settings_container = self._make_settings_panel()
+        self.right_stack = QtWidgets.QStackedWidget()
+        self.right_stack.addWidget(chat_container)
+        self.right_stack.addWidget(self.settings_container)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        splitter.addWidget(left_container)
+        splitter.addWidget(self.right_stack)
+        try:
+            splitter.setStretchFactor(0, 0)
+            splitter.setStretchFactor(1, 1)
+            splitter.setSizes([240, 720])
+        except Exception:
+            pass
+        layout.addWidget(splitter, 1)
         self.setLayout(layout)
+        try:
+            self.setMinimumSize(900, 700)
+            self.resize(1120, 800)
+        except Exception:
+            pass
 
-        self.entry.returnPressed.connect(self.on_send)
-        self.send_btn.clicked.connect(self.on_send)
+        # QTextEdit 直接回车发送，支持 Ctrl/⌘+Enter 备用快捷键
         self.conv_list.itemDoubleClicked.connect(self.on_pick_conv)
-        self.send_file_btn.clicked.connect(self.on_send_file)
-        self._connect()
+        self.conv_list.itemClicked.connect(self.on_pick_conv)
+        try:
+            QtCore.QTimer.singleShot(0, lambda: self._connect())
+        except Exception:
+            self._connect()
         self.conv_unread = {}
+        self.conv_badges = {}
         self._init_conversations()
-        gpath = os.path.join(os.getcwd(), "icons", "user", "group.png")
-        gicon = QtGui.QIcon(gpath) if os.path.exists(gpath) else QtGui.QIcon(self._letter_pixmap("群"))
-        gi = QtWidgets.QListWidgetItem(gicon, f"群聊:{self.room}")
-        self.conv_list.addItem(gi)
+        try:
+            self._update_sidebar_badge()
+        except Exception:
+            pass
+        # 屏蔽群聊入口
         self._bootstrap_local()
 
-    def _connect(self):
+    def _connect(self) -> bool:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        attempts = 0
-        while True:
-            try:
-                s.connect((self.host, self.port))
-                break
-            except Exception:
-                attempts += 1
-                if attempts >= 10:
-                    raise
-                time.sleep(0.5)
+        try:
+            s.connect((self.host, self.port))
+        except Exception:
+            self.sock = None
+            return False
         self.sock = s
-        hello = f"HELLO {self.username} {self.room}\n".encode("utf-8")
-        self.sock.sendall(hello)
+        try:
+            hello = f"HELLO {self.username} {self.room}\n".encode("utf-8")
+            self.sock.sendall(hello)
+        except Exception:
+            pass
         self.rx = Receiver(self.sock)
         self.rx.received.connect(self.on_received)
         self.rx.start()
-        self.current_conv = f"group:{self.room}"
-        self._ensure_conv(self.current_conv)
-        self.current_model = self.conv_models[self.current_conv]
+        # 初始化一个空模型，等待选择私聊
+        self.current_conv = None
+        self.current_model = ChatModel()
         self.view.setModel(self.current_model)
         self.hb = QtCore.QTimer(self)
         self.hb.setInterval(30000)
         self.hb.timeout.connect(self._send_ping)
         self.hb.start()
+        return True
         jwt_sec = os.environ.get("JWT_SECRET")
         if jwt_sec:
             try:
@@ -461,7 +789,7 @@ class ChatWindow(QtWidgets.QWidget):
                     self._send_seq(f"AUTH {self.username} {ts} {mac}")
                 except Exception:
                     pass
-        self._send_seq("UNREAD")
+        # 不自动请求未读，避免清空本地后服务端推送历史
         if self.avatar_filename:
             try:
                 self._send_seq(f"AVATAR {self.avatar_filename}")
@@ -477,14 +805,7 @@ class ChatWindow(QtWidgets.QWidget):
         if text.startswith("PONG "):
             return
         if text.startswith("[ACK] "):
-            try:
-                n = int(text.split()[1])
-                m = self.conv_models.get(self.current_conv)
-                if m:
-                    m.add("sys", "", f"已送达 {n}", False, None)
-                    self.view.scrollToBottom()
-            except Exception:
-                pass
+            return
             return
         if text.startswith("[SYS] "):
             parts = text.split()
@@ -499,6 +820,15 @@ class ChatWindow(QtWidgets.QWidget):
                     if user != self.username:
                         self._add_conv_dm(user)
                     self.view.scrollToBottom()
+                return
+            if len(parts) >= 2 and parts[1] == "DISCONNECT":
+                try:
+                    m = self.conv_models.get(self.current_conv) if self.current_conv else None
+                    if m:
+                        m.add("sys", "", "服务器连接已断开", False, None)
+                        self.view.scrollToBottom()
+                except Exception:
+                    pass
                 return
             if len(parts) >= 4 and parts[1] == "LEAVE":
                 room = parts[2]
@@ -522,17 +852,6 @@ class ChatWindow(QtWidgets.QWidget):
                         avatar = None
                         if ":" in u:
                             uname, avatar = u.split(":",1)
-                        found = False
-                        title = f"群聊:{self.room}"
-                        for i in range(self.conv_list.count()):
-                            base = self.conv_list.item(i).text().split(" (",1)[0]
-                            if base == title:
-                                found = True
-                                break
-                        if not found:
-                            gpath = os.path.join(os.getcwd(), "icons", "user", "group.png")
-                            gicon = QtGui.QIcon(gpath) if os.path.exists(gpath) else QtGui.QIcon(self._letter_pixmap("群"))
-                            self.conv_list.addItem(QtWidgets.QListWidgetItem(gicon, title))
                         if uname != self.username:
                             if avatar:
                                 self._set_peer_avatar(uname, avatar)
@@ -549,20 +868,6 @@ class ChatWindow(QtWidgets.QWidget):
             if len(parts) >= 6 and parts[1] == "HISTORY":
                 kind = parts[2]
                 if kind == "GROUP":
-                    room = parts[3]
-                    sender = parts[4]
-                    ts = parts[5]
-                    payload = " ".join(parts[6:]) if len(parts) > 6 else ""
-                    self._ensure_conv(f"group:{room}")
-                    if payload.startswith("[FILE] "):
-                        fn, mime, b64 = self._parse_file(payload)
-                        pix = self._pix_from_b64(mime, b64)
-                        self._save_attachment(fn, b64)
-                        av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                        self.conv_models[f"group:{room}"].add_file(sender, fn, mime, pix, sender == self.username, av)
-                    else:
-                        av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                        self.conv_models[f"group:{room}"].add("msg", sender, payload, sender == self.username, av)
                     return
                 if kind == "DM":
                     peer = parts[3]
@@ -572,13 +877,26 @@ class ChatWindow(QtWidgets.QWidget):
                     self._ensure_conv(f"dm:{peer}")
                     if payload.startswith("[FILE] "):
                         fn, mime, b64 = self._parse_file(payload)
+                        if self._is_deleted(f"dm:{peer}", "file", fn, mime):
+                            return
+                        
                         pix = self._pix_from_b64(mime, b64)
-                        self._save_attachment(fn, b64)
+                        self._save_attachment(fn, b64, f"dm:{peer}")
                         av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                        self.conv_models[f"dm:{peer}"].add_file(sender, fn, mime, pix, sender == self.username, av)
+                        self.conv_models[f"dm:{peer}"].add_file(sender, fn, mime, pix, sender == self.username, av, int(ts) if ts else None)
+                    elif payload.startswith("file://"):
+                        local_path = QtCore.QUrl(payload).toLocalFile()
+                        try:
+                            self._add_file_from_path(f"dm:{peer}", sender, local_path, sender == self.username)
+                        except Exception:
+                            pass
                     else:
-                        av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                        self.conv_models[f"dm:{peer}"].add("msg", sender, payload, sender == self.username, av)
+                        payload_clean = self._sanitize_text(payload)
+                        if self._is_deleted(f"dm:{peer}", "msg", payload_clean, None):
+                            return
+                        if payload_clean:
+                            av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                            self.conv_models[f"dm:{peer}"].add("msg", sender, payload_clean, sender == self.username, av, int(ts) if ts else None)
                     return
             if len(parts) >= 4 and parts[1] == "UNREAD":
                 conv = parts[2]
@@ -602,17 +920,30 @@ class ChatWindow(QtWidgets.QWidget):
                 msg = parts[3]
                 if msg.startswith("[FILE] "):
                     fn, mime, b64 = self._parse_file(msg)
+                    if self._is_deleted(f"dm:{name}", "file", fn, mime):
+                        return
+                    
                     pix = self._pix_from_b64(mime, b64)
-                    self._save_attachment(fn, b64)
+                    self._save_attachment(fn, b64, f"dm:{name}")
                     self._ensure_conv(f"dm:{name}")
                     av = self.peer_avatars.get(name)
                     self.conv_models[f"dm:{name}"].add_file(name, fn, mime, pix, False, av)
                     self.store.add(f"dm:{name}", name, f"[FILE] {fn} {mime}", "file", False)
+                elif msg.startswith("file://"):
+                    local_path = QtCore.QUrl(msg).toLocalFile()
+                    try:
+                        self._add_file_from_path(f"dm:{name}", name, local_path, False)
+                    except Exception:
+                        pass
                 else:
-                    self._ensure_conv(f"dm:{name}")
-                    av = self.peer_avatars.get(name)
-                    self.conv_models[f"dm:{name}"].add("msg", name, msg, False, av)
-                    self.store.add(f"dm:{name}", name, msg, "msg", False)
+                    msg_clean = self._sanitize_text(msg)
+                    if self._is_deleted(f"dm:{name}", "msg", msg_clean, None):
+                        return
+                    if msg_clean:
+                        self._ensure_conv(f"dm:{name}")
+                        av = self.peer_avatars.get(name)
+                        self.conv_models[f"dm:{name}"].add("msg", name, msg_clean, False, av)
+                        self.store.add(f"dm:{name}", name, msg_clean, "msg", False)
                 self.view.scrollToBottom()
                 self._add_conv_dm(name)
                 if self.current_conv != f"dm:{name}":
@@ -625,15 +956,28 @@ class ChatWindow(QtWidgets.QWidget):
                     return
                 if msg.startswith("[FILE] "):
                     fn, mime, b64 = self._parse_file(msg)
+                    if self._is_deleted(f"dm:{target}", "file", fn, mime):
+                        return
+                    
                     pix = self._pix_from_b64(mime, b64)
-                    self._save_attachment(fn, b64)
+                    self._save_attachment(fn, b64, f"dm:{target}")
                     self._ensure_conv(f"dm:{target}")
                     self.conv_models[f"dm:{target}"].add_file(self.username, fn, mime, pix, True, self.avatar_pixmap)
                     self.store.add(f"dm:{target}", self.username, f"[FILE] {fn} {mime}", "file", True)
+                elif msg.startswith("file://"):
+                    local_path = QtCore.QUrl(msg).toLocalFile()
+                    try:
+                        self._add_file_from_path(f"dm:{target}", self.username, local_path, True)
+                    except Exception:
+                        pass
                 else:
-                    self._ensure_conv(f"dm:{target}")
-                    self.conv_models[f"dm:{target}"].add("msg", self.username, msg, True, self.avatar_pixmap)
-                    self.store.add(f"dm:{target}", self.username, msg, "msg", True)
+                    msg_clean = self._sanitize_text(msg)
+                    if self._is_deleted(f"dm:{target}", "msg", msg_clean, None):
+                        return
+                    if msg_clean:
+                        self._ensure_conv(f"dm:{target}")
+                        self.conv_models[f"dm:{target}"].add("msg", self.username, msg_clean, True, self.avatar_pixmap)
+                        self.store.add(f"dm:{target}", self.username, msg_clean, "msg", True)
                 self.view.scrollToBottom()
                 self._add_conv_dm(target)
                 return
@@ -643,40 +987,114 @@ class ChatWindow(QtWidgets.QWidget):
             msg = msg.strip()
             if msg.startswith("[FILE] "):
                 fn, mime, b64 = self._parse_file(msg)
+                if self._is_deleted(f"group:{self.room}", "file", fn, mime):
+                    return
+                
                 pix = self._pix_from_b64(mime, b64)
-                self._save_attachment(fn, b64)
+                self._save_attachment(fn, b64, f"group:{self.room}")
                 self._ensure_conv(f"group:{self.room}")
                 av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
                 self.conv_models[f"group:{self.room}"].add_file(name, fn, mime, pix, name == self.username, av)
                 self.store.add(f"group:{self.room}", name, f"[FILE] {fn} {mime}", "file", name == self.username)
+            elif msg.startswith("file://"):
+                local_path = QtCore.QUrl(msg).toLocalFile()
+                try:
+                    self._add_file_from_path(f"group:{self.room}", name, local_path, name == self.username)
+                except Exception:
+                    pass
             else:
-                self._ensure_conv(f"group:{self.room}")
-                av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
-                self.conv_models[f"group:{self.room}"].add("msg", name, msg, name == self.username, av)
-                self.store.add(f"group:{self.room}", name, msg, "msg", name == self.username)
+                msg_clean = self._sanitize_text(msg)
+                if self._is_deleted(f"group:{self.room}", "msg", msg_clean, None):
+                    return
+                if msg_clean:
+                    self._ensure_conv(f"group:{self.room}")
+                    av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
+                    self.conv_models[f"group:{self.room}"].add("msg", name, msg_clean, name == self.username, av)
+                    self.store.add(f"group:{self.room}", name, msg_clean, "msg", name == self.username)
             self.view.scrollToBottom()
             if self.current_conv != f"group:{self.room}":
                 self._inc_unread(f"group:{self.room}")
 
     def on_send(self):
-        text = self.entry.text().strip()
-        if not text:
+        if not self.current_conv:
             return
+        text = self._sanitize_text(self.entry.toPlainText())
+        if not self.pending_image_bytes:
+            img_bytes = self._extract_first_image_from_editor()
+            if img_bytes:
+                self.pending_image_bytes = img_bytes
+                self.pending_image_mime = "image/png"
+                self.pending_image_name = "paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png"
+                self.pending_image_pixmap = None
+            
         try:
-            if self.current_conv.startswith("dm:"):
-                target = self.current_conv.split(":",1)[1]
-                self._send_seq(f"DM {target} {text}")
-                self.store.add(f"dm:{target}", self.username, text, "msg", True)
+            if self.pending_image_bytes:
+                b64 = base64.b64encode(self.pending_image_bytes).decode("ascii")
+                name = self.pending_image_name or ("paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png")
+                mime = self.pending_image_mime or "image/png"
+                payload_text = f"[FILE] {name} {mime} {b64}"
+                if self.current_conv.startswith("dm:"):
+                    target = self.current_conv.split(":",1)[1]
+                    self._send_seq(f"DM {target} {payload_text}")
+                    self.store.add(f"dm:{target}", self.username, payload_text, "file", True)
+                else:
+                    self._send_seq(f"MSG {payload_text}")
+                    self.store.add(f"group:{self.room}", self.username, payload_text, "file", True)
+                self.logger.write("sent", self.username, payload_text)
                 self._ensure_conv(self.current_conv)
-                self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
+                self.conv_models[self.current_conv].add_file(self.username, name, mime, _pix, True, self.avatar_pixmap)
+                try:
+                    self._save_attachment(name, b64, self.current_conv)
+                except Exception:
+                    pass
+                self.pending_image_bytes = None
+                self.pending_image_mime = None
+                self.pending_image_name = None
+                self.pending_image_pixmap = None
                 self.view.scrollToBottom()
             else:
-                self._send_seq(f"MSG {text}")
-                self.store.add(f"group:{self.room}", self.username, text, "msg", True)
-                self._ensure_conv(self.current_conv)
-                self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
-                self.view.scrollToBottom()
-            self.logger.write("sent", self.username, text)
+                url_path = self._extract_first_file_url_from_text(text)
+                if url_path and os.path.isfile(url_path):
+                    try:
+                        with open(url_path, "rb") as f:
+                            data = f.read()
+                        name = os.path.basename(url_path)
+                        mime = self._guess_mime(url_path)
+                        b64 = base64.b64encode(data).decode("ascii")
+                        payload_text = f"[FILE] {name} {mime} {b64}"
+                        if self.current_conv.startswith("dm:"):
+                            target = self.current_conv.split(":",1)[1]
+                            self._send_seq(f"DM {target} {payload_text}")
+                            self.store.add(f"dm:{target}", self.username, payload_text, "file", True)
+                        else:
+                            self._send_seq(f"MSG {payload_text}")
+                            self.store.add(f"group:{self.room}", self.username, payload_text, "file", True)
+                        self.logger.write("sent", self.username, payload_text)
+                        self._ensure_conv(self.current_conv)
+                        pix = QtGui.QPixmap(url_path)
+                        self.conv_models[self.current_conv].add_file(self.username, name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap)
+                        self._save_attachment(name, b64, self.current_conv)
+                        text = self._sanitize_text(text.replace(f"file://{url_path}", ""))
+                        self.view.scrollToBottom()
+                    except Exception:
+                        pass
+            if text:
+                if self.current_conv.startswith("dm:"):
+                    target = self.current_conv.split(":",1)[1]
+                    self._send_seq(f"DM {target} {text}")
+                    self.store.add(f"dm:{target}", self.username, text, "msg", True)
+                    self._ensure_conv(self.current_conv)
+                    self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                    self.view.scrollToBottom()
+                else:
+                    self._send_seq(f"MSG {text}")
+                    self.store.add(f"group:{self.room}", self.username, text, "msg", True)
+                    self._ensure_conv(self.current_conv)
+                    self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                    self.view.scrollToBottom()
+            if text:
+                self.logger.write("sent", self.username, text)
             self.entry.clear()
         except Exception:
             pass
@@ -699,8 +1117,34 @@ class ChatWindow(QtWidgets.QWidget):
                 exists = True
                 break
         if not exists:
-            it = QtWidgets.QListWidgetItem(self._icon_for_name(name), name)
+            it = QtWidgets.QListWidgetItem(name)
+            it.setSizeHint(QtCore.QSize(200, 44))
             self.conv_list.addItem(it)
+            row = self.conv_list.count() - 1
+            w = QtWidgets.QWidget()
+            hl = QtWidgets.QHBoxLayout()
+            try:
+                hl.setContentsMargins(12, 6, 12, 6)
+                hl.setSpacing(8)
+            except Exception:
+                pass
+            avatar_lbl = QtWidgets.QLabel()
+            avatar_lbl.setFixedSize(24, 24)
+            pmicon = self._icon_for_name(name)
+            avatar_lbl.setPixmap(pmicon.pixmap(24, 24))
+            name_lbl = QtWidgets.QLabel(name)
+            badge_lbl = QtWidgets.QLabel()
+            badge_lbl.setVisible(False)
+            try:
+                badge_lbl.setStyleSheet("QLabel{background:#F44336;color:#fff;border-radius:8px;padding:0 6px;font:11px 'Helvetica Neue';}")
+            except Exception:
+                pass
+            hl.addWidget(avatar_lbl)
+            hl.addWidget(name_lbl, 1)
+            hl.addWidget(badge_lbl)
+            w.setLayout(hl)
+            self.conv_list.setItemWidget(it, w)
+            self.conv_badges[f"dm:{name}"] = badge_lbl
         self._ensure_unread_key(f"dm:{name}")
         self._ensure_conv(f"dm:{name}")
 
@@ -755,10 +1199,12 @@ class ChatWindow(QtWidgets.QWidget):
         self._ensure_unread_key(key)
         self.conv_unread[key] += 1
         self._update_conv_title(key)
+        self._update_sidebar_badge()
 
     def _reset_unread(self, key: str):
         self.conv_unread[key] = 0
         self._update_conv_title(key)
+        self._update_sidebar_badge()
 
     def _update_conv_title(self, key: str):
         title = f"群聊:{self.room}" if key.startswith("group:") else key.split(":",1)[1]
@@ -769,10 +1215,29 @@ class ChatWindow(QtWidgets.QWidget):
             base = item.text().split(" (",1)[0]
             if base == title:
                 item.setText(text)
+                # update per-item badge
+                b = self.conv_badges.get(key)
+                if b is not None:
+                    if count > 0:
+                        b.setText(str(count))
+                        b.setVisible(True)
+                    else:
+                        b.setVisible(False)
                 break
+    def _update_sidebar_badge(self):
+        try:
+            total = sum(v for k,v in self.conv_unread.items() if k.startswith("dm:"))
+            if total > 0:
+                self.msg_badge.setText(str(total))
+                self.msg_badge.setVisible(True)
+            else:
+                self.msg_badge.setVisible(False)
+        except Exception:
+            pass
     def _set_unread(self, key: str, cnt: int):
         self.conv_unread[key] = max(0, cnt)
         self._update_conv_title(key)
+        self._update_sidebar_badge()
 
     def _ensure_conv(self, key: str):
         if key not in self.conv_models:
@@ -837,30 +1302,25 @@ class ChatWindow(QtWidgets.QWidget):
         self.current_model = self.conv_models[key]
         self.view.setModel(self.current_model)
         self._reset_unread(key)
-        if key.startswith("group:"):
-            self._send_seq("READ GROUP")
-        else:
-            peer = key.split(":",1)[1]
-            self._send_seq(f"READ DM {peer}")
+        # 不自动发送 READ，避免服务端推送未读/历史
         if len(self.current_model.items) == 0:
             conv = key
+            missing = 0
             for sender, ts, kind, text, selfflag in self.store.recent(conv, 100):
                 if kind == "file" and text.startswith("[FILE] "):
                     fn, mime, _ = self._parse_file(text)
-                    pix = None
+                    p = self._attachment_path(fn, conv)
+                    pix = QtGui.QPixmap(p) if os.path.isfile(p) else None
                     av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                    self.current_model.add_file(sender, fn, mime, pix, bool(selfflag), av)
+                    self.current_model.add_file(sender, fn, mime, pix if pix and not pix.isNull() else None, bool(selfflag), av, int(ts) if ts else None)
+                    if not (pix and not pix.isNull()):
+                        missing += 1
                 elif kind == "sys":
-                    self.current_model.add("sys", "", text, False, None)
+                    self.current_model.add("sys", "", text, False, None, int(ts) if ts else None)
                 else:
                     av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                    self.current_model.add("msg", sender, text, bool(selfflag), av)
-            if len(self.current_model.items) == 0:
-                if key.startswith("group:"):
-                    self._send_seq("HIST GROUP 50")
-                else:
-                    peer = key.split(":",1)[1]
-                    self._send_seq(f"HIST DM {peer} 50")
+                    self.current_model.add("msg", sender, text, bool(selfflag), av, int(ts) if ts else None)
+            # 不自动拉取历史，保留空界面
 
     def on_view_context_menu(self, pos):
         sender = self.sender()
@@ -894,6 +1354,18 @@ class ChatWindow(QtWidgets.QWidget):
                 mime = index.data(ChatModel.MimeRole)
                 store_text = text if kind == "msg" else (f"[FILE] {filename} {mime}" if filename and mime else text)
                 self.store.delete_message(self.current_conv, sender_name, kind, store_text, is_self, filename, mime)
+                try:
+                    prefix = store_text if kind == "msg" else f"[FILE] {filename} {mime}"
+                    self.store.mark_deleted(self.current_conv, sender_name, kind, prefix)
+                except Exception:
+                    pass
+                if kind == "file" and filename:
+                    try:
+                        p = self._attachment_path(filename, self.current_conv)
+                        if os.path.isfile(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
                 self.current_model.remove_row(index.row())
             act_del.triggered.connect(do_del)
         if kind == "file":
@@ -901,12 +1373,12 @@ class ChatWindow(QtWidgets.QWidget):
             mime = index.data(ChatModel.MimeRole) or ""
             act_open = menu.addAction("打开文件")
             def do_open_file():
-                path = self._attachment_path(filename)
+                path = self._attachment_path(filename, self.current_conv)
                 QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
             act_open.triggered.connect(do_open_file)
             act_open_dir = menu.addAction("打开所在文件夹")
             def do_open_dir():
-                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_dir()))
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_dir(self.current_conv)))
             act_open_dir.triggered.connect(do_open_dir)
             act_preview = menu.addAction("预览")
             pix = index.data(ChatModel.PixmapRole)
@@ -929,6 +1401,13 @@ class ChatWindow(QtWidgets.QWidget):
             if res == QtWidgets.QMessageBox.Yes:
                 self.store.delete_conv(self.current_conv)
                 self.current_model.clear()
+                try:
+                    d = self._attachment_dir(self.current_conv)
+                    if os.path.isdir(d):
+                        shutil.rmtree(d, ignore_errors=True)
+                    self.store.mark_cleared(self.current_conv)
+                except Exception:
+                    pass
         act_clear.triggered.connect(do_clear)
         menu.exec(global_pos)
 
@@ -939,36 +1418,29 @@ class ChatWindow(QtWidgets.QWidget):
         if kind == "file":
             filename = index.data(ChatModel.FileNameRole)
             if filename:
-                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_path(filename)))
+                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_path(filename, self.current_conv)))
         elif kind == "msg":
             txt = index.data(ChatModel.TextRole) or ""
             self._open_text_viewer(txt)
 
     def eventFilter(self, obj, ev):
+        if ev.type() == QtCore.QEvent.ApplicationActivate:
+            try:
+                if not self.isVisible():
+                    self.show()
+                    try:
+                        self.raise_()
+                        self.activateWindow()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return False
         if obj is self.view.viewport():
             if ev.type() == QtCore.QEvent.ContextMenu:
-                self.on_view_context_menu(ev.position().toPoint())
+                self.on_view_context_menu(ev.pos())
                 return True
-            if ev.type() == QtCore.QEvent.MouseButtonPress and ev.button() == QtCore.Qt.LeftButton:
-                idx = self.view.indexAt(ev.position().toPoint())
-                if idx.isValid() and idx.data(ChatModel.KindRole) == "msg":
-                    p = self._text_pos_from_event(idx, ev.position().toPoint())
-                    if p is not None:
-                        self.sel_row = idx.row()
-                        self.sel_anchor = p
-                        self.sel_pos = p
-                        self.current_model.set_selection(self.sel_row, self.sel_anchor, self.sel_pos)
-                return False
-            if ev.type() == QtCore.QEvent.MouseMove and getattr(self, 'sel_row', None) is not None:
-                idx = self.view.indexAt(ev.position().toPoint())
-                if idx.isValid() and idx.row() == self.sel_row:
-                    p = self._text_pos_from_event(idx, ev.position().toPoint())
-                    if p is not None:
-                        self.sel_pos = p
-                        a, b = sorted([self.sel_anchor, self.sel_pos])
-                        self.current_model.set_selection(self.sel_row, a, b)
-                return False
-            if ev.type() == QtCore.QEvent.MouseMove and getattr(self, 'sel_row', None) is None:
+            if ev.type() == QtCore.QEvent.MouseMove:
                 idx = self.view.indexAt(ev.position().toPoint())
                 want_ibeam = False
                 if idx.isValid() and idx.data(ChatModel.KindRole) == "msg":
@@ -981,8 +1453,6 @@ class ChatWindow(QtWidgets.QWidget):
                 return False
             if ev.type() in (QtCore.QEvent.Leave, QtCore.QEvent.MouseButtonRelease):
                 self.view.viewport().unsetCursor()
-                return False
-            if ev.type() == QtCore.QEvent.MouseButtonRelease and getattr(self, 'sel_row', None) is not None:
                 return False
         return super().eventFilter(obj, ev)
 
@@ -1000,7 +1470,7 @@ class ChatWindow(QtWidgets.QWidget):
             QtWidgets.QApplication.clipboard().setText(text)
         elif kind == "file":
             fn = index.data(ChatModel.FileNameRole) or ""
-            path = self._attachment_path(fn)
+            path = self._attachment_path(fn, self.current_conv)
             QtWidgets.QApplication.clipboard().setText(path if os.path.exists(path) else fn)
 
     def _bootstrap_local(self):
@@ -1009,23 +1479,28 @@ class ChatWindow(QtWidgets.QWidget):
             self._add_conv_dm(p)
         # preload group conv
         self._ensure_conv(f"group:{self.room}")
+        missing = 0
         for sender, ts, kind, text, selfflag in self.store.recent(f"group:{self.room}", 100):
             if kind == "file" and text.startswith("[FILE] "):
                 fn, mime, _ = self._parse_file(text)
-                pix = None
+                p = self._attachment_path(fn, f"group:{self.room}")
+                pix = QtGui.QPixmap(p) if os.path.isfile(p) else None
                 av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                self.conv_models[f"group:{self.room}"].add_file(sender, fn, mime, pix, bool(selfflag), av)
+                self.conv_models[f"group:{self.room}"].add_file(sender, fn, mime, pix if pix and not pix.isNull() else None, bool(selfflag), av)
+                if not (pix and not pix.isNull()):
+                    missing += 1
             elif kind == "sys":
                 self.conv_models[f"group:{self.room}"].add("sys", "", text, False, None)
             else:
                 av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
                 self.conv_models[f"group:{self.room}"].add("msg", sender, text, bool(selfflag), av)
-        if len(self.current_model.items) == 0:
-            if self.current_conv.startswith("group:"):
+        # if group model empty or some images missing locally, request history to hydrate attachments
+        try:
+            m = self.conv_models.get(f"group:{self.room}")
+            if (m and len(m.items) == 0) or missing > 0:
                 self._send_seq("HIST GROUP 50")
-            else:
-                peer = self.current_conv.split(":",1)[1]
-                self._send_seq(f"HIST DM {peer} 50")
+        except Exception:
+            pass
 
     def _send_seq(self, body: str):
         try:
@@ -1065,15 +1540,218 @@ class ChatWindow(QtWidgets.QWidget):
                 return None
         return None
 
+    def on_sidebar_message(self):
+        try:
+            self.msg_item.setSelected(True)
+            self.setting_item.setSelected(False)
+            self.conv_list.setVisible(True)
+            self.right_stack.setCurrentIndex(0)
+            self.conv_list.setFocus()
+        except Exception:
+            pass
+
+    def on_sidebar_setting(self):
+        try:
+            self.setting_item.setSelected(True)
+            self.msg_item.setSelected(False)
+            self.conv_list.setVisible(False)
+            self.right_stack.setCurrentIndex(1)
+        except Exception:
+            pass
+
+    def _make_settings_panel(self) -> QtWidgets.QWidget:
+        w = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout()
+        try:
+            v.setContentsMargins(12, 12, 12, 12)
+            v.setSpacing(12)
+        except Exception:
+            pass
+        form = QtWidgets.QFormLayout()
+        self.host_edit = QtWidgets.QLineEdit(self.host)
+        self.port_edit = QtWidgets.QSpinBox()
+        try:
+            self.port_edit.setRange(1, 65535)
+            self.port_edit.setValue(int(self.port))
+        except Exception:
+            pass
+        apply_btn = QtWidgets.QPushButton("保存")
+        clear_btn = QtWidgets.QPushButton("清除缓存")
+        form.addRow("服务器 IP", self.host_edit)
+        form.addRow("端口", self.port_edit)
+        v.addLayout(form)
+        # 移除状态未连接提示
+        h = QtWidgets.QHBoxLayout()
+        h.addStretch(1)
+        h.addWidget(apply_btn)
+        h.addWidget(clear_btn)
+        v.addLayout(h)
+        w.setLayout(v)
+        def do_apply():
+            try:
+                new_host = self.host_edit.text().strip() or self.host
+                new_port = int(self.port_edit.value())
+                _save_client_config(os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json"), new_host, new_port, self.room)
+                self.host = new_host
+                self.port = new_port
+                try:
+                    m = QtWidgets.QMessageBox(self)
+                    m.setIcon(QtWidgets.QMessageBox.Information)
+                    m.setWindowTitle("已保存")
+                    m.setText("配置已保存")
+                    m.exec()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        def do_clear_all():
+            try:
+                res = QtWidgets.QMessageBox.question(self, "确认", "确定清除缓存日志？", QtWidgets.QMessageBox.Yes|QtWidgets.QMessageBox.No)
+                if res == QtWidgets.QMessageBox.Yes:
+                    # 仅清除日志文件
+                    try:
+                        log_dir = self.logger.log_dir if hasattr(self, 'logger') and self.logger else os.path.expanduser("~/Library/Application Support/XiaoCaiChat")
+                        for fn in os.listdir(log_dir):
+                            if fn.endswith('.log'):
+                                try:
+                                    os.remove(os.path.join(log_dir, fn))
+                                except Exception:
+                                    pass
+                        # 同时尝试清理备用 logs 子目录
+                        logs_sub = os.path.join(os.path.expanduser("~/Library/Application Support/XiaoCaiChat"), "logs")
+                        if os.path.isdir(logs_sub):
+                            for fn in os.listdir(logs_sub):
+                                if fn.endswith('.log'):
+                                    try:
+                                        os.remove(os.path.join(logs_sub, fn))
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+                    try:
+                        QtWidgets.QMessageBox.information(self, "完成", "缓存日志已清除")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        apply_btn.clicked.connect(do_apply)
+        clear_btn.clicked.connect(do_clear_all)
+        return w
+
+    def _on_image_pasted(self, data: object, pm: object, mime: str, name: str):
+        try:
+            pixmap = pm if isinstance(pm, QtGui.QPixmap) else None
+            self.pending_image_bytes = data if isinstance(data, (bytes, bytearray)) else None
+            self.pending_image_mime = mime
+            self.pending_image_name = name
+            self.pending_image_pixmap = pixmap
+        except Exception:
+            pass
+
     def _parse_file(self, msg: str):
-        parts = msg.split(" ", 3)
-        name = parts[1] if len(parts) > 1 else "file"
-        mime = parts[2] if len(parts) > 2 else "application/octet-stream"
-        b64 = parts[3] if len(parts) > 3 else ""
+        s = msg.strip()
+        if not s.startswith("[FILE] "):
+            return "file", "application/octet-stream", ""
+        tokens = s.split(" ")
+        if len(tokens) < 4:
+            return "file", "application/octet-stream", ""
+        mime = tokens[-2]
+        b64 = tokens[-1]
+        name = " ".join(tokens[1:-2]) if len(tokens) > 3 else "file"
         return name, mime, b64
 
-    def _save_attachment(self, filename: str, b64: str):
-        att_dir = os.path.join(self.store.root, "attachments")
+    def _is_deleted(self, conv_key: str, kind: str, name_or_text: str, mime: Optional[str]) -> bool:
+        try:
+            if kind == "file":
+                prefix = f"[FILE] {name_or_text} {mime}" if mime else f"[FILE] {name_or_text}"
+            else:
+                prefix = self._sanitize_text(name_or_text or "")
+            return self.store.is_deleted(conv_key, kind, prefix)
+        except Exception:
+            return False
+
+    def _extract_first_image_from_editor(self) -> Optional[bytes]:
+        try:
+            doc: QtGui.QTextDocument = self.entry.document()
+            it = QtGui.QTextDocument.Iterator(doc)
+        except Exception:
+            pass
+        try:
+            cursor = QtGui.QTextCursor(doc)
+            cursor.movePosition(QtGui.QTextCursor.Start)
+            while not cursor.atEnd():
+                fmt = cursor.charFormat()
+                if fmt.isImageFormat():
+                    imgfmt = QtGui.QTextImageFormat(fmt)
+                    url = QtCore.QUrl(imgfmt.name())
+                    res = doc.resource(QtGui.QTextDocument.ImageResource, url)
+                    if isinstance(res, QtGui.QImage) and not res.isNull():
+                        buf = QtCore.QBuffer()
+                        buf.open(QtCore.QIODevice.WriteOnly)
+                        res.save(buf, "PNG")
+                        return bytes(buf.data())
+                cursor.movePosition(QtGui.QTextCursor.NextCharacter)
+            # fallback: parse html data uri
+            html = self.entry.toHtml()
+            if "data:image" in html and "base64," in html:
+                start = html.find("base64,") + len("base64,")
+                end = html.find("'", start)
+                b64 = html[start:end] if end != -1 else html[start:]
+                return base64.b64decode(b64)
+        except Exception:
+            pass
+        return None
+
+    def _extract_first_file_url_from_text(self, s: str) -> Optional[str]:
+        try:
+            t = s or ""
+            if "file://" in t:
+                i = t.find("file://")
+                end = len(t)
+                for sep in [" \n", "\n", " "]:
+                    j = t.find(sep, i)
+                    if j != -1:
+                        end = min(end, j)
+                url = t[i:end]
+                qurl = QtCore.QUrl(url)
+                p = qurl.toLocalFile()
+                return p if p else None
+        except Exception:
+            return None
+        return None
+
+    def _sanitize_text(self, s: str) -> str:
+        try:
+            t = (s or "")
+            # remove object replacement chars used for embedded images
+            t = t.replace("\uFFFC", "")
+            # remove zero-width spaces
+            t = t.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+            t = t.strip()
+            return t
+        except Exception:
+            return s or ""
+
+    def _add_file_from_path(self, conv_key: str, sender: str, path: str, is_self: bool):
+        if not path or not os.path.isfile(path):
+            return
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            name = os.path.basename(path)
+            mime = self._guess_mime(path)
+            b64 = base64.b64encode(data).decode("ascii")
+            pix = QtGui.QPixmap(path)
+            self._save_attachment(name, b64, conv_key)
+            self._ensure_conv(conv_key)
+            av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+            self.conv_models[conv_key].add_file(sender, name, mime, pix if not pix.isNull() else None, is_self, av)
+            self.store.add(conv_key, sender, f"[FILE] {name} {mime}", "file", is_self)
+        except Exception:
+            pass
+
+    def _save_attachment(self, filename: str, b64: str, conv_key: Optional[str] = None):
+        att_dir = self._attachment_dir(conv_key)
         os.makedirs(att_dir, exist_ok=True)
         try:
             data = base64.b64decode(b64)
@@ -1082,11 +1760,42 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _attachment_dir(self) -> str:
-        return os.path.join(self.store.root, "attachments")
+    def _attachment_dir(self, conv_key: Optional[str] = None) -> str:
+        base = os.path.join(self.store.root, "attachments")
+        if not conv_key:
+            return base
+        safe = (
+            conv_key.replace(":", "_")
+            .replace("/", "_")
+            .replace("&", "_")
+        )
+        return os.path.join(base, safe)
 
-    def _attachment_path(self, filename: str) -> str:
-        return os.path.join(self._attachment_dir(), filename)
+    def _attachment_path(self, filename: str, conv_hint: Optional[str] = None) -> str:
+        # try conv-specific path first
+        if conv_hint:
+            p = os.path.join(self._attachment_dir(conv_hint), filename)
+            if os.path.isfile(p):
+                return p
+        # fallback to current conv
+        if hasattr(self, "current_conv") and self.current_conv:
+            p = os.path.join(self._attachment_dir(self.current_conv), filename)
+            if os.path.isfile(p):
+                return p
+        # flat attachments dir
+        p = os.path.join(self._attachment_dir(None), filename)
+        if os.path.isfile(p):
+            return p
+        # search subfolders
+        try:
+            base = self._attachment_dir(None)
+            for entry in os.listdir(base):
+                cand = os.path.join(base, entry, filename)
+                if os.path.isfile(cand):
+                    return cand
+        except Exception:
+            pass
+        return p
 
     def _open_text_viewer(self, text: str):
         dlg = QtWidgets.QDialog(self)
@@ -1144,11 +1853,17 @@ class ChatWindow(QtWidgets.QWidget):
         if not text_rect.contains(vp_pos):
             return None
         local = QtCore.QPointF(vp_pos.x() - text_rect.x(), vp_pos.y() - text_rect.y())
+        # clamp to content area to ensure hitTest returns a position
+        local.setX(max(0.0, min(local.x(), float(text_rect.width() - 1))))
+        local.setY(max(0.0, min(local.y(), float(text_rect.height() - 1))))
         layout = doc.documentLayout()
         try:
             pos = layout.hitTest(local, QtCore.Qt.FuzzyHit)
             if pos < 0:
-                return None
+                # fallback to nearest edge
+                if local.x() <= 0.0 and local.y() <= 0.0:
+                    return 0
+                return len(text)
             return pos
         except Exception:
             return None
@@ -1182,46 +1897,121 @@ class ChatWindow(QtWidgets.QWidget):
         bubble_rect = QtCore.QRect(bubble_x, bubble_y, bubble_w, bubble_h)
         return bubble_rect.contains(vp_pos)
 
-    def closeEvent(self, e):
+    def closeEvent(self, e: QtGui.QCloseEvent):
         try:
-            if self.rx:
-                self.rx.stop()
-                try:
-                    self.rx.wait(1000)
-                except Exception:
-                    pass
-            try:
-                if hasattr(self, 'hb') and self.hb:
-                    self.hb.stop()
-            except Exception:
-                pass
-            if self.sock:
-                self.sock.shutdown(socket.SHUT_RDWR)
+            e.ignore()
+            self.hide()
         except Exception:
             pass
-        try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-        super().closeEvent(e)
 
 
 def parse_args():
     p = argparse.ArgumentParser(prog="qt_chat_client", add_help=True)
-    p.add_argument("--host", type=str, required=True)
-    p.add_argument("--port", type=int, default=5001)
     p.add_argument("--username", type=str, default=getpass.getuser())
-    p.add_argument("--log-dir", type=str, default=os.path.join(os.getcwd(), "chat_logs"))
-    p.add_argument("--room", type=str, default="general")
-    p.add_argument("--theme", type=str, default="dark")
+    p.add_argument("--log-dir", type=str, default=os.path.expanduser("~/Library/Application Support/XiaoCaiChat"))
+    p.add_argument("--theme", type=str, default="flat")
+    p.add_argument("--config", type=str, default=os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json"))
     return p.parse_args()
+
+def _load_client_config(path: str):
+    try:
+        defaults = {"host": "127.0.0.1", "port": 5001, "room": "general", "theme": "flat"}
+        candidates = []
+        if path:
+            candidates.append(path)
+        # user-level config
+        candidates.append(os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json"))
+        # app bundle dir
+        try:
+            app_dir = os.path.dirname(sys.argv[0])
+            candidates.append(os.path.join(app_dir, "client_config.json"))
+        except Exception:
+            pass
+        # bundled resources (current working dir may be sys._MEIPASS)
+        candidates.append(os.path.join(os.getcwd(), "client_config.json"))
+        for pth in candidates:
+            if pth and os.path.isfile(pth):
+                with open(pth, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+                for k in defaults:
+                    if k in data:
+                        defaults[k] = data[k]
+                break
+        return defaults["host"], int(defaults["port"]), defaults["room"], defaults.get("theme")
+    except Exception:
+        return "127.0.0.1", 5001, "general", "flat"
+
+def _save_client_config(path: str, host: str, port: int, room: str, theme: Optional[str] = None):
+    try:
+        p = path or os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json")
+        ddir = os.path.dirname(p)
+        os.makedirs(ddir, exist_ok=True)
+        data = {"host": host, "port": int(port), "room": room}
+        if theme:
+            data["theme"] = theme
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _ensure_user_config(path: str):
+    try:
+        p = path or os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json")
+        ddir = os.path.dirname(p)
+        os.makedirs(ddir, exist_ok=True)
+        defaults = {"host": "127.0.0.1", "port": 5001, "room": "general", "theme": "flat"}
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+            except Exception:
+                data = {}
+            changed = False
+            for k, v in defaults.items():
+                if k not in data:
+                    data[k] = v
+                    changed = True
+            if changed:
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+        else:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(defaults, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def main():
     args = parse_args()
+    base_dir = getattr(sys, "_MEIPASS", os.getcwd())
+    try:
+        os.chdir(base_dir)
+    except Exception:
+        pass
+    try:
+        import signal
+        def _sig_handler(*_):
+            try:
+                QtWidgets.QApplication.quit()
+            except Exception:
+                pass
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+    except Exception:
+        pass
+    try:
+        _ensure_user_config(args.config)
+    except Exception:
+        pass
     app = QtWidgets.QApplication([])
-    _apply_theme(app, args.theme)
+    try:
+        app.setQuitOnLastWindowClosed(False)
+    except Exception:
+        pass
+    try:
+        app.setWindowIcon(QtGui.QIcon(os.path.join(os.getcwd(), "icons", "ui", "xiaocaichat.png")))
+    except Exception:
+        pass
     icon_dir = os.path.join(os.getcwd(), "icons", "user")
     dlg = QtWidgets.QDialog()
     dlg.setWindowTitle("登录")
@@ -1321,7 +2111,16 @@ def main():
             return
         it = listw.currentItem()
         avatar = it.data(QtCore.Qt.UserRole) if it else None
-    win = ChatWindow(args.host, args.port, name, args.log_dir, args.room, avatar)
+    host, port, room, theme_cfg = _load_client_config(args.config)
+    _apply_theme(app, theme_cfg or args.theme)
+    win = ChatWindow(host, port, name, args.log_dir, room, avatar)
+    try:
+        app.installEventFilter(win)
+        app.aboutToQuit.connect(win.cleanup)
+        import atexit
+        atexit.register(win.cleanup)
+    except Exception:
+        pass
     win.resize(700, 500)
     win.show()
     app.exec()
@@ -1381,17 +2180,33 @@ def _apply_theme(app: QtWidgets.QApplication, name: str):
 
 if __name__ == "__main__":
     main()
-    def copy_selected(self):
-        idx = self.view.currentIndex()
-        if idx.isValid():
-            self._copy_index(idx)
-
-    def _copy_index(self, index: QtCore.QModelIndex):
-        kind = index.data(ChatModel.KindRole)
-        if kind == "msg":
-            text = index.data(ChatModel.TextRole) or ""
-            QtWidgets.QApplication.clipboard().setText(text)
-        elif kind == "file":
-            fn = index.data(ChatModel.FileNameRole) or ""
-            path = self._attachment_path(fn)
-            QtWidgets.QApplication.clipboard().setText(path if os.path.exists(path) else fn)
+    def cleanup(self):
+        try:
+            if hasattr(self, 'rx') and self.rx:
+                try:
+                    self.rx.stop()
+                    self.rx.wait(2000)
+                    try:
+                        self.rx.deleteLater()
+                    except Exception:
+                        pass
+                    self.rx = None
+                except Exception:
+                    pass
+            try:
+                if hasattr(self, 'hb') and self.hb:
+                    self.hb.stop()
+            except Exception:
+                pass
+            if self.sock:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass

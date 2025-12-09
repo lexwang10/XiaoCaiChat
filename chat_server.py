@@ -93,6 +93,10 @@ class Hub:
             return list(self.rooms.get(room, {}).values())
 
     def broadcast_text(self, room: str, origin: socket.socket, username: str, text: str):
+        try:
+            print(f"broadcast_text from {username}: len={len(text)} head={text[:80]}")
+        except Exception:
+            pass
         msg = f"{username}> {text}\n".encode("utf-8")
         targets = []
         with self.lock:
@@ -139,6 +143,10 @@ class Hub:
         self.broadcast_users(room)
 
     def send_dm(self, room: str, origin: socket.socket, origin_user: str, target_user: str, text: str):
+        try:
+            print(f"send_dm {origin_user} -> {target_user}: len={len(text)} head={text[:80]}")
+        except Exception:
+            pass
         targets = []
         with self.lock:
             for c, u in self.rooms.get(room, {}).items():
@@ -469,7 +477,15 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
             if not t:
                 continue
             seq, body = parse_seq(t)
+            try:
+                print(f"recv body: len={len(body)} head={body[:80]}")
+            except Exception:
+                pass
             if body.startswith("PING "):
+                try:
+                    conn.sendall(("PONG " + body[5:] + "\n").encode("utf-8"))
+                except Exception:
+                    pass
                 try:
                     conn.sendall(("PONG " + body[5:] + "\n").encode("utf-8"))
                 except Exception:
