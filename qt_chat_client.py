@@ -10,6 +10,7 @@ import json
 import hmac
 import hashlib
 import time
+import re
 
 from PySide6 import QtCore, QtWidgets, QtGui
 APP_VERSION = "1.0.0"
@@ -219,6 +220,15 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
         r = option.rect
+        try:
+            hl_row = int(option.widget.property("search_highlight_row")) if option.widget and option.widget.property("search_highlight_row") is not None else -1
+        except Exception:
+            hl_row = -1
+        is_hl = (index.row() == hl_row)
+        try:
+            kw = option.widget.property("search_keyword") or ""
+        except Exception:
+            kw = ""
         if kind == "sys":
             pen = QtGui.QPen(QtGui.QColor(120, 120, 120))
             painter.setPen(pen)
@@ -284,9 +294,33 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             # text block
             name_rect = QtCore.QRect(chip_rect.left() + pad, chip_rect.top() + pad - 2, chip_rect.width() - 22 - pad*2, fm.height())
             size_rect = QtCore.QRect(chip_rect.left() + pad, name_rect.bottom() + 4, chip_rect.width() - 22 - pad*2, fm.height())
-            painter.setPen(QtGui.QColor(51, 51, 51))
-            painter.setFont(option.font)
-            painter.drawText(name_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, filename)
+            try:
+                import html as _html
+                fname = filename or ""
+                name_doc = QtGui.QTextDocument()
+                name_doc.setDefaultFont(option.font)
+                name_doc.setDocumentMargin(0)
+                name_doc.setTextWidth(name_rect.width())
+                if kw:
+                    pat2 = re.compile(re.escape(str(kw)), re.IGNORECASE)
+                    parts2 = []
+                    last2 = 0
+                    for m2 in pat2.finditer(fname):
+                        parts2.append(_html.escape(fname[last2:m2.start()]))
+                        parts2.append("<span style='background:#fff59d'>" + _html.escape(m2.group(0)) + "</span>")
+                        last2 = m2.end()
+                    parts2.append(_html.escape(fname[last2:]))
+                    name_doc.setHtml("".join(parts2))
+                else:
+                    name_doc.setHtml(_html.escape(fname))
+                painter.save()
+                painter.translate(name_rect.topLeft())
+                name_doc.drawContents(painter, QtCore.QRectF(0, 0, name_rect.width(), name_rect.height()))
+                painter.restore()
+            except Exception:
+                painter.setPen(QtGui.QColor(51, 51, 51))
+                painter.setFont(option.font)
+                painter.drawText(name_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, filename)
             # size
             filesize = index.data(ChatModel.FileSizeRole) or 0
             def _hs(n):
@@ -336,7 +370,24 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         w0 = fm.horizontalAdvance(text)
         text_w = min(w0 + 6, maxw)
         doc.setTextWidth(text_w)
-        doc.setPlainText(text)
+        try:
+            import html as _html
+            s = text or ""
+            if kw:
+                pat = re.compile(re.escape(str(kw)), re.IGNORECASE)
+                parts = []
+                last = 0
+                for m in pat.finditer(s):
+                    parts.append(_html.escape(s[last:m.start()]))
+                    parts.append("<span style='background:#fff59d'>" + _html.escape(m.group(0)) + "</span>")
+                    last = m.end()
+                parts.append(_html.escape(s[last:]))
+                html_text = "".join(parts)
+                doc.setHtml(html_text)
+            else:
+                doc.setPlainText(s)
+        except Exception:
+            doc.setPlainText(text or "")
         pad = 12
         bubble_w = int(text_w) + pad * 2
         bubble_h = int(doc.size().height()) + pad * 2
@@ -1020,6 +1071,12 @@ class ChatWindow(QtWidgets.QWidget):
         try:
             self.view.setMouseTracking(True)
             self.view.viewport().setMouseTracking(True)
+            self.view.setProperty("search_highlight_row", -1)
+        except Exception:
+            pass
+        try:
+            self.find_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Find, self)
+            self.find_shortcut.activated.connect(self._show_find_bar)
         except Exception:
             pass
         self.copy_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Copy, self.view)
@@ -1161,6 +1218,22 @@ class ChatWindow(QtWidgets.QWidget):
             real_chat_layout.setSpacing(0)
         except Exception:
             pass
+        self.find_bar = QtWidgets.QLineEdit()
+        self.find_bar.setPlaceholderText("搜索聊天记录，回车定位")
+        try:
+            self.find_bar.setClearButtonEnabled(True)
+            self.find_bar.setVisible(False)
+            self.find_bar.setFixedHeight(28)
+            self.find_bar.setStyleSheet("QLineEdit{padding:4px 8px;border:none;border-bottom:1px solid #e0e0e0;}")
+        except Exception:
+            pass
+        self.find_bar.returnPressed.connect(self._perform_find)
+        try:
+            self.find_bar_escape = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Escape), self.find_bar)
+            self.find_bar_escape.activated.connect(self._hide_find_bar)
+        except Exception:
+            pass
+        real_chat_layout.addWidget(self.find_bar, 0)
         real_chat_layout.addWidget(splitter_chat)
         self.real_chat_widget.setLayout(real_chat_layout)
 
@@ -1220,7 +1293,7 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
         self.status_left = QtWidgets.QLabel(f"未连接 {self.host}:{self.port}")
-        self.status_right = QtWidgets.QLabel(f"©Sai Yeung Choi Technology-XiaoCaiChat {APP_VERSION}")
+        self.status_right = QtWidgets.QLabel(f"XiaoCaiChat {APP_VERSION}")
         try:
             self.status_left.setStyleSheet("QLabel{color:#757575;font:12px 'Helvetica Neue';}")
             self.status_right.setStyleSheet("QLabel{color:#9e9e9e;font:12px 'Helvetica Neue';}")
@@ -1261,6 +1334,84 @@ class ChatWindow(QtWidgets.QWidget):
             pass
         # 屏蔽群聊入口
         self._bootstrap_local()
+        self._last_find_text = ""
+        self._last_find_row = -1
+
+    def _show_find_bar(self):
+        try:
+            self.find_bar.setVisible(True)
+            self.find_bar.setFocus()
+            if self.find_bar.text():
+                self.find_bar.selectAll()
+            self.view.setProperty("search_highlight_row", -1)
+            self.view.setProperty("search_keyword", "")
+            try:
+                self.view.viewport().update()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _perform_find(self):
+        try:
+            kw = (self.find_bar.text() or "").strip()
+            if not kw or not self.current_model:
+                return
+            start = 0
+            if self._last_find_text == kw and self._last_find_row is not None and self._last_find_row >= 0:
+                start = (self._last_find_row + 1) % len(self.current_model.items)
+            found = -1
+            n = len(self.current_model.items)
+            for off in range(n):
+                i = (start + off) % n
+                it = self.current_model.items[i]
+                t = (it.get("text") or "").lower()
+                fn = (it.get("filename") or "").lower()
+                if kw.lower() in t or (fn and kw.lower() in fn):
+                    found = i
+                    break
+            if found != -1:
+                idx = self.current_model.index(found)
+                try:
+                    self.view.setCurrentIndex(idx)
+                    self.view.scrollTo(idx, QtWidgets.QAbstractItemView.PositionAtCenter)
+                except Exception:
+                    try:
+                        self.view.scrollTo(idx)
+                    except Exception:
+                        pass
+                try:
+                    self.view.setProperty("search_highlight_row", found)
+                    self.view.setProperty("search_keyword", kw)
+                    self.view.viewport().update()
+                except Exception:
+                    pass
+                self._last_find_text = kw
+                self._last_find_row = found
+            else:
+                try:
+                    self.view.setProperty("search_highlight_row", -1)
+                    self.view.setProperty("search_keyword", "")
+                    self.view.viewport().update()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _hide_find_bar(self):
+        try:
+            self.find_bar.clear()
+            self.find_bar.setVisible(False)
+            self._last_find_text = ""
+            self._last_find_row = -1
+            self.view.setProperty("search_highlight_row", -1)
+            self.view.setProperty("search_keyword", "")
+            try:
+                self.view.viewport().update()
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _connect(self) -> bool:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
