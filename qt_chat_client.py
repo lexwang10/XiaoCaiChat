@@ -897,8 +897,31 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
         left.addWidget(self.conv_list, 1)
+        
+        self.mid_divider = QtWidgets.QFrame()
+        self.mid_divider.setFrameShape(QtWidgets.QFrame.VLine)
+        self.mid_divider.setFrameShadow(QtWidgets.QFrame.Plain)
+        try:
+            self.mid_divider.setStyleSheet("color:#e0e0e0;")
+            self.mid_divider.setFixedWidth(1)
+        except Exception:
+            pass
+        
+        left_layout_h = QtWidgets.QHBoxLayout()
+        try:
+            left_layout_h.setContentsMargins(0, 0, 0, 0)
+            left_layout_h.setSpacing(0)
+        except Exception:
+            pass
+        
+        left_inner_container = QtWidgets.QWidget()
+        left_inner_container.setLayout(left)
+        
+        left_layout_h.addWidget(left_inner_container)
+        left_layout_h.addWidget(self.mid_divider)
+        
         left_container = QtWidgets.QWidget()
-        left_container.setLayout(left)
+        left_container.setLayout(left_layout_h)
         
         splitter_chat = ChatSplitter(QtCore.Qt.Vertical)
         splitter_chat.addWidget(self.view)
