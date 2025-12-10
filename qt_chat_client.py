@@ -12,7 +12,12 @@ import hashlib
 import time
 
 from PySide6 import QtCore, QtWidgets, QtGui
+APP_VERSION = "1.0.0"
 import threading
+try:
+    import Cocoa
+except ImportError:
+    Cocoa = None
 from chat_utils import ChatLogger
 from chat_local_store import LocalStore
 
@@ -106,7 +111,6 @@ class ChatModel(QtCore.QAbstractListModel):
         super().__init__()
         self.items = []
         self.last_time = None
-        self.last_sep_minute = None
 
     def rowCount(self, parent=QtCore.QModelIndex()):
         return len(self.items)
@@ -150,20 +154,35 @@ class ChatModel(QtCore.QAbstractListModel):
         self.endInsertRows()
 
     def _maybe_time_separator(self, now: QtCore.QDateTime):
-        cur_min = now.toString("yyyy-MM-dd HH:mm")
-        if self.last_sep_minute is None or self.last_sep_minute != cur_min:
-            ts = now.toString("HH:mm")
+        should = False
+        if self.last_time is None:
+            should = True
+        else:
+            delta = abs(self.last_time.secsTo(now))
+            # 3 minutes = 180 seconds
+            if delta > 180 or self.last_time.date().daysTo(now.date()) != 0:
+                should = True
+        
+        if should:
+            cur_day = now.toString("yyyy-MM-dd")
+            today_day = QtCore.QDate.currentDate().toString("yyyy-MM-dd")
+            yesterday_day = QtCore.QDate.currentDate().addDays(-1).toString("yyyy-MM-dd")
+            hhmm = now.toString("HH:mm")
+            if cur_day == today_day:
+                label = hhmm
+            elif cur_day == yesterday_day:
+                label = f"昨天 {hhmm}"
+            else:
+                label = f"{cur_day} {hhmm}"
             self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
-            self.items.append({"kind": "sys", "sender": "", "text": f"—— {ts} ——", "self": False, "time": now})
+            self.items.append({"kind": "sys", "sender": "", "text": f"—— {label} ——", "self": False, "time": now})
             self.endInsertRows()
-            self.last_sep_minute = cur_min
         self.last_time = now
 
     def clear(self):
         self.beginResetModel()
         self.items = []
         self.last_time = None
-        self.last_sep_minute = None
         self.endResetModel()
 
     def remove_row(self, row: int):
@@ -273,7 +292,7 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         doc.setDefaultTextOption(opt)
         doc.setDocumentMargin(0)
         w0 = fm.horizontalAdvance(text)
-        text_w = min(w0, maxw)
+        text_w = min(w0 + 6, maxw)
         doc.setTextWidth(text_w)
         doc.setPlainText(text)
         pad = 12
@@ -352,7 +371,7 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         maxw = int(option.rect.width() * 0.65)
         doc = QtGui.QTextDocument()
         opt = QtGui.QTextOption()
-        opt.setWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        opt.setWrapMode(QtGui.QTextOption.WordWrap)
         doc.setDefaultFont(option.font)
         doc.setDefaultTextOption(opt)
         doc.setDocumentMargin(0)
@@ -380,28 +399,53 @@ class ChatInput(QtWidgets.QTextEdit):
         super().__init__()
         self.setAcceptRichText(True)
         self.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
+        self._last_paste_kind = ""
+        self._last_paste_tick = 0
+        self._skip_image_paste_until = 0
 
     def insertFromMimeData(self, source: QtCore.QMimeData):
+        try:
+            now_ms = int(QtCore.QDateTime.currentMSecsSinceEpoch())
+            if self._last_paste_kind == "urls" and (now_ms - self._last_paste_tick) < 600:
+                return
+        except Exception:
+            pass
         try:
             if source and source.hasUrls():
                 for u in source.urls():
                     p = u.toLocalFile()
                     if p and os.path.isfile(p):
-                        ext_mime = self._guess_mime(p)
-                        if ext_mime.startswith("image/"):
-                            reader = QtGui.QImageReader(p)
-                            qimg = reader.read()
-                            if not qimg.isNull():
-                                self._insert_preview_image(qimg)
-                            with open(p, "rb") as f:
-                                data = f.read()
-                            pm = QtGui.QPixmap.fromImage(qimg) if not qimg.isNull() else QtGui.QPixmap(p)
-                            name = os.path.basename(p)
-                            self.imagePasted.emit(data, pm, ext_mime, name)
-                            return
+                        reader = QtGui.QImageReader(p)
+                        qimg = reader.read()
+                        if isinstance(qimg, QtGui.QImage) and not qimg.isNull():
+                            self._insert_preview_image(qimg)
+                        else:
+                            pm = QtGui.QPixmap(p)
+                            if isinstance(pm, QtGui.QPixmap) and not pm.isNull():
+                                self._insert_preview_image(pm.toImage())
+                        with open(p, "rb") as f:
+                            data = f.read()
+                        pm2 = QtGui.QPixmap(p)
+                        name = os.path.basename(p)
+                        mime = self._guess_mime(p)
+                        self.imagePasted.emit(data, pm2 if not pm2.isNull() else None, mime, name)
+                        try:
+                            self._last_paste_kind = "urls"
+                            self._last_paste_tick = int(QtCore.QDateTime.currentMSecsSinceEpoch())
+                        except Exception:
+                            pass
+                        return
         except Exception:
             pass
+        # 2) 再处理剪贴板内嵌位图
         try:
+            try:
+                fmts2 = list(source.formats()) if source else []
+            except Exception:
+                fmts2 = []
+            now_ms = int(QtCore.QDateTime.currentMSecsSinceEpoch())
+            if source and source.hasImage() and ("text/uri-list" in fmts2 or "public.file-url" in fmts2 or (self._last_paste_kind == "urls" and (now_ms - self._last_paste_tick) < 2000)):
+                return
             if source and source.hasImage():
                 qobj = source.imageData()
                 qimg = None
@@ -429,9 +473,14 @@ class ChatInput(QtWidgets.QTextEdit):
         try:
             if source and source.hasHtml():
                 html = source.html() or ""
-                if "data:image" in html and "base64," in html:
-                    start = html.find("base64,") + len("base64,")
-                    end = html.find("'", start)
+                marker = "data:image"
+                idx = html.find(marker)
+                if idx != -1 and "base64," in html[idx:]:
+                    start = html.find("base64,", idx) + len("base64,")
+                    end1 = html.find("'", start)
+                    end2 = html.find('"', start)
+                    ends = [e for e in [end1, end2] if e != -1]
+                    end = min(ends) if ends else -1
                     b64 = html[start:end] if end != -1 else html[start:]
                     data = base64.b64decode(b64)
                     qimg = QtGui.QImage()
@@ -442,15 +491,136 @@ class ChatInput(QtWidgets.QTextEdit):
                         name = "paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png"
                         self.imagePasted.emit(data, pm, "image/png", name)
                         return
+                if "file://" in html:
+                    i = html.find("file://")
+                    end = len(html)
+                    for sep in ['"', "'", ")", " ", "\n"]:
+                        j = html.find(sep, i)
+                        if j != -1:
+                            end = min(end, j)
+                    url = html[i:end]
+                    p = QtCore.QUrl(url).toLocalFile()
+                    if p and os.path.isfile(p):
+                        reader = QtGui.QImageReader(p)
+                        qimg = reader.read()
+                        if isinstance(qimg, QtGui.QImage) and not qimg.isNull():
+                            self._insert_preview_image(qimg)
+                            with open(p, "rb") as f:
+                                data = f.read()
+                            pm = QtGui.QPixmap(p)
+                            name = os.path.basename(p)
+                            self.imagePasted.emit(data, pm, self._guess_mime(p), name)
+                            return
+        except Exception:
+            pass
+        # 3) 其余按 HTML/text 路径处理
+        try:
+            if source and source.hasText():
+                t = source.text() or ""
+                if "file://" in t or t.lower().endswith((".png",".jpg",".jpeg",".gif")):
+                    i = t.find("file://")
+                    if i != -1:
+                        url = t[i:]
+                        p = QtCore.QUrl(url).toLocalFile()
+                    else:
+                        p = t.strip()
+                    if p and os.path.isfile(p):
+                        reader = QtGui.QImageReader(p)
+                        qimg = reader.read()
+                        if isinstance(qimg, QtGui.QImage) and not qimg.isNull():
+                            self._insert_preview_image(qimg)
+                        else:
+                            pm = QtGui.QPixmap(p)
+                            if isinstance(pm, QtGui.QPixmap) and not pm.isNull():
+                                self._insert_preview_image(pm.toImage())
+                        with open(p, "rb") as f:
+                            data = f.read()
+                        pm = QtGui.QPixmap(p)
+                        name = os.path.basename(p)
+                        self.imagePasted.emit(data, pm if not pm.isNull() else None, self._guess_mime(p), name)
+                        return
         except Exception:
             pass
         super().insertFromMimeData(source)
 
+    def dragEnterEvent(self, ev: QtGui.QDragEnterEvent):
+        try:
+            md = ev.mimeData()
+            ok = False
+            if md.hasImage():
+                ok = True
+            elif md.hasUrls():
+                for u in md.urls():
+                    p = u.toLocalFile()
+                    if p and os.path.isfile(p):
+                        ext = os.path.splitext(p)[1].lower()
+                        if ext in (".png", ".jpg", ".jpeg", ".gif"):
+                            ok = True
+                            break
+            if ok:
+                ev.acceptProposedAction()
+                return
+        except Exception:
+            pass
+        super().dragEnterEvent(ev)
+
+    def dropEvent(self, ev: QtGui.QDropEvent):
+        try:
+            md = ev.mimeData()
+            if md.hasImage():
+                qobj = md.imageData()
+                qimg = None
+                if isinstance(qobj, QtGui.QImage):
+                    qimg = qobj
+                elif isinstance(qobj, QtGui.QPixmap):
+                    qimg = qobj.toImage()
+                elif hasattr(qobj, 'toImage'):
+                    try:
+                        qimg = qobj.toImage()
+                    except Exception:
+                        qimg = None
+                if isinstance(qimg, QtGui.QImage) and not qimg.isNull():
+                    self._insert_preview_image(qimg)
+                    buf = QtCore.QBuffer(); buf.open(QtCore.QIODevice.WriteOnly); qimg.save(buf, "PNG")
+                    data = bytes(buf.data())
+                    name = "paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png"
+                    pm = QtGui.QPixmap.fromImage(qimg)
+                    self.imagePasted.emit(data, pm, "image/png", name)
+                    ev.acceptProposedAction()
+                    return
+            if md.hasUrls():
+                for u in md.urls():
+                    p = u.toLocalFile()
+                    if p and os.path.isfile(p):
+                        ext = os.path.splitext(p)[1].lower()
+                        if ext in (".png", ".jpg", ".jpeg", ".gif"):
+                            qimg = QtGui.QImage(p)
+                            if not qimg.isNull():
+                                self._insert_preview_image(qimg)
+                            with open(p, "rb") as f:
+                                data = f.read()
+                            pm = QtGui.QPixmap(p)
+                            name = os.path.basename(p)
+                            mime = self._guess_mime(p)
+                            self.imagePasted.emit(data, pm if not pm.isNull() else None, mime, name)
+                            ev.acceptProposedAction()
+                            return
+        except Exception:
+            pass
+        super().dropEvent(ev)
+
     def keyPressEvent(self, ev: QtGui.QKeyEvent):
         try:
-            if ev.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter) and not (ev.modifiers() & QtCore.Qt.ShiftModifier):
-                self.sendRequested.emit()
-                return
+            if ev.key() in (QtCore.Qt.Key_Return, QtCore.Qt.Key_Enter):
+                mods = ev.modifiers()
+                if mods & QtCore.Qt.MetaModifier:
+                    pass
+                elif mods & QtCore.Qt.ControlModifier:
+                    self.sendRequested.emit()
+                    return
+                elif not (mods & (QtCore.Qt.ShiftModifier | QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier | QtCore.Qt.ControlModifier)):
+                    self.sendRequested.emit()
+                    return
         except Exception:
             pass
         super().keyPressEvent(ev)
@@ -553,6 +723,23 @@ class SidebarItem(QtWidgets.QFrame):
             return "image/gif"
         return "application/octet-stream"
 
+class ChatSplitter(QtWidgets.QSplitter):
+    def resizeEvent(self, event):
+        try:
+            super().resizeEvent(event)
+            h = self.height()
+            if h > 0 and self.count() > 1:
+                # widget(1) is the input box
+                w = self.widget(1)
+                if w:
+                    # Limit input box to 40% of total height
+                    limit = int(h * 0.4)
+                    # Respect minimum height of 100
+                    limit = max(limit, 100)
+                    w.setMaximumHeight(limit)
+        except Exception:
+            pass
+
 class ChatWindow(QtWidgets.QWidget):
     def __init__(self, host: str, port: int, username: str, log_dir: str, room: str, avatar_path: Optional[str] = None):
         super().__init__()
@@ -577,13 +764,35 @@ class ChatWindow(QtWidgets.QWidget):
                 self.avatar_filename = None
         self.peer_avatars = {}
         self.pending_dm = set()
+        self.online_users = set()
+        self.conv_avatar_labels = {}
+        try:
+            self.status_icon_online = QtGui.QPixmap(os.path.join(os.getcwd(), "icons", "ui", "online.png"))
+        except Exception:
+            self.status_icon_online = QtGui.QPixmap()
+        try:
+            self.status_icon_offline = QtGui.QPixmap(os.path.join(os.getcwd(), "icons", "ui", "offline.png"))
+        except Exception:
+            self.status_icon_offline = QtGui.QPixmap()
 
-        self.setWindowTitle(f"群聊 - {username} @ {host}:{port} / {room}")
+        self.setWindowTitle("XiaoCaiChat")
         self.view = QtWidgets.QListView()
         self.view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.view.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
         self.view.setUniformItemSizes(False)
+        try:
+            self.view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            self.view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            self.view.setStyleSheet(
+                "QScrollBar:horizontal{height:0px;}"
+                "QScrollBar:vertical{width:8px;background:transparent;margin:0;}"
+                "QScrollBar::handle:vertical{background:#cfd8dc;border-radius:4px;min-height:24px;}"
+                "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+                "QScrollBar::up-arrow:vertical,QScrollBar::down-arrow:vertical{height:0;width:0;}"
+            )
+        except Exception:
+            pass
         self.conv_models = {}
         self.current_model = None
         self.view.setItemDelegate(BubbleDelegate())
@@ -640,6 +849,12 @@ class ChatWindow(QtWidgets.QWidget):
         self.setting_item = SidebarItem(setting_icon_path, "设置")
         self.setting_item.clicked.connect(self.on_sidebar_setting)
         sb.addWidget(self.avatar_label, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
+        self.user_label = QtWidgets.QLabel(self.username)
+        try:
+            self.user_label.setAlignment(QtCore.Qt.AlignHCenter)
+        except Exception:
+            pass
+        sb.addWidget(self.user_label, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
         sb.addWidget(self.msg_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
         sb.addWidget(self.setting_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
         sb.addStretch(1)
@@ -647,8 +862,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.entry = ChatInput()
         self.entry.imagePasted.connect(self._on_image_pasted)
         try:
-            self.entry.setMinimumHeight(90)
-            self.entry.setMaximumHeight(180)
+            self.entry.setMinimumHeight(100)
         except Exception:
             pass
         self.pending_image_bytes = None
@@ -659,8 +873,6 @@ class ChatWindow(QtWidgets.QWidget):
         try:
             self.send_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self.entry)
             self.send_shortcut.activated.connect(self.on_send)
-            self.send_shortcut2 = QtGui.QShortcut(QtGui.QKeySequence("Meta+Return"), self.entry)
-            self.send_shortcut2.activated.connect(self.on_send)
         except Exception:
             pass
         self.entry.sendRequested.connect(self.on_send)
@@ -687,26 +899,61 @@ class ChatWindow(QtWidgets.QWidget):
         left.addWidget(self.conv_list, 1)
         left_container = QtWidgets.QWidget()
         left_container.setLayout(left)
-        right = QtWidgets.QVBoxLayout()
+        
+        splitter_chat = ChatSplitter(QtCore.Qt.Vertical)
+        splitter_chat.addWidget(self.view)
+        splitter_chat.addWidget(self.entry)
+        splitter_chat.setStretchFactor(0, 1)
+        splitter_chat.setStretchFactor(1, 0)
+        splitter_chat.setHandleWidth(1)
         try:
-            right.setContentsMargins(0, 0, 0, 0)
-            right.setSpacing(6)
+            splitter_chat.setStyleSheet("QSplitter::handle{background:#e0e0e0;}")
         except Exception:
             pass
-        right.addWidget(self.view, 5)
-        h = QtWidgets.QHBoxLayout()
+
+        self.real_chat_widget = QtWidgets.QWidget()
+        real_chat_layout = QtWidgets.QVBoxLayout()
         try:
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(6)
+            real_chat_layout.setContentsMargins(0, 0, 0, 0)
+            real_chat_layout.setSpacing(0)
         except Exception:
             pass
-        h.addWidget(self.entry)
-        right.addLayout(h)
-        chat_container = QtWidgets.QWidget()
-        chat_container.setLayout(right)
+        real_chat_layout.addWidget(splitter_chat)
+        self.real_chat_widget.setLayout(real_chat_layout)
+
+        self.welcome_widget = QtWidgets.QWidget()
+        welcome_layout = QtWidgets.QVBoxLayout()
+        welcome_label = QtWidgets.QLabel()
+        welcome_label.setAlignment(QtCore.Qt.AlignCenter)
+        try:
+            w_path = os.path.join(os.getcwd(), "icons", "ui", "xiaocaichat.png")
+            if os.path.exists(w_path):
+                w_pm = QtGui.QPixmap(w_path)
+                if not w_pm.isNull():
+                    w_pm = w_pm.scaled(128, 128, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                    img = w_pm.toImage().convertToFormat(QtGui.QImage.Format_ARGB32)
+                    w = img.width()
+                    h = img.height()
+                    for y in range(h):
+                        for x in range(w):
+                            c = img.pixel(x, y)
+                            gray = int(0.299 * ((c >> 16) & 0xFF) + 0.587 * ((c >> 8) & 0xFF) + 0.114 * (c & 0xFF))
+                            alpha = (c >> 24) & 0xFF
+                            img.setPixel(x, y, (alpha << 24) | (gray << 16) | (gray << 8) | gray)
+                    w_pm = QtGui.QPixmap.fromImage(img)
+                    welcome_label.setPixmap(w_pm)
+        except Exception:
+            pass
+        welcome_layout.addWidget(welcome_label)
+        self.welcome_widget.setLayout(welcome_layout)
+
+        self.chat_stack = QtWidgets.QStackedWidget()
+        self.chat_stack.addWidget(self.welcome_widget)
+        self.chat_stack.addWidget(self.real_chat_widget)
+
         self.settings_container = self._make_settings_panel()
         self.right_stack = QtWidgets.QStackedWidget()
-        self.right_stack.addWidget(chat_container)
+        self.right_stack.addWidget(self.chat_stack)
         self.right_stack.addWidget(self.settings_container)
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         splitter.addWidget(left_container)
@@ -718,7 +965,37 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
         layout.addWidget(splitter, 1)
-        self.setLayout(layout)
+        self.status_bar = QtWidgets.QFrame()
+        try:
+            self.status_bar.setStyleSheet("QFrame{border-top:1px solid #e0e0e0;}")
+        except Exception:
+            pass
+        sbot = QtWidgets.QHBoxLayout()
+        try:
+            sbot.setContentsMargins(8, 4, 8, 4)
+            sbot.setSpacing(6)
+        except Exception:
+            pass
+        self.status_left = QtWidgets.QLabel(f"未连接 {self.host}:{self.port}")
+        self.status_right = QtWidgets.QLabel(f"©Sai Yeung Choi Technology-XiaoCaiChat {APP_VERSION}")
+        try:
+            self.status_left.setStyleSheet("QLabel{color:#757575;font:12px 'Helvetica Neue';}")
+            self.status_right.setStyleSheet("QLabel{color:#9e9e9e;font:12px 'Helvetica Neue';}")
+        except Exception:
+            pass
+        sbot.addWidget(self.status_left, 0, QtCore.Qt.AlignLeft)
+        sbot.addStretch(1)
+        sbot.addWidget(self.status_right, 0, QtCore.Qt.AlignRight)
+        self.status_bar.setLayout(sbot)
+        root = QtWidgets.QVBoxLayout()
+        try:
+            root.setContentsMargins(0, 0, 0, 0)
+            root.setSpacing(0)
+        except Exception:
+            pass
+        root.addLayout(layout, 1)
+        root.addWidget(self.status_bar, 0)
+        self.setLayout(root)
         try:
             self.setMinimumSize(900, 700)
             self.resize(1120, 800)
@@ -758,6 +1035,11 @@ class ChatWindow(QtWidgets.QWidget):
         self.rx = Receiver(self.sock)
         self.rx.received.connect(self.on_received)
         self.rx.start()
+        try:
+            if hasattr(self, 'status_left') and self.status_left:
+                self.status_left.setText(f"已连接 {self.host}:{self.port}")
+        except Exception:
+            pass
         # 初始化一个空模型，等待选择私聊
         self.current_conv = None
         self.current_model = ChatModel()
@@ -819,6 +1101,7 @@ class ChatWindow(QtWidgets.QWidget):
                     self.store.add(f"group:{self.room}", "", f"系统: {user} 加入 {room}", "sys", False)
                     if user != self.username:
                         self._add_conv_dm(user)
+                        self._set_online(user, True)
                     self.view.scrollToBottom()
                 return
             if len(parts) >= 2 and parts[1] == "DISCONNECT":
@@ -827,6 +1110,11 @@ class ChatWindow(QtWidgets.QWidget):
                     if m:
                         m.add("sys", "", "服务器连接已断开", False, None)
                         self.view.scrollToBottom()
+                    if hasattr(self, 'status_left') and self.status_left:
+                        try:
+                            self.status_left.setText(f"已断开 {self.host}:{self.port}")
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 return
@@ -839,7 +1127,7 @@ class ChatWindow(QtWidgets.QWidget):
                         m.add("sys", "", f"系统: {user} 离开 {room}", False, None)
                     self.store.add(f"group:{self.room}", "", f"系统: {user} 离开 {room}", "sys", False)
                     if user != self.username:
-                        self._remove_conv_dm(user)
+                        self._set_online(user, False)
                     self.view.scrollToBottom()
                 return
             if len(parts) >= 4 and parts[1] == "USERS":
@@ -847,6 +1135,7 @@ class ChatWindow(QtWidgets.QWidget):
                 users_csv = " ".join(parts[3:])
                 if room == self.room:
                     users = [x for x in users_csv.split(",") if x]
+                    current_peers = set()
                     for u in users:
                         uname = u
                         avatar = None
@@ -857,6 +1146,13 @@ class ChatWindow(QtWidgets.QWidget):
                                 self._set_peer_avatar(uname, avatar)
                             # 即使没有头像也先添加会话，后续收到头像再刷新
                             self._add_conv_dm(uname)
+                            self._set_online(uname, True)
+                            current_peers.add(uname)
+                    for key in list(self.conv_models.keys()):
+                        if key.startswith("dm:"):
+                            name = key.split(":",1)[1]
+                            if name != self.username and name not in current_peers:
+                                self._set_online(name, False)
                 return
             if len(parts) >= 5 and parts[1] == "AVATAR":
                 room = parts[2]
@@ -946,8 +1242,20 @@ class ChatWindow(QtWidgets.QWidget):
                         self.store.add(f"dm:{name}", name, msg_clean, "msg", False)
                 self.view.scrollToBottom()
                 self._add_conv_dm(name)
-                if self.current_conv != f"dm:{name}":
+                
+                # Check if app is inactive/minimized, force increment unread even if current_conv matches
+                is_inactive = not self.isActiveWindow() or self.isMinimized() or QtWidgets.QApplication.instance().applicationState() != QtCore.Qt.ApplicationActive
+                if self.current_conv != f"dm:{name}" or is_inactive:
                     self._inc_unread(f"dm:{name}")
+                
+                if self.current_conv != f"dm:{name}" or is_inactive:
+                    try:
+                        note_text = self._sanitize_text(msg)
+                        if msg.startswith("[FILE] ") or msg.startswith("file://"):
+                            note_text = "[图片]"
+                        self._send_macos_notification(name, note_text)
+                    except Exception:
+                        pass
                 return
             if len(parts) >= 4 and parts[1] == "TO":
                 target = parts[2]
@@ -1012,8 +1320,20 @@ class ChatWindow(QtWidgets.QWidget):
                     self.conv_models[f"group:{self.room}"].add("msg", name, msg_clean, name == self.username, av)
                     self.store.add(f"group:{self.room}", name, msg_clean, "msg", name == self.username)
             self.view.scrollToBottom()
-            if self.current_conv != f"group:{self.room}":
+            
+            # Check if app is inactive/minimized, force increment unread even if current_conv matches
+            is_inactive = not self.isActiveWindow() or self.isMinimized() or QtWidgets.QApplication.instance().applicationState() != QtCore.Qt.ApplicationActive
+            if self.current_conv != f"group:{self.room}" or is_inactive:
                 self._inc_unread(f"group:{self.room}")
+            
+            if self.current_conv != f"group:{self.room}" or is_inactive:
+                try:
+                    note_text = self._sanitize_text(msg)
+                    if msg.startswith("[FILE] ") or msg.startswith("file://"):
+                        note_text = "[图片]"
+                    self._send_macos_notification(f"{name} (群聊)", note_text)
+                except Exception:
+                    pass
 
     def on_send(self):
         if not self.current_conv:
@@ -1080,21 +1400,21 @@ class ChatWindow(QtWidgets.QWidget):
                     except Exception:
                         pass
             if text:
+                wire_text = text.replace("\n", "\\n")
                 if self.current_conv.startswith("dm:"):
                     target = self.current_conv.split(":",1)[1]
-                    self._send_seq(f"DM {target} {text}")
+                    self._send_seq(f"DM {target} {wire_text}")
                     self.store.add(f"dm:{target}", self.username, text, "msg", True)
                     self._ensure_conv(self.current_conv)
                     self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
                     self.view.scrollToBottom()
                 else:
-                    self._send_seq(f"MSG {text}")
+                    self._send_seq(f"MSG {wire_text}")
                     self.store.add(f"group:{self.room}", self.username, text, "msg", True)
                     self._ensure_conv(self.current_conv)
                     self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
                     self.view.scrollToBottom()
-            if text:
-                self.logger.write("sent", self.username, text)
+                self.logger.write("sent", self.username, wire_text)
             self.entry.clear()
         except Exception:
             pass
@@ -1109,6 +1429,11 @@ class ChatWindow(QtWidgets.QWidget):
         else:
             name = text.split(" (",1)[0]
             self.switch_conv(f"dm:{name}")
+        try:
+            self.view.scrollToBottom()
+            QtCore.QTimer.singleShot(0, lambda: self.view.scrollToBottom())
+        except Exception:
+            pass
 
     def _add_conv_dm(self, name: str):
         exists = False
@@ -1119,6 +1444,10 @@ class ChatWindow(QtWidgets.QWidget):
         if not exists:
             it = QtWidgets.QListWidgetItem(name)
             it.setSizeHint(QtCore.QSize(200, 44))
+            try:
+                it.setIcon(QtGui.QIcon())
+            except Exception:
+                pass
             self.conv_list.addItem(it)
             row = self.conv_list.count() - 1
             w = QtWidgets.QWidget()
@@ -1130,8 +1459,7 @@ class ChatWindow(QtWidgets.QWidget):
                 pass
             avatar_lbl = QtWidgets.QLabel()
             avatar_lbl.setFixedSize(24, 24)
-            pmicon = self._icon_for_name(name)
-            avatar_lbl.setPixmap(pmicon.pixmap(24, 24))
+            avatar_lbl.setPixmap(self._status_pixmap_for_name(name, 24))
             name_lbl = QtWidgets.QLabel(name)
             badge_lbl = QtWidgets.QLabel()
             badge_lbl.setVisible(False)
@@ -1145,6 +1473,7 @@ class ChatWindow(QtWidgets.QWidget):
             w.setLayout(hl)
             self.conv_list.setItemWidget(it, w)
             self.conv_badges[f"dm:{name}"] = badge_lbl
+            self.conv_avatar_labels[f"dm:{name}"] = avatar_lbl
         self._ensure_unread_key(f"dm:{name}")
         self._ensure_conv(f"dm:{name}")
 
@@ -1158,6 +1487,8 @@ class ChatWindow(QtWidgets.QWidget):
             del self.conv_unread[key]
         if key in self.conv_models:
             del self.conv_models[key]
+        if key in self.conv_avatar_labels:
+            del self.conv_avatar_labels[key]
 
     def on_send_file(self):
         dlg = QtWidgets.QFileDialog(self)
@@ -1232,6 +1563,31 @@ class ChatWindow(QtWidgets.QWidget):
                 self.msg_badge.setVisible(True)
             else:
                 self.msg_badge.setVisible(False)
+            self._update_dock_badge(total)
+        except Exception:
+            pass
+
+    def _update_dock_badge(self, count: int):
+        if not Cocoa:
+            return
+        try:
+            dock_tile = Cocoa.NSApplication.sharedApplication().dockTile()
+            if count > 0:
+                dock_tile.setBadgeLabel_(str(count))
+            else:
+                dock_tile.setBadgeLabel_(None)
+        except Exception:
+            pass
+
+    def _send_macos_notification(self, title: str, text: str):
+        if not Cocoa:
+            return
+        try:
+            notification = Cocoa.NSUserNotification.alloc().init()
+            notification.setTitle_(str(title))
+            notification.setInformativeText_(str(text))
+            notification.setSoundName_("NSUserNotificationDefaultSoundName")
+            Cocoa.NSUserNotificationCenter.defaultUserNotificationCenter().deliverNotification_(notification)
         except Exception:
             pass
     def _set_unread(self, key: str, cnt: int):
@@ -1274,7 +1630,13 @@ class ChatWindow(QtWidgets.QWidget):
             item = self.conv_list.item(i)
             base = item.text().split(" (",1)[0]
             if base == name:
-                item.setIcon(self._icon_for_name(name))
+                try:
+                    item.setIcon(QtGui.QIcon())
+                except Exception:
+                    pass
+                lbl = self.conv_avatar_labels.get(f"dm:{name}")
+                if lbl:
+                    lbl.setPixmap(self._status_pixmap_for_name(name, 24))
                 break
 
     def _set_peer_avatar(self, name: str, filename: str):
@@ -1291,9 +1653,47 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _set_online(self, name: str, online: bool):
+        if online:
+            self.online_users.add(name)
+        else:
+            self.online_users.discard(name)
+        self._refresh_conv_icon(name)
+
+    def _base_avatar_pixmap(self, name: str, size: int = 24) -> QtGui.QPixmap:
+        if name == self.username and self.avatar_pixmap:
+            return self.avatar_pixmap.scaled(size, size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        pm = self.peer_avatars.get(name)
+        if pm:
+            return pm.scaled(size, size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        return self._letter_pixmap(name, size)
+
+    def _status_pixmap_for_name(self, name: str, size: int = 24) -> QtGui.QPixmap:
+        base = self._base_avatar_pixmap(name, size)
+        if name in self.online_users:
+            return base
+        return self._desaturate_pixmap(base, size)
+
+    def _desaturate_pixmap(self, pm: QtGui.QPixmap, size: int) -> QtGui.QPixmap:
+        img = pm.toImage().convertToFormat(QtGui.QImage.Format_ARGB32)
+        w = img.width()
+        h = img.height()
+        for y in range(h):
+            for x in range(w):
+                c = img.pixel(x, y)
+                a = (c >> 24) & 0xFF
+                r = (c >> 16) & 0xFF
+                g = (c >> 8) & 0xFF
+                b = c & 0xFF
+                gray = int(0.299 * r + 0.587 * g + 0.114 * b)
+                img.setPixel(x, y, (a << 24) | (gray << 16) | (gray << 8) | gray)
+        out = QtGui.QPixmap.fromImage(img)
+        return out.scaled(size, size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+
     def switch_conv(self, key: str):
         self._ensure_conv(key)
         self.current_conv = key
+        self.chat_stack.setCurrentIndex(1)
         if key.startswith("group:"):
             self.dm_target = None
         else:
@@ -1302,6 +1702,10 @@ class ChatWindow(QtWidgets.QWidget):
         self.current_model = self.conv_models[key]
         self.view.setModel(self.current_model)
         self._reset_unread(key)
+        try:
+            self.view.scrollToBottom()
+        except Exception:
+            pass
         # 不自动发送 READ，避免服务端推送未读/历史
         if len(self.current_model.items) == 0:
             conv = key
@@ -1321,6 +1725,10 @@ class ChatWindow(QtWidgets.QWidget):
                     av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
                     self.current_model.add("msg", sender, text, bool(selfflag), av, int(ts) if ts else None)
             # 不自动拉取历史，保留空界面
+        try:
+            QtCore.QTimer.singleShot(0, lambda: self.view.scrollToBottom())
+        except Exception:
+            pass
 
     def on_view_context_menu(self, pos):
         sender = self.sender()
@@ -1433,9 +1841,19 @@ class ChatWindow(QtWidgets.QWidget):
                         self.activateWindow()
                     except Exception:
                         pass
+                # Clear unread count for current conversation when app becomes active
+                if self.current_conv:
+                    self._reset_unread(self.current_conv)
             except Exception:
                 pass
             return False
+        if ev.type() == QtCore.QEvent.WindowActivate:
+             # Clear unread count for current conversation when window becomes active
+             try:
+                 if self.current_conv:
+                     self._reset_unread(self.current_conv)
+             except Exception:
+                 pass
         if obj is self.view.viewport():
             if ev.type() == QtCore.QEvent.ContextMenu:
                 self.on_view_context_menu(ev.pos())
@@ -1477,6 +1895,7 @@ class ChatWindow(QtWidgets.QWidget):
         peers = self.store.peers()
         for p in peers:
             self._add_conv_dm(p)
+            self._set_online(p, False)
         # preload group conv
         self._ensure_conv(f"group:{self.room}")
         missing = 0
@@ -1546,6 +1965,10 @@ class ChatWindow(QtWidgets.QWidget):
             self.setting_item.setSelected(False)
             self.conv_list.setVisible(True)
             self.right_stack.setCurrentIndex(0)
+            if self.current_conv:
+                self.chat_stack.setCurrentIndex(1)
+            else:
+                self.chat_stack.setCurrentIndex(0)
             self.conv_list.setFocus()
         except Exception:
             pass
@@ -1653,11 +2076,20 @@ class ChatWindow(QtWidgets.QWidget):
         if not s.startswith("[FILE] "):
             return "file", "application/octet-stream", ""
         tokens = s.split(" ")
-        if len(tokens) < 4:
+        if len(tokens) < 3:
             return "file", "application/octet-stream", ""
-        mime = tokens[-2]
-        b64 = tokens[-1]
-        name = " ".join(tokens[1:-2]) if len(tokens) > 3 else "file"
+        
+        # Check if second to last token looks like a mime type (contains '/')
+        # Case A: [FILE] name... mime b64 (Network msg or Sent msg in store)
+        # Case B: [FILE] name... mime (Received msg in store)
+        if len(tokens) >= 4 and "/" in tokens[-2]:
+             mime = tokens[-2]
+             b64 = tokens[-1]
+             name = " ".join(tokens[1:-2])
+        else:
+             mime = tokens[-1]
+             b64 = ""
+             name = " ".join(tokens[1:-1])
         return name, mime, b64
 
     def _is_deleted(self, conv_key: str, kind: str, name_or_text: str, mime: Optional[str]) -> bool:
@@ -1727,6 +2159,7 @@ class ChatWindow(QtWidgets.QWidget):
             t = t.replace("\uFFFC", "")
             # remove zero-width spaces
             t = t.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+            t = t.replace("\\n", "\n")
             t = t.strip()
             return t
         except Exception:
@@ -1804,6 +2237,19 @@ class ChatWindow(QtWidgets.QWidget):
         edit.setPlainText(text)
         edit.setReadOnly(True)
         edit.setLineWrapMode(QtWidgets.QPlainTextEdit.WidgetWidth)
+        try:
+            edit.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+            edit.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            edit.setStyleSheet(
+                "QScrollBar:horizontal{height:0px;}"
+                "QScrollBar:vertical{width:8px;background:transparent;margin:0;}"
+                "QScrollBar::handle:vertical{background:#cfd8dc;border-radius:4px;min-height:24px;}"
+                "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+                "QScrollBar::up-arrow:vertical,QScrollBar::down-arrow:vertical{height:0;width:0;}"
+            )
+            edit.moveCursor(QtGui.QTextCursor.End)
+        except Exception:
+            pass
         btn_copy_sel = QtWidgets.QPushButton("复制选中")
         btn_copy_all = QtWidgets.QPushButton("复制全部")
         layout = QtWidgets.QVBoxLayout()
@@ -1835,10 +2281,10 @@ class ChatWindow(QtWidgets.QWidget):
         doc = QtGui.QTextDocument()
         opt = QtGui.QTextOption()
         opt.setWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
-        doc.setDefaultFont(self.view.font())
+        doc.setDefaultFont(option.font)
         doc.setDefaultTextOption(opt)
         w0 = fm.horizontalAdvance(text)
-        text_w = min(w0, maxw)
+        text_w = min(w0 + 6, maxw)
         doc.setTextWidth(text_w)
         doc.setPlainText(text)
         pad = 12
@@ -2039,11 +2485,30 @@ def main():
     v = QtWidgets.QVBoxLayout()
     form = QtWidgets.QFormLayout()
     form.addRow("用户名", name_edit)
-    v.addWidget(QtWidgets.QLabel("最近登录用户"))
-    v.addWidget(prof_list)
-    v.addLayout(form)
-    v.addWidget(QtWidgets.QLabel("选择头像"))
-    v.addWidget(listw, 1)
+    hl_recent = QtWidgets.QHBoxLayout()
+    lbl_recent = QtWidgets.QLabel("最近登录用户")
+    btn_new = QtWidgets.QPushButton("新用户")
+    try:
+        hl_recent.addWidget(lbl_recent)
+        hl_recent.addStretch(1)
+        hl_recent.addWidget(btn_new)
+    except Exception:
+        pass
+    v.addLayout(hl_recent)
+    login_stack = QtWidgets.QStackedWidget()
+    recent_page = QtWidgets.QWidget()
+    vr = QtWidgets.QVBoxLayout()
+    vr.addWidget(prof_list)
+    recent_page.setLayout(vr)
+    new_page = QtWidgets.QWidget()
+    vn = QtWidgets.QVBoxLayout()
+    vn.addLayout(form)
+    vn.addWidget(QtWidgets.QLabel("选择头像"))
+    vn.addWidget(listw, 1)
+    new_page.setLayout(vn)
+    login_stack.addWidget(recent_page)
+    login_stack.addWidget(new_page)
+    v.addWidget(login_stack, 1)
     h = QtWidgets.QHBoxLayout()
     h.addStretch(1)
     h.addWidget(btn_ok)
@@ -2096,6 +2561,22 @@ def main():
     listw.itemDoubleClicked.connect(lambda *_: dlg.accept())
     prof_list.itemDoubleClicked.connect(lambda *_: dlg.accept())
     prof_list.itemClicked.connect(lambda it: name_edit.setText(it.text()))
+    def do_new_user():
+        try:
+            prof_list.clearSelection()
+            prof_list.setCurrentRow(-1)
+        except Exception:
+            pass
+        try:
+            name_edit.clear()
+            name_edit.setFocus()
+        except Exception:
+            pass
+        try:
+            login_stack.setCurrentIndex(1)
+        except Exception:
+            pass
+    btn_new.clicked.connect(do_new_user)
     if dlg.exec() != QtWidgets.QDialog.Accepted:
         return
     # prefer profile selection only if user explicitly selected
@@ -2111,6 +2592,10 @@ def main():
             return
         it = listw.currentItem()
         avatar = it.data(QtCore.Qt.UserRole) if it else None
+    try:
+        _save_profile(args.log_dir, name, os.path.basename(avatar) if avatar else None)
+    except Exception:
+        pass
     host, port, room, theme_cfg = _load_client_config(args.config)
     _apply_theme(app, theme_cfg or args.theme)
     win = ChatWindow(host, port, name, args.log_dir, room, avatar)
