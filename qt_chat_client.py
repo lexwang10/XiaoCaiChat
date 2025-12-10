@@ -106,6 +106,7 @@ class ChatModel(QtCore.QAbstractListModel):
     FileNameRole = QtCore.Qt.UserRole + 7
     MimeRole = QtCore.Qt.UserRole + 8
     AvatarRole = QtCore.Qt.UserRole + 9
+    FileSizeRole = QtCore.Qt.UserRole + 10
 
     def __init__(self):
         super().__init__()
@@ -137,6 +138,8 @@ class ChatModel(QtCore.QAbstractListModel):
             return item.get("mime")
         if role == ChatModel.AvatarRole:
             return item.get("avatar")
+        if role == ChatModel.FileSizeRole:
+            return item.get("filesize")
         return None
 
     def add(self, kind: str, sender: str, text: str, is_self: bool, avatar: Optional[QtGui.QPixmap] = None, ts: Optional[int] = None):
@@ -146,11 +149,11 @@ class ChatModel(QtCore.QAbstractListModel):
         self.items.append({"kind": kind, "sender": sender, "text": text, "self": is_self, "time": now, "avatar": avatar})
         self.endInsertRows()
 
-    def add_file(self, sender: str, filename: str, mime: str, pixmap: Optional[QtGui.QPixmap], is_self: bool, avatar: Optional[QtGui.QPixmap] = None, ts: Optional[int] = None):
+    def add_file(self, sender: str, filename: str, mime: str, pixmap: Optional[QtGui.QPixmap], is_self: bool, avatar: Optional[QtGui.QPixmap] = None, ts: Optional[int] = None, size_bytes: Optional[int] = None):
         now = QtCore.QDateTime.fromSecsSinceEpoch(int(ts)) if ts is not None else QtCore.QDateTime.currentDateTime()
         self._maybe_time_separator(now)
         self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
-        self.items.append({"kind": "file", "sender": sender, "text": filename, "self": is_self, "time": now, "pixmap": pixmap, "filename": filename, "mime": mime, "avatar": avatar})
+        self.items.append({"kind": "file", "sender": sender, "text": filename, "self": is_self, "time": now, "pixmap": pixmap, "filename": filename, "mime": mime, "avatar": avatar, "filesize": (int(size_bytes) if size_bytes is not None else None)})
         self.endInsertRows()
 
     def _maybe_time_separator(self, now: QtCore.QDateTime):
@@ -266,21 +269,60 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
                     painter.drawText(QtCore.QRect(ax, ay, avatar_size, avatar_size), QtCore.Qt.AlignCenter, letter)
                 painter.restore()
                 return
-            # non-image files fallback to bubble with filename
+            # non-image files: render transparent chip (name + size + icon)
             fm = option.fontMetrics
             pad = 12
-            bubble_color = QtGui.QColor(88, 185, 87) if is_self else QtGui.QColor(235, 235, 235)
-            br = fm.boundingRect(filename)
-            bubble_w = min(maxw, br.width() + pad * 2)
-            bubble_h = br.height() + pad * 2
-            bubble_x = (r.right() - bubble_w - margin - avatar_size - avatar_pad) if is_self else (r.left() + margin + avatar_size + avatar_pad)
-            bubble_y = r.top() + 8
-            bubble_rect = QtCore.QRect(bubble_x, bubble_y, bubble_w, bubble_h)
+            chip_w = min(maxw, 240)
+            chip_h = 56
+            chip_x = (r.right() - chip_w - margin - avatar_size - avatar_pad) if is_self else (r.left() + margin + avatar_size + avatar_pad)
+            chip_y = r.top() + 8
+            chip_rect = QtCore.QRect(chip_x, chip_y, chip_w, chip_h)
             painter.setPen(QtCore.Qt.NoPen)
-            painter.setBrush(bubble_color)
-            painter.drawRoundedRect(bubble_rect, 12, 12)
-            painter.setPen(QtGui.QColor(0, 0, 0) if not is_self else QtGui.QColor(255, 255, 255))
-            painter.drawText(bubble_rect.adjusted(pad, pad, -pad, -pad), QtCore.Qt.TextWordWrap, filename)
+            bg = QtGui.QColor(0, 0, 0, int(255 * 0.06))
+            painter.setBrush(bg)
+            painter.drawRoundedRect(chip_rect, 10, 10)
+            # text block
+            name_rect = QtCore.QRect(chip_rect.left() + pad, chip_rect.top() + pad - 2, chip_rect.width() - 22 - pad*2, fm.height())
+            size_rect = QtCore.QRect(chip_rect.left() + pad, name_rect.bottom() + 4, chip_rect.width() - 22 - pad*2, fm.height())
+            painter.setPen(QtGui.QColor(51, 51, 51))
+            painter.setFont(option.font)
+            painter.drawText(name_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, filename)
+            # size
+            filesize = index.data(ChatModel.FileSizeRole) or 0
+            def _hs(n):
+                units = ["B","KB","MB","GB","TB"]
+                i = 0
+                f = float(n)
+                while f >= 1024.0 and i < len(units)-1:
+                    f /= 1024.0; i += 1
+                return ("{:.1f}{}".format(f, units[i]) if i>0 else "{}{}".format(int(f), units[i]))
+            painter.setPen(QtGui.QColor(119, 119, 119))
+            painter.drawText(size_rect, QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter, _hs(int(filesize)))
+            # icon
+            try:
+                icon_path = os.path.join(os.getcwd(), "icons", "ui", "document.png")
+                doc_pm = QtGui.QPixmap(icon_path)
+                if not doc_pm.isNull():
+                    doc_pm = doc_pm.scaled(22, 22, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                    icon_rect = QtCore.QRect(chip_rect.right() - pad - 22, chip_rect.top() + (chip_h-22)//2, 22, 22)
+                    painter.drawPixmap(icon_rect, doc_pm)
+            except Exception:
+                pass
+            # avatar
+            avatar = index.data(ChatModel.AvatarRole)
+            ax = (r.right() - margin - avatar_size) if is_self else (r.left() + margin)
+            ay = chip_rect.top()
+            if isinstance(avatar, QtGui.QPixmap):
+                painter.drawPixmap(QtCore.QRect(ax, ay, avatar_size, avatar_size), avatar.scaled(avatar_size, avatar_size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+            else:
+                hue = (sum(ord(c) for c in sender) % 360)
+                avatar_color = QtGui.QColor.fromHsl(hue, 160, 160)
+                painter.setBrush(avatar_color)
+                painter.setPen(QtCore.Qt.NoPen)
+                painter.drawEllipse(QtCore.QRect(ax, ay, avatar_size, avatar_size))
+                painter.setPen(QtGui.QColor(255, 255, 255))
+                letter = sender[:1] if sender else "?"
+                painter.drawText(QtCore.QRect(ax, ay, avatar_size, avatar_size), QtCore.Qt.AlignCenter, letter)
             painter.restore()
             return
         maxw = int(r.width() * 0.65)
@@ -367,6 +409,13 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
                 avatar_block = 22 + 24
                 h = max(h, avatar_block)
                 return QtCore.QSize(option.rect.width(), h)
+            # non-image file chip height
+            chip_h = 56
+            spacing = 16
+            avatar_block = 22 + 24
+            h = chip_h + spacing
+            h = max(h, avatar_block)
+            return QtCore.QSize(option.rect.width(), h)
         fm = option.fontMetrics
         maxw = int(option.rect.width() * 0.65)
         doc = QtGui.QTextDocument()
@@ -394,6 +443,7 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
 class ChatInput(QtWidgets.QTextEdit):
     imagePasted = QtCore.Signal(object, object, str, str)
     sendRequested = QtCore.Signal()
+    fileChipCleared = QtCore.Signal()
 
     def __init__(self):
         super().__init__()
@@ -402,8 +452,13 @@ class ChatInput(QtWidgets.QTextEdit):
         self._last_paste_kind = ""
         self._last_paste_tick = 0
         self._skip_image_paste_until = 0
+        self._file_chip_range = None
 
     def insertFromMimeData(self, source: QtCore.QMimeData):
+        try:
+            fmts = list(source.formats()) if source else []
+        except Exception:
+            pass
         try:
             now_ms = int(QtCore.QDateTime.currentMSecsSinceEpoch())
             if self._last_paste_kind == "urls" and (now_ms - self._last_paste_tick) < 600:
@@ -414,27 +469,58 @@ class ChatInput(QtWidgets.QTextEdit):
             if source and source.hasUrls():
                 for u in source.urls():
                     p = u.toLocalFile()
-                    if p and os.path.isfile(p):
-                        reader = QtGui.QImageReader(p)
-                        qimg = reader.read()
-                        if isinstance(qimg, QtGui.QImage) and not qimg.isNull():
-                            self._insert_preview_image(qimg)
-                        else:
-                            pm = QtGui.QPixmap(p)
-                            if isinstance(pm, QtGui.QPixmap) and not pm.isNull():
-                                self._insert_preview_image(pm.toImage())
-                        with open(p, "rb") as f:
-                            data = f.read()
-                        pm2 = QtGui.QPixmap(p)
-                        name = os.path.basename(p)
-                        mime = self._guess_mime(p)
-                        self.imagePasted.emit(data, pm2 if not pm2.isNull() else None, mime, name)
+                    
+                    isf = bool(p) and os.path.isfile(p)
+                    
+                    if isf:
                         try:
+                            reader = QtGui.QImageReader(p)
+                            qimg = reader.read()
+                            if isinstance(qimg, QtGui.QImage) and not qimg.isNull():
+                                self._insert_preview_image(qimg)
+                            else:
+                                pm = QtGui.QPixmap(p)
+                                if isinstance(pm, QtGui.QPixmap) and not pm.isNull():
+                                    self._insert_preview_image(pm.toImage())
+                            with open(p, "rb") as f:
+                                data = f.read()
+                            pm2 = QtGui.QPixmap(p)
+                            name = os.path.basename(p)
+                            mime = self._guess_mime(p)
+                            if not pm2.isNull():
+                                self.imagePasted.emit(data, pm2, mime, name)
+                            else:
+                                # Generic file with icon chip
+                                self._insert_file_chip(name, len(data))
+                                self.imagePasted.emit(data, None, mime, name)
+                            try:
+                                self._last_paste_kind = "urls"
+                                self._last_paste_tick = int(QtCore.QDateTime.currentMSecsSinceEpoch())
+                            except Exception:
+                                pass
+                            return
+                        except Exception:
+                            # Fallback: still emit as generic file with placeholder
+                            name = os.path.basename(p) or "file"
+                            mime = self._guess_mime(p)
+                            with open(p, "rb") as f:
+                                data = f.read()
+                            self._insert_file_chip(name, len(data))
+                            self.imagePasted.emit(data, None, mime, name)
                             self._last_paste_kind = "urls"
                             self._last_paste_tick = int(QtCore.QDateTime.currentMSecsSinceEpoch())
+                            return
+                    else:
+                        # Fallback: insert raw file URL into editor so Enter can send it
+                        try:
+                            raw = u.toString()
+                            if raw:
+                                self.textCursor().insertText(raw)
+                                self._last_paste_kind = "urls"
+                                self._last_paste_tick = int(QtCore.QDateTime.currentMSecsSinceEpoch())
+                                return
                         except Exception:
                             pass
-                        return
         except Exception:
             pass
         # 2) 再处理剪贴板内嵌位图
@@ -445,6 +531,7 @@ class ChatInput(QtWidgets.QTextEdit):
                 fmts2 = []
             now_ms = int(QtCore.QDateTime.currentMSecsSinceEpoch())
             if source and source.hasImage() and ("text/uri-list" in fmts2 or "public.file-url" in fmts2 or (self._last_paste_kind == "urls" and (now_ms - self._last_paste_tick) < 2000)):
+                
                 return
             if source and source.hasImage():
                 qobj = source.imageData()
@@ -500,6 +587,7 @@ class ChatInput(QtWidgets.QTextEdit):
                             end = min(end, j)
                     url = html[i:end]
                     p = QtCore.QUrl(url).toLocalFile()
+                    
                     if p and os.path.isfile(p):
                         reader = QtGui.QImageReader(p)
                         qimg = reader.read()
@@ -510,6 +598,14 @@ class ChatInput(QtWidgets.QTextEdit):
                             pm = QtGui.QPixmap(p)
                             name = os.path.basename(p)
                             self.imagePasted.emit(data, pm, self._guess_mime(p), name)
+                            return
+                        else:
+                            with open(p, "rb") as f:
+                                data = f.read()
+                            name = os.path.basename(p)
+                            mime = self._guess_mime(p)
+                            self._insert_file_chip(name, len(data))
+                            self.imagePasted.emit(data, None, mime, name)
                             return
         except Exception:
             pass
@@ -524,6 +620,7 @@ class ChatInput(QtWidgets.QTextEdit):
                         p = QtCore.QUrl(url).toLocalFile()
                     else:
                         p = t.strip()
+                
                     if p and os.path.isfile(p):
                         reader = QtGui.QImageReader(p)
                         qimg = reader.read()
@@ -537,7 +634,11 @@ class ChatInput(QtWidgets.QTextEdit):
                             data = f.read()
                         pm = QtGui.QPixmap(p)
                         name = os.path.basename(p)
-                        self.imagePasted.emit(data, pm if not pm.isNull() else None, self._guess_mime(p), name)
+                        if not pm.isNull():
+                            self.imagePasted.emit(data, pm, self._guess_mime(p), name)
+                        else:
+                            self._insert_file_chip(name, len(data))
+                            self.imagePasted.emit(data, None, self._guess_mime(p), name)
                         return
         except Exception:
             pass
@@ -605,6 +706,15 @@ class ChatInput(QtWidgets.QTextEdit):
                             self.imagePasted.emit(data, pm if not pm.isNull() else None, mime, name)
                             ev.acceptProposedAction()
                             return
+                        else:
+                            with open(p, "rb") as f:
+                                data = f.read()
+                            name = os.path.basename(p)
+                            mime = self._guess_mime(p)
+                            self._insert_file_chip(name, len(data))
+                            self.imagePasted.emit(data, None, mime, name)
+                            ev.acceptProposedAction()
+                            return
         except Exception:
             pass
         super().dropEvent(ev)
@@ -621,6 +731,22 @@ class ChatInput(QtWidgets.QTextEdit):
                 elif not (mods & (QtCore.Qt.ShiftModifier | QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier | QtCore.Qt.ControlModifier)):
                     self.sendRequested.emit()
                     return
+            elif ev.key() == QtCore.Qt.Key_Backspace:
+                if self._file_chip_range and not self.textCursor().hasSelection():
+                    try:
+                        s, e = self._file_chip_range
+                        c = QtGui.QTextCursor(self.document())
+                        c.setPosition(s)
+                        c.setPosition(e, QtGui.QTextCursor.KeepAnchor)
+                        c.removeSelectedText()
+                        self._file_chip_range = None
+                        try:
+                            self.fileChipCleared.emit()
+                        except Exception:
+                            pass
+                        return
+                    except Exception:
+                        pass
         except Exception:
             pass
         super().keyPressEvent(ev)
@@ -654,6 +780,80 @@ class ChatInput(QtWidgets.QTextEdit):
             except Exception:
                 pass
 
+    def _insert_document_icon(self, size: int = 18):
+        try:
+            icon_path = os.path.join(os.getcwd(), "icons", "ui", "document.png")
+            pm = QtGui.QPixmap(icon_path)
+            if pm.isNull():
+                return
+            pm = pm.scaled(size, size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            name = "doc-" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch()))
+            fmt = QtGui.QTextImageFormat()
+            fmt.setName(name)
+            fmt.setWidth(float(pm.width()))
+            fmt.setHeight(float(pm.height()))
+            self.document().addResource(QtGui.QTextDocument.ImageResource, QtCore.QUrl(name), pm.toImage())
+            cur = self.textCursor()
+            cur.insertImage(fmt)
+            cur.insertText(" ")
+        except Exception:
+            pass
+
+    def _human_size(self, n: int) -> str:
+        try:
+            units = ["B", "KB", "MB", "GB", "TB"]
+            i = 0
+            f = float(n)
+            while f >= 1024.0 and i < len(units) - 1:
+                f /= 1024.0
+                i += 1
+            return ("{:.1f}{}".format(f, units[i]) if i > 0 else "{}{}".format(int(f), units[i]))
+        except Exception:
+            return "0B"
+
+    def _insert_file_chip(self, name: str, size_bytes: int):
+        try:
+            size_str = self._human_size(int(size_bytes) if size_bytes is not None else 0)
+            cur = self.textCursor()
+            start_pos = cur.position()
+            icon_b64 = ""
+            try:
+                pm = QtGui.QPixmap(os.path.join(os.getcwd(), "icons", "ui", "document.png"))
+                if not pm.isNull():
+                    pm = pm.scaled(22, 22, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                    buf = QtCore.QBuffer(); buf.open(QtCore.QIODevice.WriteOnly)
+                    pm.toImage().save(buf, "PNG")
+                    icon_b64 = base64.b64encode(bytes(buf.data())).decode("ascii")
+            except Exception:
+                pass
+            import html as _html
+            esc_name = _html.escape(name or "")
+            img_tag = (f"<img src='data:image/png;base64,{icon_b64}' style='width:22px;height:22px;'/>" if icon_b64 else "")
+            html = (
+                "<div style='display:inline-block;background-color:rgba(0,0,0,0.06);border-radius:10px;padding:10px 12px;margin:4px 0;width:400px;'>"
+                "<table style='border-collapse:collapse;border:none;width:100%;'>"
+                "<tr>"
+                "<td style='vertical-align:middle;'>"
+                f"<div style='font-weight:600;color:#333;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;'>{esc_name}</div>"
+                f"<div style='font-size:12px;color:#777;margin-top:4px;'>{size_str}</div>"
+                "</td>"
+                f"<td style='vertical-align:middle;width:30px;text-align:right;'>{img_tag}</td>"
+                "</tr>"
+                "</table>"
+                "</div>"
+            )
+            self.textCursor().insertHtml(html)
+            end_pos = self.textCursor().position()
+            if end_pos > start_pos:
+                self._file_chip_range = (start_pos, end_pos)
+        except Exception:
+            # fallback to simple text
+            try:
+                self._insert_document_icon(18)
+            except Exception:
+                pass
+            self.textCursor().insertText(f"[文件: {name}] {size_str}")
+
     def _preview_target_width(self) -> int:
         try:
             vw = self.viewport().width()
@@ -661,6 +861,21 @@ class ChatInput(QtWidgets.QTextEdit):
             return max(200, min(w, 600))
         except Exception:
             return 300
+
+    def _guess_mime(self, path: str) -> str:
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in [".png"]:
+                return "image/png"
+            if ext in [".jpg", ".jpeg"]:
+                return "image/jpeg"
+            if ext in [".gif"]:
+                return "image/gif"
+            import mimetypes
+            m, _ = mimetypes.guess_type(path)
+            return m or "application/octet-stream"
+        except Exception:
+            return "application/octet-stream"
 
 class SidebarItem(QtWidgets.QFrame):
     clicked = QtCore.Signal()
@@ -869,6 +1084,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.pending_image_mime = None
         self.pending_image_name = None
         self.pending_image_pixmap = None
+        self.pending_file_path = None
         # shortcuts bound to entry
         try:
             self.send_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self.entry)
@@ -876,6 +1092,10 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
         self.entry.sendRequested.connect(self.on_send)
+        try:
+            self.entry.fileChipCleared.connect(self._on_file_chip_cleared)
+        except Exception:
+            pass
         layout = QtWidgets.QHBoxLayout()
         try:
             layout.setContentsMargins(8, 8, 8, 8)
@@ -1202,7 +1422,11 @@ class ChatWindow(QtWidgets.QWidget):
                         pix = self._pix_from_b64(mime, b64)
                         self._save_attachment(fn, b64, f"dm:{peer}")
                         av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                        self.conv_models[f"dm:{peer}"].add_file(sender, fn, mime, pix, sender == self.username, av, int(ts) if ts else None)
+                        try:
+                            sz = len(base64.b64decode(b64))
+                        except Exception:
+                            sz = None
+                        self.conv_models[f"dm:{peer}"].add_file(sender, fn, mime, pix, sender == self.username, av, int(ts) if ts else None, sz)
                     elif payload.startswith("file://"):
                         local_path = QtCore.QUrl(payload).toLocalFile()
                         try:
@@ -1246,7 +1470,11 @@ class ChatWindow(QtWidgets.QWidget):
                     self._save_attachment(fn, b64, f"dm:{name}")
                     self._ensure_conv(f"dm:{name}")
                     av = self.peer_avatars.get(name)
-                    self.conv_models[f"dm:{name}"].add_file(name, fn, mime, pix, False, av)
+                    try:
+                        sz = len(base64.b64decode(b64))
+                    except Exception:
+                        sz = None
+                    self.conv_models[f"dm:{name}"].add_file(name, fn, mime, pix, False, av, None, sz)
                     self.store.add(f"dm:{name}", name, f"[FILE] {fn} {mime}", "file", False)
                 elif msg.startswith("file://"):
                     local_path = QtCore.QUrl(msg).toLocalFile()
@@ -1293,7 +1521,11 @@ class ChatWindow(QtWidgets.QWidget):
                     pix = self._pix_from_b64(mime, b64)
                     self._save_attachment(fn, b64, f"dm:{target}")
                     self._ensure_conv(f"dm:{target}")
-                    self.conv_models[f"dm:{target}"].add_file(self.username, fn, mime, pix, True, self.avatar_pixmap)
+                    try:
+                        sz = len(base64.b64decode(b64))
+                    except Exception:
+                        sz = None
+                    self.conv_models[f"dm:{target}"].add_file(self.username, fn, mime, pix, True, self.avatar_pixmap, None, sz)
                     self.store.add(f"dm:{target}", self.username, f"[FILE] {fn} {mime}", "file", True)
                 elif msg.startswith("file://"):
                     local_path = QtCore.QUrl(msg).toLocalFile()
@@ -1325,7 +1557,11 @@ class ChatWindow(QtWidgets.QWidget):
                 self._save_attachment(fn, b64, f"group:{self.room}")
                 self._ensure_conv(f"group:{self.room}")
                 av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
-                self.conv_models[f"group:{self.room}"].add_file(name, fn, mime, pix, name == self.username, av)
+                try:
+                    sz = len(base64.b64decode(b64))
+                except Exception:
+                    sz = None
+                self.conv_models[f"group:{self.room}"].add_file(name, fn, mime, pix, name == self.username, av, None, sz)
                 self.store.add(f"group:{self.room}", name, f"[FILE] {fn} {mime}", "file", name == self.username)
             elif msg.startswith("file://"):
                 local_path = QtCore.QUrl(msg).toLocalFile()
@@ -1362,6 +1598,75 @@ class ChatWindow(QtWidgets.QWidget):
         if not self.current_conv:
             return
         text = self._sanitize_text(self.entry.toPlainText())
+        
+        # Check if we have a pending pasted file/image
+        if self.pending_image_bytes:
+            try:
+                print(f"[Send] pending file detected name={self.pending_image_name} mime={self.pending_image_mime} size={len(self.pending_image_bytes)}")
+            except Exception:
+                pass
+            b64 = base64.b64encode(self.pending_image_bytes).decode("ascii")
+            name = self.pending_image_name or ("paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png")
+            mime = self.pending_image_mime or "application/octet-stream"
+            
+            # If text contains the placeholder, remove it so we don't send duplicate text
+            placeholder = f"[文件: {name}]"
+            if placeholder in text:
+                text = text.replace(placeholder, "").strip()
+            # Also strip file-chip plaintext (name + size) that comes from HTML chip
+            try:
+                size_str = self._human_readable_size(len(self.pending_image_bytes))
+                lines = [ln for ln in (text.splitlines()) if ln.strip() not in {name.strip(), size_str.strip()}]
+                # remove extra empty lines introduced by chip
+                lines = [ln for ln in lines if ln.strip() != ""]
+                text = "\n".join(lines).strip()
+            except Exception:
+                pass
+                
+            payload_text = f"[FILE] {name} {mime} {b64}"
+            if self.current_conv.startswith("dm:"):
+                target = self.current_conv.split(":",1)[1]
+                self._send_seq(f"DM {target} {payload_text}")
+                self.store.add(f"dm:{target}", self.username, payload_text, "file", True)
+            else:
+                self._send_seq(f"MSG {payload_text}")
+                self.store.add(f"group:{self.room}", self.username, payload_text, "file", True)
+            self.logger.write("sent", self.username, payload_text)
+            self._ensure_conv(self.current_conv)
+            
+            _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
+            self.conv_models[self.current_conv].add_file(self.username, name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
+            try:
+                self._save_attachment(name, b64, self.current_conv)
+            except Exception:
+                pass
+            
+            self.pending_image_bytes = None
+            self.pending_image_mime = None
+            self.pending_image_name = None
+            self.pending_image_pixmap = None
+            self.view.scrollToBottom()
+            
+            # If there was remaining text, send it too
+            if text:
+                wire_text = text.replace("\n", "\\n")
+                if self.current_conv.startswith("dm:"):
+                    target = self.current_conv.split(":",1)[1]
+                    self._send_seq(f"DM {target} {wire_text}")
+                    self.store.add(f"dm:{target}", self.username, text, "msg", True)
+                    self._ensure_conv(self.current_conv)
+                    self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                else:
+                    self._send_seq(f"MSG {wire_text}")
+                    self.store.add(f"group:{self.room}", self.username, text, "msg", True)
+                    self._ensure_conv(self.current_conv)
+                    self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                    self.view.scrollToBottom()
+                self.logger.write("sent", self.username, wire_text)
+            
+            self.entry.clear()
+            return
+
         if not self.pending_image_bytes:
             img_bytes = self._extract_first_image_from_editor()
             if img_bytes:
@@ -1386,7 +1691,7 @@ class ChatWindow(QtWidgets.QWidget):
                 self.logger.write("sent", self.username, payload_text)
                 self._ensure_conv(self.current_conv)
                 _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
-                self.conv_models[self.current_conv].add_file(self.username, name, mime, _pix, True, self.avatar_pixmap)
+                self.conv_models[self.current_conv].add_file(self.username, name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
                 try:
                     self._save_attachment(name, b64, self.current_conv)
                 except Exception:
@@ -1402,6 +1707,7 @@ class ChatWindow(QtWidgets.QWidget):
                     try:
                         with open(url_path, "rb") as f:
                             data = f.read()
+                        
                         name = os.path.basename(url_path)
                         mime = self._guess_mime(url_path)
                         b64 = base64.b64encode(data).decode("ascii")
@@ -1416,7 +1722,7 @@ class ChatWindow(QtWidgets.QWidget):
                         self.logger.write("sent", self.username, payload_text)
                         self._ensure_conv(self.current_conv)
                         pix = QtGui.QPixmap(url_path)
-                        self.conv_models[self.current_conv].add_file(self.username, name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap)
+                        self.conv_models[self.current_conv].add_file(self.username, name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, len(data))
                         self._save_attachment(name, b64, self.current_conv)
                         text = self._sanitize_text(text.replace(f"file://{url_path}", ""))
                         self.view.scrollToBottom()
@@ -1537,7 +1843,7 @@ class ChatWindow(QtWidgets.QWidget):
                     self.logger.write("sent", self.username, payload_text)
                     pix = self._pix_from_b64(mime, b64)
                     self._ensure_conv(self.current_conv)
-                    self.conv_models[self.current_conv].add_file(self.username, name, mime, pix, True, self.avatar_pixmap)
+                    self.conv_models[self.current_conv].add_file(self.username, name, mime, pix, True, self.avatar_pixmap, None, len(data))
                     self.view.scrollToBottom()
                 except Exception:
                     pass
@@ -1739,7 +2045,11 @@ class ChatWindow(QtWidgets.QWidget):
                     p = self._attachment_path(fn, conv)
                     pix = QtGui.QPixmap(p) if os.path.isfile(p) else None
                     av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                    self.current_model.add_file(sender, fn, mime, pix if pix and not pix.isNull() else None, bool(selfflag), av, int(ts) if ts else None)
+                    try:
+                        sz = os.path.getsize(p) if os.path.isfile(p) else None
+                    except Exception:
+                        sz = None
+                    self.current_model.add_file(sender, fn, mime, pix if pix and not pix.isNull() else None, bool(selfflag), av, int(ts) if ts else None, sz)
                     if not (pix and not pix.isNull()):
                         missing += 1
                 elif kind == "sys":
@@ -1807,6 +2117,20 @@ class ChatWindow(QtWidgets.QWidget):
                 path = self._attachment_path(filename, self.current_conv)
                 QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
             act_open.triggered.connect(do_open_file)
+            
+            act_save_as = menu.addAction("另存为...")
+            def do_save_as():
+                try:
+                    src = self._attachment_path(filename, self.current_conv)
+                    if not os.path.isfile(src):
+                        return
+                    dst, _ = QtWidgets.QFileDialog.getSaveFileName(self, "另存为", filename)
+                    if dst:
+                        shutil.copy2(src, dst)
+                except Exception:
+                    pass
+            act_save_as.triggered.connect(do_save_as)
+
             act_open_dir = menu.addAction("打开所在文件夹")
             def do_open_dir():
                 QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_dir(self.current_conv)))
@@ -1928,7 +2252,11 @@ class ChatWindow(QtWidgets.QWidget):
                 p = self._attachment_path(fn, f"group:{self.room}")
                 pix = QtGui.QPixmap(p) if os.path.isfile(p) else None
                 av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-                self.conv_models[f"group:{self.room}"].add_file(sender, fn, mime, pix if pix and not pix.isNull() else None, bool(selfflag), av)
+                try:
+                    sz = os.path.getsize(p) if os.path.isfile(p) else None
+                except Exception:
+                    sz = None
+                self.conv_models[f"group:{self.room}"].add_file(sender, fn, mime, pix if pix and not pix.isNull() else None, bool(selfflag), av, None, sz)
                 if not (pix and not pix.isNull()):
                     missing += 1
             elif kind == "sys":
@@ -2091,6 +2419,17 @@ class ChatWindow(QtWidgets.QWidget):
             self.pending_image_mime = mime
             self.pending_image_name = name
             self.pending_image_pixmap = pixmap
+            
+        except Exception:
+            pass
+
+    def _on_file_chip_cleared(self):
+        try:
+            self.pending_image_bytes = None
+            self.pending_image_mime = None
+            self.pending_image_name = None
+            self.pending_image_pixmap = None
+            
         except Exception:
             pass
 
@@ -2188,6 +2527,18 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             return s or ""
 
+    def _human_readable_size(self, n: int) -> str:
+        try:
+            units = ["B", "KB", "MB", "GB", "TB"]
+            i = 0
+            f = float(max(0, int(n)))
+            while f >= 1024.0 and i < len(units) - 1:
+                f /= 1024.0
+                i += 1
+            return ("{:.1f}{}".format(f, units[i]) if i > 0 else "{}{}".format(int(f), units[i]))
+        except Exception:
+            return "0B"
+
     def _add_file_from_path(self, conv_key: str, sender: str, path: str, is_self: bool):
         if not path or not os.path.isfile(path):
             return
@@ -2201,7 +2552,7 @@ class ChatWindow(QtWidgets.QWidget):
             self._save_attachment(name, b64, conv_key)
             self._ensure_conv(conv_key)
             av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-            self.conv_models[conv_key].add_file(sender, name, mime, pix if not pix.isNull() else None, is_self, av)
+            self.conv_models[conv_key].add_file(sender, name, mime, pix if not pix.isNull() else None, is_self, av, None, len(data))
             self.store.add(conv_key, sender, f"[FILE] {name} {mime}", "file", is_self)
         except Exception:
             pass
