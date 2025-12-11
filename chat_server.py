@@ -9,6 +9,19 @@ import base64
 import hmac
 import hashlib
 import json
+import sys
+try:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+except Exception:
+    BaseHTTPRequestHandler = None
+    ThreadingHTTPServer = None
+import webbrowser
+try:
+    from PySide6 import QtWidgets, QtGui, QtCore
+except Exception:
+    QtWidgets = None
+    QtGui = None
+    QtCore = None
 
 
 class UnreadStore:
@@ -67,6 +80,7 @@ class Hub:
         self.store = UnreadStore()
         self.avatars = {}
         self.avatar_data = {}
+        self.room_names = {"general": "General"}
 
     def add(self, conn: socket.socket, username: str, room: str):
         with self.lock:
@@ -187,7 +201,12 @@ class Hub:
         return self.store.all(user)
 
 
-DB_PATH = os.path.join(os.getcwd(), "chat_history.db")
+_data_dir = os.path.expanduser("~/Library/Application Support/XiaoCaiChatServer")
+try:
+    os.makedirs(_data_dir, exist_ok=True)
+except Exception:
+    pass
+DB_PATH = os.path.join(_data_dir, "chat_history.db")
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.execute(
     "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conv TEXT, sender TEXT, ts INTEGER, text TEXT)"
@@ -626,6 +645,142 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
 
 def start_server(host: str, port: int):
     hub = Hub()
+    try:
+        if ThreadingHTTPServer and BaseHTTPRequestHandler:
+            def start_status_server():
+                class H(BaseHTTPRequestHandler):
+                    def do_GET(self):
+                        try:
+                            p = self.path.split("?", 1)[0]
+                            if p == "/api/status":
+                                rooms = list(hub.rooms.keys())
+                                data = {"rooms": [{"id": r, "name": hub.room_names.get(r, r), "users": hub.users(r)} for r in rooms]}
+                                b = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/json; charset=utf-8")
+                                self.send_header("Content-Length", str(len(b)))
+                                self.end_headers()
+                                try:
+                                    self.wfile.write(b)
+                                except Exception:
+                                    pass
+                            else:
+                                rooms = list(hub.rooms.keys())
+                                name_map = {r: hub.room_names.get(r, r) for r in rooms}
+                                html = ["<html><head><meta charset=\"utf-8\"><title>XiaoCaiChat Server</title>",
+                                        "<style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;padding:20px}h1{font-size:20px;margin:0 0 14px}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 10px}input,button{font-size:14px;padding:6px 10px;margin:4px}form{margin:12px 0}</style>",
+                                        "</head><body>",
+                                        "<h1>群聊后台管理</h1>",
+                                        "<form method=\"post\" action=\"/api/quit\"><button type=\"submit\">关闭服务器</button></form>",
+                                        "<form method=\"post\" action=\"/api/add_room\"><input name=\"room\" placeholder=\"新房间ID\"><button type=\"submit\">添加房间</button></form>",
+                                        "<table><tr><th>房间ID</th><th>显示名称</th><th>在线用户</th><th>操作</th></tr>"]
+                                for r in rooms:
+                                    u = hub.users(r)
+                                    html.append(f"<tr><td>{r}</td><td>{name_map.get(r,r)}</td><td>{len(u)}</td><td><form method=\"post\" action=\"/api/set_room_name\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"name\" placeholder=\"新的显示名称\"><button type=\"submit\">设置名称</button></form></td></tr>")
+                                html.append("</table>")
+                                html.append("</body></html>")
+                                b = "".join(html).encode("utf-8")
+                                self.send_response(200)
+                                self.send_header("Content-Type", "text/html; charset=utf-8")
+                                self.send_header("Content-Length", str(len(b)))
+                                self.end_headers()
+                                try:
+                                    self.wfile.write(b)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            try:
+                                self.send_response(500)
+                                self.end_headers()
+                            except Exception:
+                                pass
+                    def log_message(self, fmt, *args):
+                        try:
+                            pass
+                        except Exception:
+                            pass
+                    def _read_form(self):
+                        try:
+                            n = int(self.headers.get("Content-Length") or "0")
+                        except Exception:
+                            n = 0
+                        try:
+                            body = self.rfile.read(n) if n > 0 else b""
+                        except Exception:
+                            body = b""
+                        try:
+                            s = body.decode("utf-8")
+                            d = {}
+                            for p in s.split("&"):
+                                if not p:
+                                    continue
+                                kv = p.split("=", 1)
+                                k = kv[0]
+                                v = kv[1] if len(kv) > 1 else ""
+                                d[k] = v.replace("+", " ")
+                            return d
+                        except Exception:
+                            return {}
+                    def do_POST(self):
+                        try:
+                            p = self.path
+                            if p == "/api/add_room":
+                                form = self._read_form()
+                                room = form.get("room") or ""
+                                if room:
+                                    with hub.lock:
+                                        if room not in hub.rooms:
+                                            hub.rooms[room] = {}
+                                        if room not in hub.room_names:
+                                            hub.room_names[room] = room
+                                self.send_response(302)
+                                self.send_header("Location", "/")
+                                self.end_headers()
+                                return
+                            if p == "/api/set_room_name":
+                                form = self._read_form()
+                                room = form.get("room") or ""
+                                name = form.get("name") or ""
+                                if room and name:
+                                    with hub.lock:
+                                        hub.room_names[room] = name
+                                self.send_response(302)
+                                self.send_header("Location", "/")
+                                self.end_headers()
+                                return
+                            if p == "/api/quit":
+                                self.send_response(200)
+                                self.end_headers()
+                                try:
+                                    os._exit(0)
+                                except Exception:
+                                    pass
+                            self.send_response(404)
+                            self.end_headers()
+                        except Exception:
+                            try:
+                                self.send_response(500)
+                                self.end_headers()
+                            except Exception:
+                                pass
+                try:
+                    srv = ThreadingHTTPServer((host, 34568), H)
+                except Exception:
+                    return
+                def _loop():
+                    try:
+                        srv.serve_forever()
+                    except Exception:
+                        pass
+                    try:
+                        srv.server_close()
+                    except Exception:
+                        pass
+                t = threading.Thread(target=_loop, daemon=True)
+                t.start()
+            threading.Thread(target=start_status_server, daemon=True).start()
+    except Exception:
+        pass
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
@@ -643,18 +798,77 @@ def start_server(host: str, port: int):
             srv.close()
         except Exception:
             pass
+    
+    
 
 
 def parse_args():
     p = argparse.ArgumentParser(prog="chat_server", add_help=True)
-    p.add_argument("--host", type=str, default="0.0.0.0")
-    p.add_argument("--port", type=int, default=5001)
+    p.add_argument("--host", type=str, default="auto")
+    p.add_argument("--port", type=int, default=34567)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    start_server(args.host, args.port)
+    host = args.host
+    if not host or host == "auto":
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            host = s.getsockname()[0]
+            s.close()
+        except Exception:
+            try:
+                host = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                host = "127.0.0.1"
+    
+    def _run_server():
+        start_server(host, args.port)
+    base_dir = getattr(sys, "_MEIPASS", os.getcwd())
+    try:
+        os.chdir(base_dir)
+    except Exception:
+        pass
+    if QtWidgets and QtGui:
+        try:
+            t = threading.Thread(target=_run_server, daemon=True)
+            t.start()
+            app = QtWidgets.QApplication([])
+            try:
+                app.setQuitOnLastWindowClosed(False)
+            except Exception:
+                pass
+            icon = None
+            try:
+                icon = QtGui.QIcon(os.path.join(os.getcwd(), "icons", "ui", "server_menu.png"))
+            except Exception:
+                pass
+            tray = QtWidgets.QSystemTrayIcon(icon if icon and not icon.isNull() else QtGui.QIcon())
+            menu = QtWidgets.QMenu()
+            act_open = menu.addAction("打开后台")
+            act_quit = menu.addAction("退出")
+            def _open():
+                try:
+                    webbrowser.open(f"http://{host}:34568/")
+                except Exception:
+                    pass
+            def _quit():
+                try:
+                    os._exit(0)
+                except Exception:
+                    pass
+            act_open.triggered.connect(_open)
+            act_quit.triggered.connect(_quit)
+            tray.setContextMenu(menu)
+            tray.setToolTip("XiaoCaiChat Server")
+            tray.setVisible(True)
+            app.exec()
+            return
+        except Exception:
+            pass
+    _run_server()
 
 
 if __name__ == "__main__":
