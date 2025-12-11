@@ -11,6 +11,8 @@ import hmac
 import hashlib
 import time
 import re
+import urllib.request
+import urllib.error
 
 from PySide6 import QtCore, QtWidgets, QtGui
 APP_VERSION = "1.0.0"
@@ -1030,6 +1032,8 @@ class ChatWindow(QtWidgets.QWidget):
         self.port = port
         self.username = username
         self.room = room
+        self.room_name = room
+        self.room_ready = False
         self.sock: Optional[socket.socket] = None
         self.rx: Optional[Receiver] = None
         self.logger = ChatLogger(log_dir, f"{host}_{port}")
@@ -1046,6 +1050,10 @@ class ChatWindow(QtWidgets.QWidget):
                 self.avatar_pixmap = None
                 self.avatar_filename = None
         self.peer_avatars = {}
+        self.rooms_info = []
+        self.room_name_map = {}
+        self.socks = {}
+        self.receivers = {}
         self.pending_dm = set()
         self.pending_dm_users = set()
         self.pending_join_users = set()
@@ -1348,10 +1356,15 @@ class ChatWindow(QtWidgets.QWidget):
         # QTextEdit 直接回车发送，支持 Ctrl/⌘+Enter 备用快捷键
         self.conv_list.itemDoubleClicked.connect(self.on_pick_conv)
         self.conv_list.itemClicked.connect(self.on_pick_conv)
+        self.view_mode = "message"
         try:
-            QtCore.QTimer.singleShot(0, lambda: self._connect())
+            self._sync_room_from_server()
         except Exception:
-            self._connect()
+            pass
+        try:
+            QtCore.QTimer.singleShot(0, lambda: self._connect_all_rooms())
+        except Exception:
+            self._connect_all_rooms()
         self.conv_unread = {}
         self.conv_badges = {}
         self._init_conversations()
@@ -1363,7 +1376,6 @@ class ChatWindow(QtWidgets.QWidget):
         self._bootstrap_local()
         self._last_find_text = ""
         self._last_find_row = -1
-        self.view_mode = "message"
 
     def _show_find_bar(self):
         try:
@@ -1512,6 +1524,60 @@ class ChatWindow(QtWidgets.QWidget):
             pass
         return True
 
+    def _connect_room(self, rid: str) -> bool:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.connect((self.host, self.port))
+        except Exception:
+            return False
+        try:
+            extra = (self.avatar_filename or "").strip() if isinstance(self.avatar_filename, str) else ""
+            hello = f"HELLO {self.username} {rid} {extra}\n".encode("utf-8")
+            s.sendall(hello)
+        except Exception:
+            pass
+        rx = Receiver(s)
+        try:
+            rx.received.connect(lambda t, _rid=rid: self.on_received_room(_rid, t))
+        except Exception:
+            rx.received.connect(self.on_received)
+        rx.start()
+        self.socks[rid] = s
+        self.receivers[rid] = rx
+        try:
+            if hasattr(self, 'status_left') and self.status_left:
+                self.status_left.setText(f"已连接 {self.host}:{self.port}")
+        except Exception:
+            pass
+        try:
+            self._send_seq("HIST GROUP 50", rid)
+        except Exception:
+            pass
+        return True
+
+    def _connect_all_rooms(self) -> bool:
+        try:
+            if not self.rooms_info:
+                self._sync_room_from_server()
+            rooms = self.rooms_info or []
+            if not rooms:
+                return self._connect()
+            # init view model once
+            self.current_conv = None
+            self.current_model = ChatModel()
+            self.view.setModel(self.current_model)
+            # heartbeat timer
+            self.hb = QtCore.QTimer(self)
+            self.hb.setInterval(30000)
+            self.hb.timeout.connect(self._send_ping)
+            self.hb.start()
+            for r in rooms:
+                rid = str(r.get("id"))
+                self._connect_room(rid)
+            return True
+        except Exception:
+            return False
+
     def on_received(self, text: str):
         self.logger.write("recv", self.host, text)
         if text.startswith("PONG "):
@@ -1611,6 +1677,30 @@ class ChatWindow(QtWidgets.QWidget):
                             name = key.split(":",1)[1]
                             if name != self.username and name not in current_peers:
                                 self._set_online(name, False)
+                return
+            if len(parts) >= 4 and parts[1] == "ROOM_NAME":
+                room = parts[2]
+                name = " ".join(parts[3:])
+                if name:
+                    try:
+                        self.room_name_map[room] = name
+                    except Exception:
+                        pass
+                    if room == self.room:
+                        try:
+                            self.room_name = name
+                            self.room_ready = True
+                            if self.view_mode == "group":
+                                try:
+                                    self._ensure_group_items()
+                                except Exception:
+                                    pass
+                            try:
+                                self._update_conv_title(f"group:{self.room}")
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
                 return
             if len(parts) >= 5 and parts[1] == "AVATAR":
                 room = parts[2]
@@ -1850,6 +1940,371 @@ class ChatWindow(QtWidgets.QWidget):
                 except Exception:
                     pass
 
+    def on_received_room(self, rid: str, text: str):
+        self.logger.write("recv", self.host, text)
+        if text.startswith("PONG "):
+            return
+        if text.startswith("[ACK] "):
+            return
+        if text.startswith("[SYS] "):
+            parts = text.split()
+            if len(parts) >= 4 and parts[1] == "JOIN":
+                room = parts[2]
+                user = parts[3]
+                if room == rid:
+                    if user != self.username:
+                        if len(parts) >= 5 and parts[4]:
+                            try:
+                                self._set_peer_avatar(user, parts[4])
+                            except Exception:
+                                pass
+                            try:
+                                if user not in self.peer_avatars:
+                                    self._send_seq(f"AVATAR_REQ {user}", rid)
+                            except Exception:
+                                pass
+                        try:
+                            if self.view_mode == "message":
+                                self._set_online(user, True)
+                                self._add_conv_dm(user)
+                                try:
+                                    self._rebuild_conv_list()
+                                except Exception:
+                                    pass
+                            else:
+                                self._set_online(user, True)
+                                self.pending_join_users.add(user)
+                        except Exception:
+                            pass
+                try:
+                    self.view.scrollToBottom()
+                except Exception:
+                    pass
+                return
+            if len(parts) >= 2 and parts[1] == "DISCONNECT":
+                try:
+                    key = f"group:{rid}"
+                    self._ensure_conv(key)
+                    m = self.conv_models.get(key)
+                    if m:
+                        m.add("sys", "", "服务器连接已断开", False, None)
+                        self.view.scrollToBottom()
+                    if hasattr(self, 'status_left') and self.status_left:
+                        try:
+                            self.status_left.setText(f"已断开 {self.host}:{self.port}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return
+            if len(parts) >= 4 and parts[1] == "LEAVE":
+                room = parts[2]
+                user = parts[3]
+                if room == rid:
+                    if user != self.username:
+                        self._set_online(user, False)
+                    try:
+                        self.view.scrollToBottom()
+                    except Exception:
+                        pass
+                return
+            if len(parts) >= 4 and parts[1] == "USERS":
+                room = parts[2]
+                users_csv = " ".join(parts[3:])
+                if room == rid:
+                    users = [x for x in users_csv.split(",") if x]
+                    current_peers = set()
+                    for u in users:
+                        uname = u
+                        avatar = None
+                        if ":" in u:
+                            uname, avatar = u.split(":",1)
+                        if uname != self.username:
+                            if avatar:
+                                self._set_peer_avatar(uname, avatar)
+                            else:
+                                try:
+                                    self._try_local_peer_avatar(uname)
+                                except Exception:
+                                    pass
+                            try:
+                                if self.view_mode == "message":
+                                    self._set_online(uname, True)
+                                    self._add_conv_dm(uname)
+                                    try:
+                                        self._rebuild_conv_list()
+                                    except Exception:
+                                        pass
+                                else:
+                                    self._set_online(uname, True)
+                                    self.pending_join_users.add(uname)
+                            except Exception:
+                                pass
+                            current_peers.add(uname)
+                    for key in list(self.conv_models.keys()):
+                        if key.startswith("dm:"):
+                            name = key.split(":",1)[1]
+                            if name != self.username and name not in current_peers:
+                                self._set_online(name, False)
+                return
+            if len(parts) >= 4 and parts[1] == "ROOM_NAME":
+                room = parts[2]
+                name = " ".join(parts[3:])
+                if name:
+                    try:
+                        self.room_name_map[room] = name
+                    except Exception:
+                        pass
+                    try:
+                        self._update_conv_title(f"group:{room}")
+                    except Exception:
+                        pass
+                    if room == self.room:
+                        try:
+                            self.room_name = name
+                            self.room_ready = True
+                            if self.view_mode == "group":
+                                try:
+                                    self._ensure_group_items()
+                                except Exception:
+                                    pass
+                            try:
+                                self._update_conv_title(f"group:{self.room}")
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                return
+            if len(parts) >= 5 and parts[1] == "AVATAR":
+                room = parts[2]
+                user = parts[3]
+                filename = parts[4]
+                if room == rid and user != self.username:
+                    self._set_peer_avatar(user, filename)
+                    try:
+                        if user not in self.peer_avatars:
+                            self._send_seq(f"AVATAR_REQ {user}", rid)
+                    except Exception:
+                        pass
+                return
+            if len(parts) >= 6 and parts[1] == "AVATAR_DATA":
+                room = parts[2]
+                user = parts[3]
+                filename = parts[4]
+                mime = parts[5]
+                b64 = " ".join(parts[6:]) if len(parts) > 6 else ""
+                if room == rid and user != self.username and filename and b64:
+                    p = self._save_peer_avatar_file(filename, b64)
+                    if p:
+                        try:
+                            self._set_peer_avatar(user, filename)
+                        except Exception:
+                            pass
+                return
+            if len(parts) >= 6 and parts[1] == "HISTORY":
+                kind = parts[2]
+                if kind == "GROUP":
+                    return
+                if kind == "DM":
+                    peer = parts[3]
+                    sender = parts[4]
+                    ts = parts[5]
+                    payload = " ".join(parts[6:]) if len(parts) > 6 else ""
+                    self._ensure_conv(f"dm:{peer}")
+                    if payload.startswith("[FILE] "):
+                        fn, mime, b64 = self._parse_file(payload)
+                        if self._is_deleted(f"dm:{peer}", "file", fn, mime):
+                            return
+                        pix = self._pix_from_b64(mime, b64)
+                        self._save_attachment(fn, b64, f"dm:{peer}")
+                        av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                        try:
+                            sz = len(base64.b64decode(b64))
+                        except Exception:
+                            sz = None
+                        self.conv_models[f"dm:{peer}"].add_file(sender, fn, mime, pix, sender == self.username, av, int(ts) if ts else None, sz)
+                    elif payload.startswith("file://"):
+                        local_path = QtCore.QUrl(payload).toLocalFile()
+                        try:
+                            self._add_file_from_path(f"dm:{peer}", sender, local_path, sender == self.username)
+                        except Exception:
+                            pass
+                    else:
+                        payload_clean = self._sanitize_text(payload)
+                        if self._is_deleted(f"dm:{peer}", "msg", payload_clean, None):
+                            return
+                        if payload_clean:
+                            av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                            self.conv_models[f"dm:{peer}"].add("msg", sender, payload_clean, sender == self.username, av, int(ts) if ts else None)
+                    return
+            if len(parts) >= 4 and parts[1] == "UNREAD":
+                conv = parts[2]
+                cnt = 0
+                try:
+                    cnt = int(parts[3])
+                except Exception:
+                    cnt = 0
+                if conv.startswith("group:"):
+                    key = conv
+                else:
+                    x, y = conv[len("dm:"):].split("&", 1)
+                    key = f"dm:{y}" if x == self.username else f"dm:{x}"
+                    try:
+                        name = key.split(":",1)[1]
+                        if self.view_mode == "message":
+                            self._add_conv_dm(name)
+                            self._apply_conv_filter()
+                        else:
+                            self.pending_dm_users.add(name)
+                    except Exception:
+                        pass
+                self._set_unread(key, cnt)
+                return
+        if text.startswith("[DM] "):
+            parts = text.split(" ", 3)
+            if len(parts) >= 4 and parts[1] == "FROM":
+                name = parts[2]
+                msg = parts[3]
+                if msg.startswith("[FILE] "):
+                    fn, mime, b64 = self._parse_file(msg)
+                    if self._is_deleted(f"dm:{name}", "file", fn, mime):
+                        return
+                    pix = self._pix_from_b64(mime, b64)
+                    self._save_attachment(fn, b64, f"dm:{name}")
+                    self._ensure_conv(f"dm:{name}")
+                    av = self.peer_avatars.get(name)
+                    try:
+                        sz = len(base64.b64decode(b64))
+                    except Exception:
+                        sz = None
+                    self.conv_models[f"dm:{name}"].add_file(name, fn, mime, pix, False, av, None, sz)
+                    self.store.add(f"dm:{name}", name, f"[FILE] {fn} {mime}", "file", False)
+                elif msg.startswith("file://"):
+                    local_path = QtCore.QUrl(msg).toLocalFile()
+                    try:
+                        self._add_file_from_path(f"dm:{name}", name, local_path, False)
+                    except Exception:
+                        pass
+                else:
+                    msg_clean = self._sanitize_text(msg)
+                    if self._is_deleted(f"dm:{name}", "msg", msg_clean, None):
+                        return
+                    if msg_clean:
+                        self._ensure_conv(f"dm:{name}")
+                        av = self.peer_avatars.get(name)
+                        self.conv_models[f"dm:{name}"].add("msg", name, msg_clean, False, av)
+                        self.store.add(f"dm:{name}", name, msg_clean, "msg", False)
+                self.view.scrollToBottom()
+                try:
+                    if self.view_mode == "message":
+                        self._add_conv_dm(name)
+                        self._apply_conv_filter()
+                    else:
+                        self.pending_dm_users.add(name)
+                except Exception:
+                    pass
+                is_inactive = not self.isActiveWindow() or self.isMinimized() or QtWidgets.QApplication.instance().applicationState() != QtCore.Qt.ApplicationActive
+                if self.current_conv != f"dm:{name}" or is_inactive:
+                    self._inc_unread(f"dm:{name}")
+                if self.current_conv != f"dm:{name}" or is_inactive:
+                    try:
+                        note_text = self._sanitize_text(msg)
+                        if msg.startswith("[FILE] ") or msg.startswith("file://"):
+                            note_text = "[图片]"
+                        self._send_macos_notification(name, note_text)
+                    except Exception:
+                        pass
+                return
+            if len(parts) >= 4 and parts[1] == "TO":
+                target = parts[2]
+                msg = parts[3]
+                if target != self.username:
+                    return
+                if msg.startswith("[FILE] "):
+                    fn, mime, b64 = self._parse_file(msg)
+                    if self._is_deleted(f"dm:{target}", "file", fn, mime):
+                        return
+                    pix = self._pix_from_b64(mime, b64)
+                    self._save_attachment(fn, b64, f"dm:{target}")
+                    self._ensure_conv(f"dm:{target}")
+                    try:
+                        sz = len(base64.b64decode(b64))
+                    except Exception:
+                        sz = None
+                    self.conv_models[f"dm:{target}"].add_file(self.username, fn, mime, pix, True, self.avatar_pixmap, None, sz)
+                    self.store.add(f"dm:{target}", self.username, f"[FILE] {fn} {mime}", "file", True)
+                elif msg.startswith("file://"):
+                    local_path = QtCore.QUrl(msg).toLocalFile()
+                    try:
+                        self._add_file_from_path(f"dm:{target}", self.username, local_path, True)
+                    except Exception:
+                        pass
+                else:
+                    msg_clean = self._sanitize_text(msg)
+                    if self._is_deleted(f"dm:{target}", "msg", msg_clean, None):
+                        return
+                    if msg_clean:
+                        self._ensure_conv(f"dm:{target}")
+                        self.conv_models[f"dm:{target}"].add("msg", self.username, msg_clean, True, self.avatar_pixmap)
+                        self.store.add(f"dm:{target}", self.username, msg_clean, "msg", True)
+                        self.view.scrollToBottom()
+                        try:
+                            if self.view_mode == "message":
+                                self._add_conv_dm(target)
+                                self._apply_conv_filter()
+                            else:
+                                self.pending_dm_users.add(target)
+                        except Exception:
+                            pass
+                return
+        if ">" in text:
+            name, msg = text.split(">", 1)
+            name = name.strip()
+            msg = msg.strip()
+            rid_key = f"group:{rid}"
+            if msg.startswith("[FILE] "):
+                fn, mime, b64 = self._parse_file(msg)
+                if self._is_deleted(rid_key, "file", fn, mime):
+                    return
+                pix = self._pix_from_b64(mime, b64)
+                self._save_attachment(fn, b64, rid_key)
+                self._ensure_conv(rid_key)
+                av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
+                try:
+                    sz = len(base64.b64decode(b64))
+                except Exception:
+                    sz = None
+                self.conv_models[rid_key].add_file(name, fn, mime, pix, name == self.username, av, None, sz)
+                self.store.add(rid_key, name, f"[FILE] {fn} {mime}", "file", name == self.username)
+            elif msg.startswith("file://"):
+                local_path = QtCore.QUrl(msg).toLocalFile()
+                try:
+                    self._add_file_from_path(rid_key, name, local_path, name == self.username)
+                except Exception:
+                    pass
+            else:
+                msg_clean = self._sanitize_text(msg)
+                if self._is_deleted(rid_key, "msg", msg_clean, None):
+                    return
+                if msg_clean:
+                    self._ensure_conv(rid_key)
+                    av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
+                    self.conv_models[rid_key].add("msg", name, msg_clean, name == self.username, av)
+                    self.store.add(rid_key, name, msg_clean, "msg", name == self.username)
+            self.view.scrollToBottom()
+            is_inactive = not self.isActiveWindow() or self.isMinimized() or QtWidgets.QApplication.instance().applicationState() != QtCore.Qt.ApplicationActive
+            if self.current_conv != rid_key or is_inactive:
+                self._inc_unread(rid_key)
+            if self.current_conv != rid_key or is_inactive:
+                try:
+                    note_text = self._sanitize_text(msg)
+                    if msg.startswith("[FILE] ") or msg.startswith("file://"):
+                        note_text = "[图片]"
+                    room_title = self.room_name_map.get(rid, rid)
+                    self._send_macos_notification(f"{name} ({room_title})", note_text)
+                except Exception:
+                    pass
+
     def on_send(self):
         if not self.current_conv:
             return
@@ -1885,8 +2340,9 @@ class ChatWindow(QtWidgets.QWidget):
                 self._send_seq(f"DM {target} {payload_text}")
                 self.store.add(f"dm:{target}", self.username, payload_text, "file", True)
             else:
-                self._send_seq(f"MSG {payload_text}")
-                self.store.add(f"group:{self.room}", self.username, payload_text, "file", True)
+                rid = self.current_conv.split(":",1)[1]
+                self._send_seq(f"MSG {payload_text}", rid)
+                self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
             self.logger.write("sent", self.username, payload_text)
             self._ensure_conv(self.current_conv)
             
@@ -1913,8 +2369,9 @@ class ChatWindow(QtWidgets.QWidget):
                     self._ensure_conv(self.current_conv)
                     self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
                 else:
-                    self._send_seq(f"MSG {wire_text}")
-                    self.store.add(f"group:{self.room}", self.username, text, "msg", True)
+                    rid = self.current_conv.split(":",1)[1]
+                    self._send_seq(f"MSG {wire_text}", rid)
+                    self.store.add(f"group:{rid}", self.username, text, "msg", True)
                     self._ensure_conv(self.current_conv)
                     self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
                     self.view.scrollToBottom()
@@ -1942,8 +2399,9 @@ class ChatWindow(QtWidgets.QWidget):
                     self._send_seq(f"DM {target} {payload_text}")
                     self.store.add(f"dm:{target}", self.username, payload_text, "file", True)
                 else:
-                    self._send_seq(f"MSG {payload_text}")
-                    self.store.add(f"group:{self.room}", self.username, payload_text, "file", True)
+                    rid = self.current_conv.split(":",1)[1]
+                    self._send_seq(f"MSG {payload_text}", rid)
+                    self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
                 self.logger.write("sent", self.username, payload_text)
                 self._ensure_conv(self.current_conv)
                 _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
@@ -1973,8 +2431,9 @@ class ChatWindow(QtWidgets.QWidget):
                             self._send_seq(f"DM {target} {payload_text}")
                             self.store.add(f"dm:{target}", self.username, payload_text, "file", True)
                         else:
-                            self._send_seq(f"MSG {payload_text}")
-                            self.store.add(f"group:{self.room}", self.username, payload_text, "file", True)
+                            rid = self.current_conv.split(":",1)[1]
+                            self._send_seq(f"MSG {payload_text}", rid)
+                            self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
                         self.logger.write("sent", self.username, payload_text)
                         self._ensure_conv(self.current_conv)
                         pix = QtGui.QPixmap(url_path)
@@ -1994,8 +2453,9 @@ class ChatWindow(QtWidgets.QWidget):
                     self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
                     self.view.scrollToBottom()
                 else:
-                    self._send_seq(f"MSG {wire_text}")
-                    self.store.add(f"group:{self.room}", self.username, text, "msg", True)
+                    rid = self.current_conv.split(":",1)[1]
+                    self._send_seq(f"MSG {wire_text}", rid)
+                    self.store.add(f"group:{rid}", self.username, text, "msg", True)
                     self._ensure_conv(self.current_conv)
                     self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
                     self.view.scrollToBottom()
@@ -2009,14 +2469,63 @@ class ChatWindow(QtWidgets.QWidget):
 
     def on_pick_conv(self, item: QtWidgets.QListWidgetItem):
         text = item.text()
-        if text.startswith("群聊:"):
-            self.switch_conv(f"group:{self.room}")
+        data = None
+        try:
+            data = item.data(QtCore.Qt.UserRole)
+        except Exception:
+            data = None
+        if isinstance(data, str) and data.startswith("group:"):
+            self.switch_conv(data)
         else:
             name = text.split(" (",1)[0]
             self.switch_conv(f"dm:{name}")
         try:
             self.view.scrollToBottom()
             QtCore.QTimer.singleShot(0, lambda: self.view.scrollToBottom())
+        except Exception:
+            pass
+
+    def _switch_room(self, rid: str, name: str):
+        try:
+            if hasattr(self, 'hb') and self.hb:
+                try:
+                    self.hb.stop()
+                except Exception:
+                    pass
+            if hasattr(self, 'rx') and self.rx:
+                try:
+                    self.rx.stop()
+                    self.rx.wait(2000)
+                except Exception:
+                    pass
+                try:
+                    self.rx.deleteLater()
+                except Exception:
+                    pass
+                self.rx = None
+            if self.sock:
+                try:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    self.sock.close()
+                except Exception:
+                    pass
+                self.sock = None
+            self.room = rid
+            self.room_name = name
+            self.room_ready = True
+            try:
+                self.room_name_map[rid] = name
+            except Exception:
+                pass
+            self._connect()
+            self.view_mode = "group"
+            try:
+                self._rebuild_conv_list()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2136,7 +2645,11 @@ class ChatWindow(QtWidgets.QWidget):
         self._update_sidebar_badge()
 
     def _update_conv_title(self, key: str):
-        title = f"群聊:{self.room}" if key.startswith("group:") else key.split(":",1)[1]
+        if key.startswith("group:"):
+            rid = key.split(":",1)[1]
+            title = self.room_name if rid == self.room else self.room_name_map.get(rid, rid)
+        else:
+            title = key.split(":",1)[1]
         count = self.conv_unread.get(key, 0)
         text = f"{title} ({count})" if count > 0 else title
         for i in range(self.conv_list.count()):
@@ -2160,7 +2673,7 @@ class ChatWindow(QtWidgets.QWidget):
     def _update_sidebar_badge(self):
         try:
             total_dm = sum(v for k,v in self.conv_unread.items() if k.startswith("dm:"))
-            group_cnt = self.conv_unread.get(f"group:{self.room}", 0)
+            group_cnt = sum(v for k,v in self.conv_unread.items() if k.startswith("group:"))
             if total_dm > 0:
                 self.msg_badge.setText(str(total_dm))
                 self.msg_badge.setVisible(True)
@@ -2176,16 +2689,21 @@ class ChatWindow(QtWidgets.QWidget):
             pass
     def _apply_conv_filter(self):
         try:
-            title = f"群聊:{self.room}"
             items_log = []
             for i in range(self.conv_list.count()):
                 base = self.conv_list.item(i).text().split(" (",1)[0]
+                item = self.conv_list.item(i)
+                data = None
+                try:
+                    data = item.data(QtCore.Qt.UserRole)
+                except Exception:
+                    data = None
                 if self.view_mode == "group":
-                    hide = (base != title)
+                    hide = not (isinstance(data, str) and data.startswith("group:"))
                     self.conv_list.setItemHidden(self.conv_list.item(i), hide)
                     items_log.append(f"{i}:{base}:{'hide' if hide else 'show'}")
                 else:
-                    hide = base.startswith("群聊:")
+                    hide = (isinstance(data, str) and data.startswith("group:"))
                     self.conv_list.setItemHidden(self.conv_list.item(i), hide)
                     items_log.append(f"{i}:{base}:{'hide' if hide else 'show'}")
             try:
@@ -2203,12 +2721,13 @@ class ChatWindow(QtWidgets.QWidget):
                 self.conv_avatar_labels = {}
             except Exception:
                 pass
-            title = f"群聊:{self.room}"
             if self.view_mode == "group":
-                self._ensure_group_item()
+                self._ensure_group_items()
+                want = f"group:{self.room}"
                 for i in range(self.conv_list.count()):
-                    base = self.conv_list.item(i).text().split(" (",1)[0]
-                    if base == title:
+                    it = self.conv_list.item(i)
+                    data = it.data(QtCore.Qt.UserRole) if it else None
+                    if data == want:
                         self.conv_list.setCurrentRow(i)
                         break
             else:
@@ -2226,6 +2745,36 @@ class ChatWindow(QtWidgets.QWidget):
                             self.conv_list.setCurrentRow(i)
                             break
             self._apply_conv_filter()
+        except Exception:
+            pass
+
+    def _sync_room_from_server(self):
+        try:
+            url = f"http://{self.host}:34568/api/status"
+            with urllib.request.urlopen(url, timeout=2.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            rooms = data.get("rooms") or []
+            self.rooms_info = rooms
+            try:
+                self.room_name_map = {str(r.get("id")): str(r.get("name") or str(r.get("id"))) for r in rooms}
+            except Exception:
+                self.room_name_map = {}
+            if rooms:
+                prefer = None
+                for r in rooms:
+                    if str(r.get("id")) == str(self.room):
+                        prefer = r
+                        break
+                info = prefer or rooms[0]
+                rid = str(info.get("id") or self.room)
+                rname = str(info.get("name") or rid)
+                self.room = rid
+                self.room_name = rname
+                self.room_ready = True
+                try:
+                    self.room_name_map[self.room] = self.room_name
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2666,10 +3215,23 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def _send_seq(self, body: str):
+    def _send_seq(self, body: str, rid: Optional[str] = None):
         try:
+            target_room = rid
+            if not target_room:
+                try:
+                    if self.current_conv and self.current_conv.startswith("group:"):
+                        target_room = self.current_conv.split(":",1)[1]
+                except Exception:
+                    target_room = None
+            if not target_room:
+                target_room = self.room
             payload = f"SEQ {self.seq} {body}\n".encode("utf-8")
-            self.sock.sendall(payload)
+            s = self.socks.get(target_room) if hasattr(self, 'socks') else None
+            if s:
+                s.sendall(payload)
+            elif self.sock:
+                self.sock.sendall(payload)
             self.seq += 1
         except Exception:
             pass
@@ -2677,7 +3239,16 @@ class ChatWindow(QtWidgets.QWidget):
     def _send_ping(self):
         try:
             ts = str(QtCore.QDateTime.currentMSecsSinceEpoch())
-            self.sock.sendall((f"PING {ts}\n").encode("utf-8"))
+            sent = False
+            if hasattr(self, 'socks'):
+                for rid, s in list(self.socks.items()):
+                    try:
+                        s.sendall((f"PING {ts}\n").encode("utf-8"))
+                        sent = True
+                    except Exception:
+                        pass
+            if not sent and self.sock:
+                self.sock.sendall((f"PING {ts}\n").encode("utf-8"))
         except Exception:
             pass
 
@@ -2749,59 +3320,81 @@ class ChatWindow(QtWidgets.QWidget):
             pass
 
     def _ensure_group_item(self):
-        title = f"群聊:{self.room}"
-        exists = False
-        for i in range(self.conv_list.count()):
-            if self.conv_list.item(i).text().split(" (",1)[0] == title:
-                exists = True
-                break
-        if not exists:
-            it = QtWidgets.QListWidgetItem(title)
-            it.setSizeHint(QtCore.QSize(200, 56))
+        self._ensure_group_items()
+
+    def _ensure_group_items(self):
+        if not self.room_ready:
             try:
-                it.setIcon(QtGui.QIcon())
+                return
+            except Exception:
+                return
+        rooms = self.rooms_info or []
+        # build items for all rooms
+        for r in rooms:
+            rid = str(r.get("id"))
+            title = str(r.get("name") or rid)
+            exists = False
+            for i in range(self.conv_list.count()):
+                it0 = self.conv_list.item(i)
+                data0 = it0.data(QtCore.Qt.UserRole) if it0 else None
+                if data0 == f"group:{rid}":
+                    exists = True
+                    break
+            if not exists:
+                it = QtWidgets.QListWidgetItem(title)
+                it.setSizeHint(QtCore.QSize(200, 56))
+                try:
+                    it.setIcon(QtGui.QIcon())
+                except Exception:
+                    pass
+                try:
+                    it.setData(QtCore.Qt.UserRole, f"group:{rid}")
+                except Exception:
+                    pass
+                self.conv_list.addItem(it)
+                w = QtWidgets.QWidget()
+                hl = QtWidgets.QHBoxLayout()
+                try:
+                    hl.setContentsMargins(12, 6, 12, 6)
+                    hl.setSpacing(8)
+                except Exception:
+                    pass
+                icon_lbl = QtWidgets.QLabel()
+                icon_lbl.setFixedSize(28, 28)
+                try:
+                    pm = QtGui.QIcon(os.path.join(os.getcwd(), "icons", "user", "group.png")).pixmap(28, 28)
+                    icon_lbl.setPixmap(pm)
+                except Exception:
+                    pass
+                name_lbl = QtWidgets.QLabel(title)
+                try:
+                    name_lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';}")
+                except Exception:
+                    pass
+                badge_lbl = QtWidgets.QLabel()
+                badge_lbl.setVisible(False)
+                try:
+                    badge_lbl.setStyleSheet("QLabel{background:#F44336;color:#fff;border-radius:8px;padding:0 6px;font:11px 'Helvetica Neue';}")
+                except Exception:
+                    pass
+                hl.addWidget(icon_lbl)
+                hl.addWidget(name_lbl, 1)
+                hl.addWidget(badge_lbl)
+                w.setLayout(hl)
+                self.conv_list.setItemWidget(it, w)
+                self.conv_badges[f"group:{rid}"] = badge_lbl
+            try:
+                self._ensure_unread_key(f"group:{rid}")
             except Exception:
                 pass
-            self.conv_list.insertItem(0, it)
-            # custom widget with badge on the right
-            w = QtWidgets.QWidget()
-            hl = QtWidgets.QHBoxLayout()
-            try:
-                hl.setContentsMargins(12, 6, 12, 6)
-                hl.setSpacing(8)
-            except Exception:
-                pass
-            icon_lbl = QtWidgets.QLabel()
-            icon_lbl.setFixedSize(28, 28)
-            try:
-                pm = QtGui.QIcon(os.path.join(os.getcwd(), "icons", "user", "group.png")).pixmap(28, 28)
-                icon_lbl.setPixmap(pm)
-            except Exception:
-                pass
-            name_lbl = QtWidgets.QLabel(title)
-            try:
-                name_lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';}")
-            except Exception:
-                pass
-            badge_lbl = QtWidgets.QLabel()
-            badge_lbl.setVisible(False)
-            try:
-                badge_lbl.setStyleSheet("QLabel{background:#F44336;color:#fff;border-radius:8px;padding:0 6px;font:11px 'Helvetica Neue';}")
-            except Exception:
-                pass
-            hl.addWidget(icon_lbl)
-            hl.addWidget(name_lbl, 1)
-            hl.addWidget(badge_lbl)
-            w.setLayout(hl)
-            self.conv_list.setItemWidget(it, w)
-            self.conv_badges[f"group:{self.room}"] = badge_lbl
-        self._ensure_unread_key(f"group:{self.room}")
         try:
             self._apply_conv_filter()
         except Exception:
             pass
         try:
-            self._update_conv_title(f"group:{self.room}")
+            for r in rooms:
+                rid = str(r.get("id"))
+                self._update_conv_title(f"group:{rid}")
         except Exception:
             pass
 
@@ -2812,8 +3405,7 @@ class ChatWindow(QtWidgets.QWidget):
             self.setting_item.setSelected(False)
             self.conv_list.setVisible(True)
             self.right_stack.setCurrentIndex(0)
-            self._ensure_group_item()
-            title = f"群聊:{self.room}"
+            self._ensure_group_items()
             self.view_mode = "group"
             try:
                 self._rebuild_conv_list()
@@ -3228,7 +3820,7 @@ def parse_args():
 
 def _load_client_config(path: str):
     try:
-        defaults = {"host": "127.0.0.1", "port": 5001, "room": "general", "theme": "flat"}
+        defaults = {"host": "127.0.0.1", "port": 34567, "room": "世界", "theme": "flat"}
         candidates = []
         if path:
             candidates.append(path)
@@ -3252,7 +3844,7 @@ def _load_client_config(path: str):
                 break
         return defaults["host"], int(defaults["port"]), defaults["room"], defaults.get("theme")
     except Exception:
-        return "127.0.0.1", 5001, "general", "flat"
+        return "127.0.0.1", 34567, "世界", "flat"
 
 def _save_client_config(path: str, host: str, port: int, room: str, theme: Optional[str] = None):
     try:
@@ -3272,7 +3864,7 @@ def _ensure_user_config(path: str):
         p = path or os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json")
         ddir = os.path.dirname(p)
         os.makedirs(ddir, exist_ok=True)
-        defaults = {"host": "127.0.0.1", "port": 5001, "room": "general", "theme": "flat"}
+        defaults = {"host": "127.0.0.1", "port": 34567, "room": "世界", "theme": "flat"}
         if os.path.isfile(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:

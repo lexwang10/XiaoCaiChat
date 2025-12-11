@@ -74,13 +74,17 @@ class UnreadStore:
 
 class Hub:
     def __init__(self):
-        self.rooms = {}
+        self.rooms = {"世界": {}}
         self.conn_info = {}
         self.lock = threading.Lock()
         self.store = UnreadStore()
         self.avatars = {}
         self.avatar_data = {}
-        self.room_names = {"general": "General"}
+        self.room_names = {"世界": "世界"}
+        try:
+            self._load_rooms()
+        except Exception:
+            pass
 
     def add(self, conn: socket.socket, username: str, room: str):
         with self.lock:
@@ -91,6 +95,11 @@ class Hub:
         self.broadcast_sys(room, f"[SYS] JOIN {room} {username} {av}")
         self.broadcast_users(room)
         with self.lock:
+            pass
+        try:
+            name = self.room_names.get(room, room)
+            self.broadcast_sys(room, f"[SYS] ROOM_NAME {room} {name}")
+        except Exception:
             pass
 
     def remove(self, conn: socket.socket):
@@ -191,6 +200,30 @@ class Hub:
         save_message(conv_dm(origin_user, target_user), origin_user, text)
         self.store.inc(target_user, conv_dm(origin_user, target_user))
 
+    def _load_rooms(self):
+        try:
+            rooms, names = _load_rooms_json()
+            if rooms:
+                with self.lock:
+                    for r in rooms:
+                        if r not in self.rooms:
+                            self.rooms[r] = {}
+            if names:
+                with self.lock:
+                    for r, n in names.items():
+                        self.room_names[r] = n
+        except Exception:
+            pass
+
+    def _save_rooms(self):
+        try:
+            with self.lock:
+                rooms = list(self.rooms.keys())
+                names = dict(self.room_names)
+            _save_rooms_json(rooms, names)
+        except Exception:
+            pass
+
     def _unread_inc(self, user: str, conv: str):
         self.store.inc(user, conv)
 
@@ -228,6 +261,28 @@ def save_message(conv: str, sender: str, text: str):
     except Exception:
         pass
 
+ROOMS_JSON = os.path.join(_data_dir, "rooms.json")
+
+def _load_rooms_json():
+    try:
+        if os.path.isfile(ROOMS_JSON):
+            with open(ROOMS_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            rooms = data.get("rooms") or []
+            names = data.get("names") or {}
+            return rooms, names
+    except Exception:
+        pass
+    return None, None
+
+def _save_rooms_json(rooms: list[str], names: dict[str,str]):
+    try:
+        data = {"rooms": rooms, "names": names}
+        with open(ROOMS_JSON, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 def load_recent(conv: str, limit: int):
     try:
         cur = db.execute("SELECT sender, ts, text FROM messages WHERE conv=? ORDER BY id DESC LIMIT ?", (conv, limit))
@@ -241,7 +296,7 @@ def load_recent(conv: str, limit: int):
 def handle_client(conn: socket.socket, addr, hub: Hub):
     f = conn.makefile("r", encoding="utf-8", newline="\n")
     username = addr[0]
-    room = "general"
+    room = "世界"
     def parse_dm(line: str):
         s = line.strip()
         if not s:
@@ -358,7 +413,7 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
             parts = first.strip().split()
             if len(parts) >= 3:
                 username = parts[1] or addr[0]
-                room = parts[2] or "general"
+                room = parts[2] or "世界"
             else:
                 username = first[len("HELLO ") :].rstrip("\n") or addr[0]
             hub.add(conn, username, room)
@@ -676,7 +731,13 @@ def start_server(host: str, port: int):
                                         "<table><tr><th>房间ID</th><th>显示名称</th><th>在线用户</th><th>操作</th></tr>"]
                                 for r in rooms:
                                     u = hub.users(r)
-                                    html.append(f"<tr><td>{r}</td><td>{name_map.get(r,r)}</td><td>{len(u)}</td><td><form method=\"post\" action=\"/api/set_room_name\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"name\" placeholder=\"新的显示名称\"><button type=\"submit\">设置名称</button></form></td></tr>")
+                                    del_btn = "<button type=\"submit\" disabled>删除房间</button>" if len(u) > 0 else "<button type=\"submit\">删除房间</button>"
+                                    html.append(
+                                        f"<tr><td>{r}</td><td>{name_map.get(r,r)}</td><td>{len(u)}</td><td>"
+                                        f"<form method=\"post\" action=\"/api/set_room_name\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"name\" placeholder=\"新的显示名称\"><button type=\"submit\">设置名称</button></form>"
+                                        f"<form method=\"post\" action=\"/api/delete_room\"><input type=\"hidden\" name=\"room\" value=\"{r}\">{del_btn}</form>"
+                                        f"</td></tr>"
+                                    )
                                 html.append("</table>")
                                 html.append("</body></html>")
                                 b = "".join(html).encode("utf-8")
@@ -733,6 +794,10 @@ def start_server(host: str, port: int):
                                             hub.rooms[room] = {}
                                         if room not in hub.room_names:
                                             hub.room_names[room] = room
+                                    try:
+                                        hub._save_rooms()
+                                    except Exception:
+                                        pass
                                 self.send_response(302)
                                 self.send_header("Location", "/")
                                 self.end_headers()
@@ -744,6 +809,38 @@ def start_server(host: str, port: int):
                                 if room and name:
                                     with hub.lock:
                                         hub.room_names[room] = name
+                                    try:
+                                        hub.broadcast_sys(room, f"[SYS] ROOM_NAME {room} {name}")
+                                    except Exception:
+                                        pass
+                                    try:
+                                        hub._save_rooms()
+                                    except Exception:
+                                        pass
+                                self.send_response(302)
+                                self.send_header("Location", "/")
+                                self.end_headers()
+                                return
+                            if p == "/api/delete_room":
+                                form = self._read_form()
+                                room = form.get("room") or ""
+                                if room:
+                                    with hub.lock:
+                                        users = hub.rooms.get(room, {})
+                                        if room in hub.rooms and len(users) == 0:
+                                            try:
+                                                del hub.rooms[room]
+                                            except Exception:
+                                                pass
+                                        if room in hub.room_names:
+                                            try:
+                                                del hub.room_names[room]
+                                            except Exception:
+                                                pass
+                                    try:
+                                        hub._save_rooms()
+                                    except Exception:
+                                        pass
                                 self.send_response(302)
                                 self.send_header("Location", "/")
                                 self.end_headers()

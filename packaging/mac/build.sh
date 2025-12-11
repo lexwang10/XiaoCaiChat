@@ -24,8 +24,8 @@ done
 
 iconutil -c icns "$ICONSET" -o "$BUILD_DIR/xiaocaichat.icns"
 
-# Ensure PyInstaller is available
-python -m pip show pyinstaller >/dev/null 2>&1 || python -m pip install -U pyinstaller
+# Ensure PyInstaller and hooks are available and version-compatible
+python -m pip install -U --upgrade-strategy eager "pyinstaller>=6.17" "pyinstaller-hooks-contrib>=2025.10" >/dev/null 2>&1 || true
 
 # Build app
 ADD_DATA_ARGS=(--add-data "icons:icons" --add-data "themes:themes")
