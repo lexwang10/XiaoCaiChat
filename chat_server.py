@@ -66,14 +66,18 @@ class Hub:
         self.lock = threading.Lock()
         self.store = UnreadStore()
         self.avatars = {}
+        self.avatar_data = {}
 
     def add(self, conn: socket.socket, username: str, room: str):
         with self.lock:
             room_map = self.rooms.setdefault(room, {})
             room_map[conn] = username
             self.conn_info[conn] = (room, username)
-        self.broadcast_sys(room, f"[SYS] JOIN {room} {username}")
+        av = self.avatars.get(username) or ""
+        self.broadcast_sys(room, f"[SYS] JOIN {room} {username} {av}")
         self.broadcast_users(room)
+        with self.lock:
+            pass
 
     def remove(self, conn: socket.socket):
         room = None
@@ -139,6 +143,13 @@ class Hub:
     def set_avatar(self, room: str, username: str, filename: str):
         with self.lock:
             self.avatars[username] = filename
+        self.broadcast_sys(room, f"[SYS] AVATAR {room} {username} {filename}")
+        self.broadcast_users(room)
+
+    def set_avatar_data(self, room: str, username: str, filename: str, mime: str, b64: str):
+        with self.lock:
+            self.avatars[username] = filename
+            self.avatar_data[username] = (filename, mime, b64)
         self.broadcast_sys(room, f"[SYS] AVATAR {room} {username} {filename}")
         self.broadcast_users(room)
 
@@ -259,6 +270,20 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
             if len(parts) >= 3 and parts[1].upper() == "DM":
                 return ("DM", parts[2])
         return None
+    def parse_avatar_upload(line: str):
+        s = line.strip()
+        if s.startswith("AVATAR_UPLOAD "):
+            parts = s.split(" ", 3)
+            if len(parts) >= 4:
+                return (parts[1], parts[2], parts[3])
+        return None
+    def parse_avatar_req(line: str):
+        s = line.strip()
+        if s.startswith("AVATAR_REQ "):
+            parts = s.split()
+            if len(parts) >= 2:
+                return parts[1]
+        return None
     def parse_avatar(line: str):
         s = line.strip()
         if s.startswith("AVATAR "):
@@ -319,6 +344,8 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                 username = first[len("HELLO ") :].rstrip("\n") or addr[0]
             hub.add(conn, username, room)
             print(f"joined {username}@{addr[0]}:{addr[1]} room={room}")
+            if len(parts) >= 4 and parts[3]:
+                hub.set_avatar(room, username, parts[3])
         else:
             text = first.rstrip("\n")
             hub.add(conn, username, room)
@@ -360,12 +387,26 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                                     except Exception:
                                         pass
                         else:
-                            if parse_unread(body):
-                                for conv, cnt in hub._unread_all(username).items():
-                                    try:
-                                        conn.sendall(f"[SYS] UNREAD {conv} {cnt}\n".encode("utf-8"))
-                                    except Exception:
-                                        pass
+                            up = parse_avatar_upload(body)
+                            if up:
+                                fn, mime, b64 = up
+                                hub.set_avatar_data(room, username, fn, mime, b64)
+                            else:
+                                req_user = parse_avatar_req(body)
+                                if req_user:
+                                    d = hub.avatar_data.get(req_user)
+                                    if d:
+                                        fn, mime, b64 = d
+                                        try:
+                                            conn.sendall(f"[SYS] AVATAR_DATA {room} {req_user} {fn} {mime} {b64}\n".encode("utf-8"))
+                                        except Exception:
+                                            pass
+                                elif parse_unread(body):
+                                    for conv, cnt in hub._unread_all(username).items():
+                                        try:
+                                            conn.sendall(f"[SYS] UNREAD {conv} {cnt}\n".encode("utf-8"))
+                                        except Exception:
+                                            pass
                     else:
                         r = parse_read(body)
                         if r:
@@ -386,6 +427,8 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                                 else:
                                     if body.startswith("MSG "):
                                         hub.broadcast_text(room, conn, username, body[4:])
+                                    elif body.startswith("AVATAR_UPLOAD ") or body.startswith("AVATAR_REQ "):
+                                        pass
                                     else:
                                         hub.broadcast_text(room, conn, username, body)
                         if seq is not None and do_process:
@@ -436,34 +479,50 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                         except Exception:
                             pass
                     continue
-                if parse_unread(body):
-                    for conv, cnt in hub._unread_all(username).items():
-                        try:
-                            conn.sendall(f"[SYS] UNREAD {conv} {cnt}\n".encode("utf-8"))
-                        except Exception:
-                            pass
+                up = parse_avatar_upload(body)
+                if up:
+                    fn, mime, b64 = up
+                    hub.set_avatar_data(room, username, fn, mime, b64)
                 else:
-                    r = parse_read(body)
-                    if r:
-                        kind, p = r
-                        if kind == "GROUP":
-                            hub._unread_reset(username, conv_group(room))
-                        else:
-                            hub._unread_reset(username, conv_dm(username, p))
+                    req_user = parse_avatar_req(body)
+                    if req_user:
+                        d = hub.avatar_data.get(req_user)
+                        if d:
+                            fn, mime, b64 = d
+                            try:
+                                conn.sendall(f"[SYS] AVATAR_DATA {room} {req_user} {fn} {mime} {b64}\n".encode("utf-8"))
+                            except Exception:
+                                pass
+                    elif parse_unread(body):
+                        for conv, cnt in hub._unread_all(username).items():
+                            try:
+                                conn.sendall(f"[SYS] UNREAD {conv} {cnt}\n".encode("utf-8"))
+                            except Exception:
+                                pass
                     else:
-                        av = parse_avatar(body)
-                        if av:
-                            hub.set_avatar(room, username, av)
-                        else:
-                            dm = parse_dm(body)
-                            if dm:
-                                target, payload = dm
-                                hub.send_dm(room, conn, username, target, payload)
+                        r = parse_read(body)
+                        if r:
+                            kind, p = r
+                            if kind == "GROUP":
+                                hub._unread_reset(username, conv_group(room))
                             else:
-                                if body.startswith("MSG "):
-                                    hub.broadcast_text(room, conn, username, body[4:])
+                                hub._unread_reset(username, conv_dm(username, p))
+                        else:
+                            av = parse_avatar(body)
+                            if av:
+                                hub.set_avatar(room, username, av)
+                            else:
+                                dm = parse_dm(body)
+                                if dm:
+                                    target, payload = dm
+                                    hub.send_dm(room, conn, username, target, payload)
                                 else:
-                                    hub.broadcast_text(room, conn, username, body)
+                                    if body.startswith("MSG "):
+                                        hub.broadcast_text(room, conn, username, body[4:])
+                                    elif body.startswith("AVATAR_UPLOAD ") or body.startswith("AVATAR_REQ "):
+                                        pass
+                                    else:
+                                        hub.broadcast_text(room, conn, username, body)
                 if seq is not None:
                     try:
                         conn.sendall((f"[ACK] {seq}\n").encode("utf-8"))
@@ -545,6 +604,8 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                     else:
                         if body.startswith("MSG "):
                             hub.broadcast_text(room, conn, username, body[4:])
+                        elif body.startswith("AVATAR_UPLOAD ") or body.startswith("AVATAR_REQ "):
+                            pass
                         else:
                             hub.broadcast_text(room, conn, username, body)
             if seq is not None:

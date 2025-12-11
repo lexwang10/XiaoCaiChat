@@ -449,7 +449,11 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             return QtCore.QSize(option.rect.width(), h)
         if kind == "file":
             fm = option.fontMetrics
-            maxw = int(option.rect.width() * 0.5)
+            try:
+                vw = option.rect.width() if option.rect.width() > 0 else (option.widget.viewport().width() if option.widget else 0)
+            except Exception:
+                vw = option.rect.width()
+            maxw = int(vw * 0.5)
             mime = (index.data(ChatModel.MimeRole) or "").lower()
             pix = index.data(ChatModel.PixmapRole)
             if mime.startswith("image/") and isinstance(pix, QtGui.QPixmap):
@@ -468,7 +472,11 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             h = max(h, avatar_block)
             return QtCore.QSize(option.rect.width(), h)
         fm = option.fontMetrics
-        maxw = int(option.rect.width() * 0.65)
+        try:
+            vw = option.rect.width() if option.rect.width() > 0 else (option.widget.viewport().width() if option.widget else 0)
+        except Exception:
+            vw = option.rect.width()
+        maxw = int(vw * 0.65)
         doc = QtGui.QTextDocument()
         opt = QtGui.QTextOption()
         opt.setWrapMode(QtGui.QTextOption.WordWrap)
@@ -1006,6 +1014,15 @@ class ChatSplitter(QtWidgets.QSplitter):
         except Exception:
             pass
 
+class ChatListView(QtWidgets.QListView):
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        try:
+            super().resizeEvent(event)
+            # Recalculate item geometries when viewport width changes
+            self.doItemsLayout()
+            self.viewport().update()
+        except Exception:
+            pass
 class ChatWindow(QtWidgets.QWidget):
     def __init__(self, host: str, port: int, username: str, log_dir: str, room: str, avatar_path: Optional[str] = None):
         super().__init__()
@@ -1030,6 +1047,8 @@ class ChatWindow(QtWidgets.QWidget):
                 self.avatar_filename = None
         self.peer_avatars = {}
         self.pending_dm = set()
+        self.pending_dm_users = set()
+        self.pending_join_users = set()
         self.online_users = set()
         self.conv_avatar_labels = {}
         try:
@@ -1042,7 +1061,7 @@ class ChatWindow(QtWidgets.QWidget):
             self.status_icon_offline = QtGui.QPixmap()
 
         self.setWindowTitle("XiaoCaiChat")
-        self.view = QtWidgets.QListView()
+        self.view = ChatListView()
         self.view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.view.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectItems)
@@ -1117,6 +1136,10 @@ class ChatWindow(QtWidgets.QWidget):
         self.msg_item = SidebarItem(msg_icon_path, "消息")
         self.msg_item.clicked.connect(self.on_sidebar_message)
         self.msg_badge = self.msg_item.badge
+        team_icon_path = os.path.join(os.getcwd(), "icons", "ui", "team.png")
+        self.group_item = SidebarItem(team_icon_path, "群聊")
+        self.group_item.clicked.connect(self.on_sidebar_group)
+        self.group_badge = self.group_item.badge
         setting_icon_path = os.path.join(os.getcwd(), "icons", "ui", "setting.png")
         self.setting_item = SidebarItem(setting_icon_path, "设置")
         self.setting_item.clicked.connect(self.on_sidebar_setting)
@@ -1128,6 +1151,7 @@ class ChatWindow(QtWidgets.QWidget):
             pass
         sb.addWidget(self.user_label, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
         sb.addWidget(self.msg_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
+        sb.addWidget(self.group_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
         sb.addWidget(self.setting_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
         sb.addStretch(1)
         self.sidebar.setLayout(sb)
@@ -1336,6 +1360,7 @@ class ChatWindow(QtWidgets.QWidget):
         self._bootstrap_local()
         self._last_find_text = ""
         self._last_find_row = -1
+        self.view_mode = "message"
 
     def _show_find_bar(self):
         try:
@@ -1422,7 +1447,8 @@ class ChatWindow(QtWidgets.QWidget):
             return False
         self.sock = s
         try:
-            hello = f"HELLO {self.username} {self.room}\n".encode("utf-8")
+            extra = (self.avatar_filename or "").strip() if isinstance(self.avatar_filename, str) else ""
+            hello = f"HELLO {self.username} {self.room} {extra}\n".encode("utf-8")
             self.sock.sendall(hello)
         except Exception:
             pass
@@ -1442,7 +1468,6 @@ class ChatWindow(QtWidgets.QWidget):
         self.hb.setInterval(30000)
         self.hb.timeout.connect(self._send_ping)
         self.hb.start()
-        return True
         jwt_sec = os.environ.get("JWT_SECRET")
         if jwt_sec:
             try:
@@ -1468,13 +1493,21 @@ class ChatWindow(QtWidgets.QWidget):
         # 不自动请求未读，避免清空本地后服务端推送历史
         if self.avatar_filename:
             try:
-                self._send_seq(f"AVATAR {self.avatar_filename}")
+                path = os.path.join(os.getcwd(), "icons", "user", self.avatar_filename)
+                if os.path.isfile(path):
+                    mime = self._guess_mime(path)
+                    with open(path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("ascii")
+                    self._send_seq(f"AVATAR_UPLOAD {self.avatar_filename} {mime} {b64}")
+                else:
+                    self._send_seq(f"AVATAR {self.avatar_filename}")
             except Exception:
                 pass
         try:
             _save_profile(log_dir, self.username, self.avatar_filename)
         except Exception:
             pass
+        return True
 
     def on_received(self, text: str):
         self.logger.write("recv", self.host, text)
@@ -1489,12 +1522,24 @@ class ChatWindow(QtWidgets.QWidget):
                 room = parts[2]
                 user = parts[3]
                 if room == self.room:
-                    m = self.conv_models.get(f"group:{self.room}")
-                    if m:
-                        m.add("sys", "", f"系统: {user} 加入 {room}", False, None)
-                    self.store.add(f"group:{self.room}", "", f"系统: {user} 加入 {room}", "sys", False)
                     if user != self.username:
-                        self._add_conv_dm(user)
+                        if len(parts) >= 5 and parts[4]:
+                            try:
+                                self._set_peer_avatar(user, parts[4])
+                            except Exception:
+                                pass
+                            try:
+                                if user not in self.peer_avatars:
+                                    self._send_seq(f"AVATAR_REQ {user}")
+                            except Exception:
+                                pass
+                        try:
+                            if self.view_mode == "message":
+                                self._add_conv_dm(user)
+                            else:
+                                self.pending_join_users.add(user)
+                        except Exception:
+                            pass
                         self._set_online(user, True)
                     self.view.scrollToBottom()
                 return
@@ -1516,10 +1561,6 @@ class ChatWindow(QtWidgets.QWidget):
                 room = parts[2]
                 user = parts[3]
                 if room == self.room:
-                    m = self.conv_models.get(f"group:{self.room}")
-                    if m:
-                        m.add("sys", "", f"系统: {user} 离开 {room}", False, None)
-                    self.store.add(f"group:{self.room}", "", f"系统: {user} 离开 {room}", "sys", False)
                     if user != self.username:
                         self._set_online(user, False)
                     self.view.scrollToBottom()
@@ -1538,8 +1579,18 @@ class ChatWindow(QtWidgets.QWidget):
                         if uname != self.username:
                             if avatar:
                                 self._set_peer_avatar(uname, avatar)
-                            # 即使没有头像也先添加会话，后续收到头像再刷新
-                            self._add_conv_dm(uname)
+                            else:
+                                try:
+                                    self._try_local_peer_avatar(uname)
+                                except Exception:
+                                    pass
+                            try:
+                                if self.view_mode == "message":
+                                    self._add_conv_dm(uname)
+                                else:
+                                    self.pending_join_users.add(uname)
+                            except Exception:
+                                pass
                             self._set_online(uname, True)
                             current_peers.add(uname)
                     for key in list(self.conv_models.keys()):
@@ -1554,6 +1605,25 @@ class ChatWindow(QtWidgets.QWidget):
                 filename = parts[4]
                 if room == self.room and user != self.username:
                     self._set_peer_avatar(user, filename)
+                    try:
+                        if user not in self.peer_avatars:
+                            self._send_seq(f"AVATAR_REQ {user}")
+                    except Exception:
+                        pass
+                return
+            if len(parts) >= 6 and parts[1] == "AVATAR_DATA":
+                room = parts[2]
+                user = parts[3]
+                filename = parts[4]
+                mime = parts[5]
+                b64 = " ".join(parts[6:]) if len(parts) > 6 else ""
+                if room == self.room and user != self.username and filename and b64:
+                    p = self._save_peer_avatar_file(filename, b64)
+                    if p:
+                        try:
+                            self._set_peer_avatar(user, filename)
+                        except Exception:
+                            pass
                 return
             if len(parts) >= 6 and parts[1] == "HISTORY":
                 kind = parts[2]
@@ -1604,7 +1674,15 @@ class ChatWindow(QtWidgets.QWidget):
                 else:
                     x, y = conv[len("dm:"):].split("&", 1)
                     key = f"dm:{y}" if x == self.username else f"dm:{x}"
-                    self._add_conv_dm(key.split(":",1)[1])
+                    try:
+                        name = key.split(":",1)[1]
+                        if self.view_mode == "message":
+                            self._add_conv_dm(name)
+                            self._apply_conv_filter()
+                        else:
+                            self.pending_dm_users.add(name)
+                    except Exception:
+                        pass
                 self._set_unread(key, cnt)
                 return
         if text.startswith("[DM] "):
@@ -1643,7 +1721,14 @@ class ChatWindow(QtWidgets.QWidget):
                         self.conv_models[f"dm:{name}"].add("msg", name, msg_clean, False, av)
                         self.store.add(f"dm:{name}", name, msg_clean, "msg", False)
                 self.view.scrollToBottom()
-                self._add_conv_dm(name)
+                try:
+                    if self.view_mode == "message":
+                        self._add_conv_dm(name)
+                        self._apply_conv_filter()
+                    else:
+                        self.pending_dm_users.add(name)
+                except Exception:
+                    pass
                 
                 # Check if app is inactive/minimized, force increment unread even if current_conv matches
                 is_inactive = not self.isActiveWindow() or self.isMinimized() or QtWidgets.QApplication.instance().applicationState() != QtCore.Qt.ApplicationActive
@@ -1692,9 +1777,16 @@ class ChatWindow(QtWidgets.QWidget):
                         self._ensure_conv(f"dm:{target}")
                         self.conv_models[f"dm:{target}"].add("msg", self.username, msg_clean, True, self.avatar_pixmap)
                         self.store.add(f"dm:{target}", self.username, msg_clean, "msg", True)
-                self.view.scrollToBottom()
-                self._add_conv_dm(target)
-                return
+                        self.view.scrollToBottom()
+                        try:
+                            if self.view_mode == "message":
+                                self._add_conv_dm(target)
+                                self._apply_conv_filter()
+                            else:
+                                self.pending_dm_users.add(target)
+                        except Exception:
+                            pass
+                    return
         if ">" in text:
             name, msg = text.split(">", 1)
             name = name.strip()
@@ -1952,10 +2044,19 @@ class ChatWindow(QtWidgets.QWidget):
             hl.addWidget(badge_lbl)
             w.setLayout(hl)
             self.conv_list.setItemWidget(it, w)
-            self.conv_badges[f"dm:{name}"] = badge_lbl
-            self.conv_avatar_labels[f"dm:{name}"] = avatar_lbl
+        self.conv_badges[f"dm:{name}"] = badge_lbl
+        self.conv_avatar_labels[f"dm:{name}"] = avatar_lbl
         self._ensure_unread_key(f"dm:{name}")
         self._ensure_conv(f"dm:{name}")
+        try:
+            self._apply_conv_filter()
+        except Exception:
+            pass
+        try:
+            self._update_conv_title(f"dm:{name}")
+            self._update_sidebar_badge()
+        except Exception:
+            pass
 
     def _remove_conv_dm(self, name: str):
         for i in range(self.conv_list.count()):
@@ -2035,15 +2136,76 @@ class ChatWindow(QtWidgets.QWidget):
                     else:
                         b.setVisible(False)
                 break
+        try:
+            self._apply_conv_filter()
+        except Exception:
+            pass
     def _update_sidebar_badge(self):
         try:
-            total = sum(v for k,v in self.conv_unread.items() if k.startswith("dm:"))
-            if total > 0:
-                self.msg_badge.setText(str(total))
+            total_dm = sum(v for k,v in self.conv_unread.items() if k.startswith("dm:"))
+            group_cnt = self.conv_unread.get(f"group:{self.room}", 0)
+            if total_dm > 0:
+                self.msg_badge.setText(str(total_dm))
                 self.msg_badge.setVisible(True)
             else:
                 self.msg_badge.setVisible(False)
-            self._update_dock_badge(total)
+            if group_cnt > 0:
+                self.group_badge.setText(str(group_cnt))
+                self.group_badge.setVisible(True)
+            else:
+                self.group_badge.setVisible(False)
+            self._update_dock_badge(total_dm + group_cnt)
+        except Exception:
+            pass
+    def _apply_conv_filter(self):
+        try:
+            title = f"群聊:{self.room}"
+            items_log = []
+            for i in range(self.conv_list.count()):
+                base = self.conv_list.item(i).text().split(" (",1)[0]
+                if self.view_mode == "group":
+                    hide = (base != title)
+                    self.conv_list.setItemHidden(self.conv_list.item(i), hide)
+                    items_log.append(f"{i}:{base}:{'hide' if hide else 'show'}")
+                else:
+                    hide = base.startswith("群聊:")
+                    self.conv_list.setItemHidden(self.conv_list.item(i), hide)
+                    items_log.append(f"{i}:{base}:{'hide' if hide else 'show'}")
+            try:
+                pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _rebuild_conv_list(self):
+        try:
+            self.conv_list.clear()
+            self.conv_badges = {}
+            try:
+                self.conv_avatar_labels = {}
+            except Exception:
+                pass
+            title = f"群聊:{self.room}"
+            if self.view_mode == "group":
+                self._ensure_group_item()
+                for i in range(self.conv_list.count()):
+                    base = self.conv_list.item(i).text().split(" (",1)[0]
+                    if base == title:
+                        self.conv_list.setCurrentRow(i)
+                        break
+            else:
+                names = sorted([k.split(":",1)[1] for k in self.conv_unread.keys() if k.startswith("dm:")])
+                for name in names:
+                    self._add_conv_dm(name)
+                if self.current_conv and self.current_conv.startswith("dm:"):
+                    sel = self.current_conv.split(":",1)[1]
+                    for i in range(self.conv_list.count()):
+                        base = self.conv_list.item(i).text().split(" (",1)[0]
+                        if base == sel:
+                            self.conv_list.setCurrentRow(i)
+                            break
+            self._apply_conv_filter()
         except Exception:
             pass
 
@@ -2058,6 +2220,43 @@ class ChatWindow(QtWidgets.QWidget):
                 dock_tile.setBadgeLabel_(None)
         except Exception:
             pass
+    def _try_local_peer_avatar(self, name: str) -> bool:
+        try:
+            icon_dir = os.path.join(os.getcwd(), "icons", "user")
+            for ext in (".png", ".jpg", ".jpeg"):
+                p = os.path.join(icon_dir, f"{name}{ext}")
+                if os.path.isfile(p):
+                    pm = QtGui.QPixmap(p)
+                    if not pm.isNull():
+                        self.peer_avatars[name] = pm
+                        self._refresh_conv_icon(name)
+                        try:
+                            for m in self.conv_models.values():
+                                m.set_sender_avatar(name, pm)
+                        except Exception:
+                            pass
+                        return True
+            try:
+                profiles = _load_profiles(self.logger.log_dir)
+                afn = profiles.get(name)
+                if afn:
+                    p = os.path.join(icon_dir, afn)
+                    if os.path.isfile(p):
+                        pm = QtGui.QPixmap(p)
+                        if not pm.isNull():
+                            self.peer_avatars[name] = pm
+                            self._refresh_conv_icon(name)
+                            try:
+                                for m in self.conv_models.values():
+                                    m.set_sender_avatar(name, pm)
+                            except Exception:
+                                pass
+                            return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return False
 
     def _send_macos_notification(self, title: str, text: str):
         if not Cocoa:
@@ -2122,16 +2321,35 @@ class ChatWindow(QtWidgets.QWidget):
     def _set_peer_avatar(self, name: str, filename: str):
         try:
             path = os.path.join(os.getcwd(), "icons", "user", filename)
+            pm = None
             if os.path.exists(path):
-                self.peer_avatars[name] = QtGui.QPixmap(path)
+                pm = QtGui.QPixmap(path)
+            else:
+                alt = os.path.join(self.logger.log_dir, "avatars", filename)
+                if os.path.exists(alt):
+                    pm = QtGui.QPixmap(alt)
+            if pm and not pm.isNull():
+                self.peer_avatars[name] = pm
                 self._refresh_conv_icon(name)
                 try:
                     for m in self.conv_models.values():
-                        m.set_sender_avatar(name, self.peer_avatars[name])
+                        m.set_sender_avatar(name, pm)
                 except Exception:
                     pass
         except Exception:
             pass
+
+    def _save_peer_avatar_file(self, filename: str, b64: str) -> Optional[str]:
+        try:
+            d = os.path.join(self.logger.log_dir, "avatars")
+            os.makedirs(d, exist_ok=True)
+            p = os.path.join(d, filename)
+            data = base64.b64decode(b64)
+            with open(p, "wb") as f:
+                f.write(data)
+            return p
+        except Exception:
+            return None
 
     def _set_online(self, name: str, online: bool):
         if online:
@@ -2394,6 +2612,11 @@ class ChatWindow(QtWidgets.QWidget):
         for p in peers:
             self._add_conv_dm(p)
             self._set_online(p, False)
+            try:
+                if p != self.username:
+                    self._try_local_peer_avatar(p)
+            except Exception:
+                pass
         # preload group conv
         self._ensure_conv(f"group:{self.room}")
         missing = 0
@@ -2464,14 +2687,31 @@ class ChatWindow(QtWidgets.QWidget):
     def on_sidebar_message(self):
         try:
             self.msg_item.setSelected(True)
+            try:
+                self.group_item.setSelected(False)
+            except Exception:
+                pass
             self.setting_item.setSelected(False)
             self.conv_list.setVisible(True)
             self.right_stack.setCurrentIndex(0)
-            if self.current_conv:
-                self.chat_stack.setCurrentIndex(1)
-            else:
-                self.chat_stack.setCurrentIndex(0)
+            self.view_mode = "message"
+            try:
+                self._rebuild_conv_list()
+            except Exception:
+                pass
+            self.current_conv = None
+            self.current_model = None
+            self.chat_stack.setCurrentIndex(0)
             self.conv_list.setFocus()
+            try:
+                for name in list(self.pending_join_users | self.pending_dm_users):
+                    if name and name != self.username:
+                        self._add_conv_dm(name)
+                self.pending_join_users.clear()
+                self.pending_dm_users.clear()
+                self._apply_conv_filter()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -2479,8 +2719,86 @@ class ChatWindow(QtWidgets.QWidget):
         try:
             self.setting_item.setSelected(True)
             self.msg_item.setSelected(False)
+            try:
+                self.group_item.setSelected(False)
+            except Exception:
+                pass
             self.conv_list.setVisible(False)
             self.right_stack.setCurrentIndex(1)
+        except Exception:
+            pass
+
+    def _ensure_group_item(self):
+        title = f"群聊:{self.room}"
+        exists = False
+        for i in range(self.conv_list.count()):
+            if self.conv_list.item(i).text().split(" (",1)[0] == title:
+                exists = True
+                break
+        if not exists:
+            it = QtWidgets.QListWidgetItem(title)
+            it.setSizeHint(QtCore.QSize(200, 44))
+            try:
+                it.setIcon(QtGui.QIcon())
+            except Exception:
+                pass
+            self.conv_list.insertItem(0, it)
+            # custom widget with badge on the right
+            w = QtWidgets.QWidget()
+            hl = QtWidgets.QHBoxLayout()
+            try:
+                hl.setContentsMargins(12, 6, 12, 6)
+                hl.setSpacing(8)
+            except Exception:
+                pass
+            icon_lbl = QtWidgets.QLabel()
+            icon_lbl.setFixedSize(24, 24)
+            try:
+                pm = QtGui.QIcon(os.path.join(os.getcwd(), "icons", "user", "group.png")).pixmap(24, 24)
+                icon_lbl.setPixmap(pm)
+            except Exception:
+                pass
+            name_lbl = QtWidgets.QLabel(title)
+            badge_lbl = QtWidgets.QLabel()
+            badge_lbl.setVisible(False)
+            try:
+                badge_lbl.setStyleSheet("QLabel{background:#F44336;color:#fff;border-radius:8px;padding:0 6px;font:11px 'Helvetica Neue';}")
+            except Exception:
+                pass
+            hl.addWidget(icon_lbl)
+            hl.addWidget(name_lbl, 1)
+            hl.addWidget(badge_lbl)
+            w.setLayout(hl)
+            self.conv_list.setItemWidget(it, w)
+            self.conv_badges[f"group:{self.room}"] = badge_lbl
+        self._ensure_unread_key(f"group:{self.room}")
+        try:
+            self._apply_conv_filter()
+        except Exception:
+            pass
+        try:
+            self._update_conv_title(f"group:{self.room}")
+        except Exception:
+            pass
+
+    def on_sidebar_group(self):
+        try:
+            self.group_item.setSelected(True)
+            self.msg_item.setSelected(False)
+            self.setting_item.setSelected(False)
+            self.conv_list.setVisible(True)
+            self.right_stack.setCurrentIndex(0)
+            self._ensure_group_item()
+            title = f"群聊:{self.room}"
+            self.view_mode = "group"
+            try:
+                self._rebuild_conv_list()
+            except Exception:
+                pass
+            self.current_conv = None
+            self.current_model = None
+            self.chat_stack.setCurrentIndex(0)
+            self.conv_list.setFocus()
         except Exception:
             pass
 
