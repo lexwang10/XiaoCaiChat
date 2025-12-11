@@ -1186,8 +1186,11 @@ class ChatWindow(QtWidgets.QWidget):
         layout.addWidget(self.sidebar, 0)
         self.side_divider = QtWidgets.QFrame()
         try:
+            self.side_divider.setObjectName("SideDivider")
             self.side_divider.setFrameShape(QtWidgets.QFrame.VLine)
-            self.side_divider.setFrameShadow(QtWidgets.QFrame.Sunken)
+            self.side_divider.setFrameShadow(QtWidgets.QFrame.Plain)
+            self.side_divider.setFixedWidth(1)
+            self.side_divider.setStyleSheet("QFrame#SideDivider{color:#d9d9d9;}")
         except Exception:
             pass
         layout.addWidget(self.side_divider, 0)
@@ -1535,12 +1538,17 @@ class ChatWindow(QtWidgets.QWidget):
                                 pass
                         try:
                             if self.view_mode == "message":
+                                self._set_online(user, True)
                                 self._add_conv_dm(user)
+                                try:
+                                    self._rebuild_conv_list()
+                                except Exception:
+                                    pass
                             else:
+                                self._set_online(user, True)
                                 self.pending_join_users.add(user)
                         except Exception:
                             pass
-                        self._set_online(user, True)
                     self.view.scrollToBottom()
                 return
             if len(parts) >= 2 and parts[1] == "DISCONNECT":
@@ -1586,12 +1594,17 @@ class ChatWindow(QtWidgets.QWidget):
                                     pass
                             try:
                                 if self.view_mode == "message":
+                                    self._set_online(uname, True)
                                     self._add_conv_dm(uname)
+                                    try:
+                                        self._rebuild_conv_list()
+                                    except Exception:
+                                        pass
                                 else:
+                                    self._set_online(uname, True)
                                     self.pending_join_users.add(uname)
                             except Exception:
                                 pass
-                            self._set_online(uname, True)
                             current_peers.add(uname)
                     for key in list(self.conv_models.keys()):
                         if key.startswith("dm:"):
@@ -2015,7 +2028,7 @@ class ChatWindow(QtWidgets.QWidget):
                 break
         if not exists:
             it = QtWidgets.QListWidgetItem(name)
-            it.setSizeHint(QtCore.QSize(200, 44))
+            it.setSizeHint(QtCore.QSize(200, 56))
             try:
                 it.setIcon(QtGui.QIcon())
             except Exception:
@@ -2030,9 +2043,13 @@ class ChatWindow(QtWidgets.QWidget):
             except Exception:
                 pass
             avatar_lbl = QtWidgets.QLabel()
-            avatar_lbl.setFixedSize(24, 24)
-            avatar_lbl.setPixmap(self._status_pixmap_for_name(name, 24))
+            avatar_lbl.setFixedSize(28, 28)
+            avatar_lbl.setPixmap(self._status_pixmap_for_name(name, 28))
             name_lbl = QtWidgets.QLabel(name)
+            try:
+                name_lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';}")
+            except Exception:
+                pass
             badge_lbl = QtWidgets.QLabel()
             badge_lbl.setVisible(False)
             try:
@@ -2195,7 +2212,10 @@ class ChatWindow(QtWidgets.QWidget):
                         self.conv_list.setCurrentRow(i)
                         break
             else:
-                names = sorted([k.split(":",1)[1] for k in self.conv_unread.keys() if k.startswith("dm:")])
+                names_set = set([k.split(":",1)[1] for k in self.conv_unread.keys() if k.startswith("dm:")])
+                def _sort_key(n: str):
+                    return (0 if n in self.online_users else 1, n.lower())
+                names = sorted(list(names_set), key=_sort_key)
                 for name in names:
                     self._add_conv_dm(name)
                 if self.current_conv and self.current_conv.startswith("dm:"):
@@ -2709,7 +2729,7 @@ class ChatWindow(QtWidgets.QWidget):
                         self._add_conv_dm(name)
                 self.pending_join_users.clear()
                 self.pending_dm_users.clear()
-                self._apply_conv_filter()
+                self._rebuild_conv_list()
             except Exception:
                 pass
         except Exception:
@@ -2737,7 +2757,7 @@ class ChatWindow(QtWidgets.QWidget):
                 break
         if not exists:
             it = QtWidgets.QListWidgetItem(title)
-            it.setSizeHint(QtCore.QSize(200, 44))
+            it.setSizeHint(QtCore.QSize(200, 56))
             try:
                 it.setIcon(QtGui.QIcon())
             except Exception:
@@ -2752,13 +2772,17 @@ class ChatWindow(QtWidgets.QWidget):
             except Exception:
                 pass
             icon_lbl = QtWidgets.QLabel()
-            icon_lbl.setFixedSize(24, 24)
+            icon_lbl.setFixedSize(28, 28)
             try:
-                pm = QtGui.QIcon(os.path.join(os.getcwd(), "icons", "user", "group.png")).pixmap(24, 24)
+                pm = QtGui.QIcon(os.path.join(os.getcwd(), "icons", "user", "group.png")).pixmap(28, 28)
                 icon_lbl.setPixmap(pm)
             except Exception:
                 pass
             name_lbl = QtWidgets.QLabel(title)
+            try:
+                name_lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';}")
+            except Exception:
+                pass
             badge_lbl = QtWidgets.QLabel()
             badge_lbl.setVisible(False)
             try:
