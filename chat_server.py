@@ -193,10 +193,12 @@ class Hub:
                 c.sendall(payload_target)
             except Exception:
                 pass
-        try:
-            origin.sendall(payload_origin)
-        except Exception:
-            pass
+        # Reduce backpressure: do not echo giant payloads back to origin
+        if not (text.startswith("FILE_CHUNK ") or text.startswith("[FILE] ")):
+            try:
+                origin.sendall(payload_origin)
+            except Exception:
+                pass
         save_message(conv_dm(origin_user, target_user), origin_user, text)
         self.store.inc(target_user, conv_dm(origin_user, target_user))
 
@@ -255,6 +257,10 @@ def conv_dm(a: str, b: str):
 
 def save_message(conv: str, sender: str, text: str):
     try:
+        if text.startswith("FILE_CHUNK "):
+            return
+        if len(text) >= 262144:
+            return
         ts = int(time.time())
         db.execute("INSERT INTO messages (conv, sender, ts, text) VALUES (?,?,?,?)", (conv, sender, ts, text))
         db.commit()
