@@ -1346,7 +1346,7 @@ class FileChunkSender(QtCore.QThread):
 class MultiConnFileUploader(QtCore.QObject):
     progress = QtCore.Signal(int, int)
     finished = QtCore.Signal(bool, str)
-    def __init__(self, host: str, port: int, username: str, room_or_rid: str, mode: str, target: Optional[str], path: str, conn_count: int = 3, chunk_size: int = 2097152, extra: Optional[str] = ""):
+    def __init__(self, host: str, port: int, username: str, room_or_rid: str, mode: str, target: Optional[str], path: str, conn_count: int = 3, chunk_size: int = 2097152, extra: Optional[str] = "", override_name: Optional[str] = None):
         super().__init__()
         self.host = host
         self.port = port
@@ -1358,6 +1358,7 @@ class MultiConnFileUploader(QtCore.QObject):
         self.conn_count = max(1, int(conn_count))
         self.chunk_size = int(max(65536, chunk_size))
         self.extra = extra or ""
+        self._override_name = override_name
         self._paused = [False]
         self._canceled = [False]
         self._total = 0
@@ -1435,7 +1436,7 @@ class MultiConnFileUploader(QtCore.QObject):
                 s = self._open_socket()
                 if s:
                     self._socks.append(s)
-            name = os.path.basename(self.path)
+            name = self._override_name or os.path.basename(self.path)
             mime = "application/octet-stream"
             try:
                 ext = os.path.splitext(name)[1].lower()
@@ -1552,6 +1553,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.upload_workers = {}
         self._fade_timers = {}
         self._rx_files = {}
+        self._finalizing_files = set()
         try:
             app = QtWidgets.QApplication.instance()
             if app:
@@ -2732,18 +2734,29 @@ class ChatWindow(QtWidgets.QWidget):
                     if self._is_deleted(f"dm:{name}", "file", fn, mime):
                         return
                     pix = self._pix_from_b64(mime, b64)
-                    if mime and mime.lower().startswith("image/"):
-                        self._save_attachment(fn, b64, f"dm:{name}")
-                    else:
-                        self._save_attachment_async(fn, b64, f"dm:{name}")
-                    self._ensure_conv(f"dm:{name}")
-                    av = self.peer_avatars.get(name)
                     try:
-                        sz = len(base64.b64decode(b64))
+                        self._ensure_conv(f"dm:{name}")
+                        m = self.conv_models.get(f"dm:{name}")
+                        exists = False
+                        if m:
+                            for it in m.items:
+                                if it.get("kind") == "file" and it.get("filename") == fn and it.get("sender") == name:
+                                    exists = True
+                                    break
+                        if not exists:
+                            if mime and mime.lower().startswith("image/"):
+                                self._save_attachment(fn, b64, f"dm:{name}")
+                            else:
+                                self._save_attachment_async(fn, b64, f"dm:{name}")
+                            av = self.peer_avatars.get(name)
+                            try:
+                                sz = len(base64.b64decode(b64))
+                            except Exception:
+                                sz = None
+                            self.conv_models[f"dm:{name}"].add_file(name, fn, mime, pix, False, av, None, sz)
+                            self.store.add(f"dm:{name}", name, f"[FILE] {fn} {mime}", "file", False)
                     except Exception:
-                        sz = None
-                    self.conv_models[f"dm:{name}"].add_file(name, fn, mime, pix, False, av, None, sz)
-                    self.store.add(f"dm:{name}", name, f"[FILE] {fn} {mime}", "file", False)
+                        pass
                 elif msg.startswith("FILE_BEGIN "):
                     toks = msg.split(" ")
                     if len(toks) >= 4:
@@ -2898,18 +2911,29 @@ class ChatWindow(QtWidgets.QWidget):
                 if self._is_deleted(rid_key, "file", fn, mime):
                     return
                 pix = self._pix_from_b64(mime, b64)
-                if mime and mime.lower().startswith("image/"):
-                    self._save_attachment(fn, b64, rid_key)
-                else:
-                    self._save_attachment_async(fn, b64, rid_key)
-                self._ensure_conv(rid_key)
-                av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
                 try:
-                    sz = len(base64.b64decode(b64))
+                    self._ensure_conv(rid_key)
+                    m = self.conv_models.get(rid_key)
+                    exists = False
+                    if m:
+                        for it in m.items:
+                            if it.get("kind") == "file" and it.get("filename") == fn and it.get("sender") == name:
+                                exists = True
+                                break
+                    if not exists:
+                        if mime and mime.lower().startswith("image/"):
+                            self._save_attachment(fn, b64, rid_key)
+                        else:
+                            self._save_attachment_async(fn, b64, rid_key)
+                        av = self.avatar_pixmap if name == self.username else self.peer_avatars.get(name)
+                        try:
+                            sz = len(base64.b64decode(b64))
+                        except Exception:
+                            sz = None
+                        self.conv_models[rid_key].add_file(name, fn, mime, pix, name == self.username, av, None, sz)
+                        self.store.add(rid_key, name, f"[FILE] {fn} {mime}", "file", name == self.username)
                 except Exception:
-                    sz = None
-                self.conv_models[rid_key].add_file(name, fn, mime, pix, name == self.username, av, None, sz)
-                self.store.add(rid_key, name, f"[FILE] {fn} {mime}", "file", name == self.username)
+                    pass
             elif msg.startswith("FILE_BEGIN "):
                 toks = msg.split(" ")
                 if len(toks) >= 4:
@@ -3030,11 +3054,12 @@ class ChatWindow(QtWidgets.QWidget):
             mime = self.pending_image_mime or "application/octet-stream"
             size_bytes = len(self.pending_image_bytes) if self.pending_image_bytes is not None else 0
             is_image = bool(mime and mime.lower().startswith("image/"))
+            uniq_name = self._ensure_unique_filename(self.current_conv, self.username, name)
             if (not is_image) and size_bytes >= (2 * 1024 * 1024):
                 try:
                     att_dir = self._attachment_dir(self.current_conv)
                     os.makedirs(att_dir, exist_ok=True)
-                    temp_path = os.path.join(att_dir, name)
+                    temp_path = os.path.join(att_dir, uniq_name)
                     with open(temp_path, "wb") as f:
                         f.write(self.pending_image_bytes)
                     self._ensure_conv(self.current_conv)
@@ -3043,10 +3068,10 @@ class ChatWindow(QtWidgets.QWidget):
                         sz = os.path.getsize(temp_path)
                     except Exception:
                         sz = size_bytes
-                    self.conv_models[self.current_conv].add_file(self.username, name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
-                    self.store.add(self.current_conv, self.username, f"[FILE] {name} {mime}", "file", True)
+                    self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
+                    self.store.add(self.current_conv, self.username, f"[FILE] {uniq_name} {mime}", "file", True)
                     try:
-                        placeholder = f"[文件: {name}]"
+                        placeholder = f"[文件: {uniq_name}]"
                         if placeholder in text:
                             text = text.replace(placeholder, "").strip()
                         size_str = self._human_readable_size(size_bytes)
@@ -3055,13 +3080,13 @@ class ChatWindow(QtWidgets.QWidget):
                         text = "\n".join(lines).strip()
                     except Exception:
                         pass
-                    self._start_async_upload(temp_path)
+                    self._start_async_upload(temp_path, uniq_name)
                 except Exception:
                     pass
             else:
                 b64 = base64.b64encode(self.pending_image_bytes).decode("ascii")
                 # If text contains the placeholder, remove it so we don't send duplicate text
-                placeholder = f"[文件: {name}]"
+                placeholder = f"[文件: {uniq_name}]"
                 if placeholder in text:
                     text = text.replace(placeholder, "").strip()
                 # Also strip file-chip plaintext (name + size) that comes from HTML chip
@@ -3072,7 +3097,7 @@ class ChatWindow(QtWidgets.QWidget):
                     text = "\n".join(lines).strip()
                 except Exception:
                     pass
-                payload_text = f"[FILE] {name} {mime} {b64}"
+                payload_text = f"[FILE] {uniq_name} {mime} {b64}"
                 if self.current_conv.startswith("dm:"):
                     target = self.current_conv.split(":",1)[1]
                     self._send_seq(f"DM {target} {payload_text}")
@@ -3084,9 +3109,9 @@ class ChatWindow(QtWidgets.QWidget):
                 self.logger.write("sent", self.username, payload_text)
                 self._ensure_conv(self.current_conv)
                 _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
-                self.conv_models[self.current_conv].add_file(self.username, name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
+                self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
                 try:
-                    self._save_attachment(name, b64, self.current_conv)
+                    self._save_attachment(uniq_name, b64, self.current_conv)
                 except Exception:
                     pass
             
@@ -3130,7 +3155,8 @@ class ChatWindow(QtWidgets.QWidget):
                 b64 = base64.b64encode(self.pending_image_bytes).decode("ascii")
                 name = self.pending_image_name or ("paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png")
                 mime = self.pending_image_mime or "image/png"
-                payload_text = f"[FILE] {name} {mime} {b64}"
+                uniq_name = self._ensure_unique_filename(self.current_conv, self.username, name)
+                payload_text = f"[FILE] {uniq_name} {mime} {b64}"
                 if self.current_conv.startswith("dm:"):
                     target = self.current_conv.split(":",1)[1]
                     self._send_seq(f"DM {target} {payload_text}")
@@ -3142,9 +3168,9 @@ class ChatWindow(QtWidgets.QWidget):
                 self.logger.write("sent", self.username, payload_text)
                 self._ensure_conv(self.current_conv)
                 _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
-                self.conv_models[self.current_conv].add_file(self.username, name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
+                self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
                 try:
-                    self._save_attachment(name, b64, self.current_conv)
+                    self._save_attachment(uniq_name, b64, self.current_conv)
                 except Exception:
                     pass
                 self.pending_image_bytes = None
@@ -4065,23 +4091,23 @@ class ChatWindow(QtWidgets.QWidget):
                     pass
         except Exception:
             pass
-    def _start_async_upload(self, path: str):
+    def _start_async_upload(self, path: str, override_name: Optional[str] = None):
         try:
             if not path or not os.path.isfile(path):
                 return
-            name = os.path.basename(path)
+            name = override_name or os.path.basename(path)
             mime = self._guess_mime(path)
             rid = None
             uploader = None
             if self.current_conv and self.current_conv.startswith("dm:"):
                 target = self.current_conv.split(":",1)[1]
-                uploader = MultiConnFileUploader(self.host, self.port, self.username, self.room, "dm", target, path, 2, 1048576, (self.avatar_filename or ""))
+                uploader = MultiConnFileUploader(self.host, self.port, self.username, self.room, "dm", target, path, 2, 1048576, (self.avatar_filename or ""), name)
             elif self.current_conv and self.current_conv.startswith("group:"):
                 rid = self.current_conv.split(":",1)[1]
-                uploader = MultiConnFileUploader(self.host, self.port, self.username, rid, "group", None, path, 2, 1048576, (self.avatar_filename or ""))
+                uploader = MultiConnFileUploader(self.host, self.port, self.username, rid, "group", None, path, 2, 1048576, (self.avatar_filename or ""), name)
             else:
                 rid = self.room
-                uploader = MultiConnFileUploader(self.host, self.port, self.username, rid, "group", None, path, 2, 1048576, (self.avatar_filename or ""))
+                uploader = MultiConnFileUploader(self.host, self.port, self.username, rid, "group", None, path, 2, 1048576, (self.avatar_filename or ""), name)
             total = 0
             try:
                 total = os.path.getsize(path)
@@ -4227,6 +4253,27 @@ class ChatWindow(QtWidgets.QWidget):
             except Exception:
                 return None
         return None
+    def _ensure_unique_filename(self, conv_key: Optional[str], sender: str, name: str) -> str:
+        try:
+            base, ext = os.path.splitext(name)
+            att_dir = self._attachment_dir(conv_key)
+            m = self.conv_models.get(conv_key) if conv_key else None
+            i = 2
+            candidate = name
+            while True:
+                exists_in_model = False
+                if m:
+                    for it in m.items:
+                        if it.get("kind") == "file" and it.get("sender") == sender and it.get("filename") == candidate:
+                            exists_in_model = True
+                            break
+                exists_on_disk = os.path.isfile(os.path.join(att_dir, candidate))
+                if not exists_in_model and not exists_on_disk:
+                    return candidate
+                candidate = f"{base} ({i}){ext}"
+                i += 1
+        except Exception:
+            return name
 
     def on_sidebar_message(self):
         try:
@@ -4650,6 +4697,12 @@ class ChatWindow(QtWidgets.QWidget):
                 self.payload = payload
             def run(self):
                 try:
+                    key = (self.conv_key, self.sender, self.filename)
+                    try:
+                        if (hasattr(self.owner, "_finalizing_files") and key in self.owner._finalizing_files) or (hasattr(self.owner, "_rx_files") and key not in self.owner._rx_files):
+                            return
+                    except Exception:
+                        pass
                     data = base64.b64decode(self.payload)
                     with open(self.path, "r+b") as f:
                         f.seek(self.off)
@@ -4669,27 +4722,7 @@ class ChatWindow(QtWidgets.QWidget):
                     except Exception:
                         pass
                 except FileNotFoundError:
-                    try:
-                        data = base64.b64decode(self.payload)
-                        with open(self.path, "wb") as f:
-                            f.seek(self.off)
-                            f.write(data)
-                        try:
-                            print(f"[RecvChunkWriteNew] part={self.path} off={self.off} wrote={len(data)}")
-                        except Exception:
-                            pass
-                        try:
-                            if self.total > 0:
-                                try:
-                                    sz = os.path.getsize(self.path)
-                                except Exception:
-                                    sz = 0
-                                if sz >= self.total:
-                                    self.owner._rx_file_end(self.conv_key, self.sender, self.filename)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
+                    return
                 except Exception:
                     pass
         try:
@@ -4764,55 +4797,123 @@ class ChatWindow(QtWidgets.QWidget):
         d = self._rx_files.get(key)
         if not d:
             return
+        if key in getattr(self, "_finalizing_files", set()):
+            return
+        try:
+            self._finalizing_files.add(key)
+        except Exception:
+            pass
         att_dir = self._attachment_dir(conv_key)
         dst = os.path.join(att_dir, filename)
-        try:
-            m = self.conv_models.get(conv_key)
-            if m:
-                for it in m.items:
-                    if it.get("kind") == "file" and it.get("filename") == filename and it.get("sender") == sender:
-                        return
-        except Exception:
-            pass
-        try:
-            if os.path.isfile(d["part"]):
-                try:
-                    if os.path.isfile(dst):
-                        os.remove(dst)
-                except Exception:
-                    pass
-                shutil.move(d["part"], dst)
-        except Exception:
-            pass
-        try:
-            if hasattr(self, "logger") and self.logger:
-                sz = 0
-                try:
-                    sz = os.path.getsize(dst)
-                except Exception:
+        def _do_update_and_cleanup():
+            try:
+                if hasattr(self, "logger") and self.logger:
                     sz = 0
-                self.logger.write("recv", sender, f"RX_END conv={conv_key} name={filename} dst={dst} size={sz}")
-        except Exception:
-            pass
-        try:
-            mime = d.get("mime") or ""
-            pix = QtGui.QPixmap(dst) if mime.startswith("image/") else None
-            self._ensure_conv(conv_key)
-            av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
-            is_self = (sender == self.username)
-            try:
-                sz = os.path.getsize(dst)
-            except Exception:
-                sz = None
-            self.conv_models[conv_key].add_file(sender, filename, mime, pix if pix and not pix.isNull() else None, is_self, av, None, sz)
-            self.store.add(conv_key, sender, f"[FILE] {filename} {mime}", "file", is_self)
-            try:
-                if hasattr(self, "view") and self.view:
-                    self.view.scrollToBottom()
+                    try:
+                        sz = os.path.getsize(dst)
+                    except Exception:
+                        sz = 0
+                    self.logger.write("recv", sender, f"RX_END conv={conv_key} name={filename} dst={dst} size={sz}")
             except Exception:
                 pass
-        except Exception:
-            pass
+            # Update existing bubble if present; else add new bubble
+            try:
+                mime = d.get("mime") or ""
+                pix = QtGui.QPixmap(dst) if mime.startswith("image/") else None
+                self._ensure_conv(conv_key)
+                m = self.conv_models.get(conv_key)
+                av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                is_self = (sender == self.username)
+                final_size = None
+                try:
+                    final_size = os.path.getsize(dst)
+                except Exception:
+                    final_size = None
+                found_row = -1
+                if m:
+                    for i, it in enumerate(m.items):
+                        if it.get("kind") == "file" and it.get("filename") == filename and it.get("sender") == sender:
+                            found_row = i
+                            break
+                if m and found_row >= 0:
+                    try:
+                        it = m.items[found_row]
+                        it["filesize"] = final_size
+                        if pix and not pix.isNull():
+                            it["pixmap"] = pix
+                        top = m.index(found_row)
+                        bottom = m.index(found_row)
+                        m.dataChanged.emit(top, bottom)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        m.add_file(sender, filename, mime, pix if pix and not pix.isNull() else None, is_self, av, None, final_size)
+                        self.store.add(conv_key, sender, f"[FILE] {filename} {mime}", "file", is_self)
+                    except Exception:
+                        pass
+                try:
+                    if hasattr(self, "view") and self.view:
+                        self.view.scrollToBottom()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                if key in self._finalizing_files:
+                    self._finalizing_files.remove(key)
+            except Exception:
+                pass
+        def _attempt_finalize():
+            partp = d.get("part")
+            total = int(d.get("total") or 0)
+            try:
+                cur = os.path.getsize(partp) if partp and os.path.isfile(partp) else 0
+            except Exception:
+                cur = 0
+            if partp and os.path.isfile(partp) and (total <= 0 or cur >= total):
+                try:
+                    if os.path.isfile(dst):
+                        try:
+                            os.remove(dst)
+                        except Exception:
+                            pass
+                    shutil.move(partp, dst)
+                except Exception:
+                    return False
+                _do_update_and_cleanup()
+                return True
+            return False
+        if not _attempt_finalize():
+            try:
+                max_tries = 40  # ~6s with 150ms interval
+                tries = [0]
+                def _tick():
+                    if _attempt_finalize():
+                        return
+                    tries[0] += 1
+                    if tries[0] < max_tries:
+                        QtCore.QTimer.singleShot(150, _tick)
+                    else:
+                        # force finalize by moving if exists even if size not reached
+                        partp = d.get("part")
+                        if partp and os.path.isfile(partp):
+                            try:
+                                if os.path.isfile(dst):
+                                    try:
+                                        os.remove(dst)
+                                    except Exception:
+                                        pass
+                                shutil.move(partp, dst)
+                            except Exception:
+                                pass
+                        _do_update_and_cleanup()
+                QtCore.QTimer.singleShot(150, _tick)
+            except Exception:
+                try:
+                    _do_update_and_cleanup()
+                except Exception:
+                    pass
         try:
             if key in self._rx_files:
                 del self._rx_files[key]
