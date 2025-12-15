@@ -2704,6 +2704,15 @@ class ChatWindow(QtWidgets.QWidget):
                             att_dir = self._attachment_dir(f"dm:{name}")
                             part = os.path.join(att_dir, fn + ".part")
                             try:
+                                k = (f"dm:{name}", name, fn)
+                                if os.path.isfile(part) and k not in self._rx_files:
+                                    try:
+                                        os.remove(part)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            try:
                                 written = os.path.getsize(part) if os.path.isfile(part) else 0
                             except Exception:
                                 written = 0
@@ -2822,6 +2831,33 @@ class ChatWindow(QtWidgets.QWidget):
                             except Exception:
                                 pass
                         return
+                elif msg.startswith("FILE_CANCEL "):
+                    toks = msg.split(" ", 1)
+                    fn = toks[1] if len(toks) >= 2 else ""
+                    try:
+                        att_dir = self._attachment_dir(f"dm:{name}")
+                        part = os.path.join(att_dir, fn + ".part")
+                        if os.path.isfile(part):
+                            try:
+                                os.remove(part)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    try:
+                        k = (f"dm:{name}", name, fn)
+                        if k in self._rx_files:
+                            del self._rx_files[k]
+                    except Exception:
+                        pass
+                    return
+                    try:
+                        k = (f"dm:{name}", name, fn)
+                        if k in self._rx_files:
+                            del self._rx_files[k]
+                    except Exception:
+                        pass
+                    return
                 elif msg.startswith("file://"):
                     local_path = QtCore.QUrl(msg).toLocalFile()
                     try:
@@ -2934,6 +2970,31 @@ class ChatWindow(QtWidgets.QWidget):
                         self.store.add(rid_key, name, f"[FILE] {fn} {mime}", "file", name == self.username)
                 except Exception:
                     pass
+            elif msg.startswith("FILE_META "):
+                toks = msg.split(" ")
+                if len(toks) >= 5:
+                    try:
+                        md5 = toks[-1]
+                        tot = int(toks[-2])
+                    except Exception:
+                        md5 = ""
+                        try:
+                            tot = int(toks[-2]) if len(toks) >= 2 else 0
+                        except Exception:
+                            tot = 0
+                    mime = toks[-3] if len(toks) >= 3 else "application/octet-stream"
+                    fn = " ".join(toks[1:-3]) if len(toks) > 4 else (toks[1] if len(toks) > 1 else "")
+                    try:
+                        att_dir = self._attachment_dir(rid_key)
+                        part = os.path.join(att_dir, fn + ".part")
+                        k = (rid_key, name, fn)
+                        if os.path.isfile(part) and k not in self._rx_files:
+                            try:
+                                os.remove(part)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
             elif msg.startswith("FILE_BEGIN "):
                 toks = msg.split(" ")
                 if len(toks) >= 4:
@@ -3000,6 +3061,26 @@ class ChatWindow(QtWidgets.QWidget):
                         except Exception:
                             pass
                     return
+            elif msg.startswith("FILE_CANCEL "):
+                toks = msg.split(" ", 1)
+                fn = toks[1] if len(toks) >= 2 else ""
+                try:
+                    att_dir = self._attachment_dir(rid_key)
+                    part = os.path.join(att_dir, fn + ".part")
+                    if os.path.isfile(part):
+                        try:
+                            os.remove(part)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    k = (rid_key, name, fn)
+                    if k in self._rx_files:
+                        del self._rx_files[k]
+                except Exception:
+                    pass
+                return
             elif msg.startswith("file://"):
                 local_path = QtCore.QUrl(msg).toLocalFile()
                 try:
@@ -3868,7 +3949,47 @@ class ChatWindow(QtWidgets.QWidget):
                 act_cancel = menu.addAction("取消发送")
                 def _cancel():
                     try:
+                        # cancel worker
                         w.cancel()
+                        # hide pie instantly
+                        try:
+                            self.current_model.set_upload_progress(row, None, None, "canceled")
+                            self.current_model.set_upload_alpha(row, 0)
+                            key2 = (key, row)
+                            t2 = self._fade_timers.get(key2)
+                            if t2:
+                                try:
+                                    t2.stop()
+                                    t2.deleteLater()
+                                except Exception:
+                                    pass
+                                try:
+                                    del self._fade_timers[key2]
+                                except Exception:
+                                    pass
+                            if hasattr(self, "view") and self.view:
+                                self.view.viewport().update()
+                        except Exception:
+                            pass
+                        # remove worker mapping to avoid further UI updates
+                        try:
+                            if (key, row) in self.upload_workers:
+                                del self.upload_workers[(key, row)]
+                        except Exception:
+                            pass
+                        # notify peer to cleanup .part
+                        try:
+                            fname = index.data(ChatModel.FileNameRole) or ""
+                            if self.current_conv and self.current_conv.startswith("dm:"):
+                                target = self.current_conv.split(":",1)[1]
+                                if fname:
+                                    self._send_seq(f"DM {target} FILE_CANCEL {fname}")
+                            else:
+                                rid = (self.current_conv.split(":",1)[1] if self.current_conv and self.current_conv.startswith("group:") else self.room)
+                                if rid and fname:
+                                    self._send_seq(f"MSG FILE_CANCEL {fname}", rid)
+                        except Exception:
+                            pass
                     except Exception:
                         pass
                 act_cancel.triggered.connect(_cancel)
@@ -4134,6 +4255,8 @@ class ChatWindow(QtWidgets.QWidget):
                     if m and row >= 0:
                         cur_state = m.data(m.index(row), ChatModel.UploadStateRole)
                         cur_alpha = m.data(m.index(row), ChatModel.UploadAlphaRole) or 0
+                        if str(cur_state) == "canceled":
+                            return
                         if int(max(0, sent)) < int(max(0, tot)):
                             m.set_upload_progress(row, sent, tot, "uploading")
                         else:
@@ -4184,9 +4307,11 @@ class ChatWindow(QtWidgets.QWidget):
                     if not ok:
                         m2 = self.conv_models.get(conv_key)
                         if m2:
-                            m2.add("sys", "", "文件发送失败", False, None)
-                        if err == "已取消":
-                            self._restart_room_socket(rid)
+                            try:
+                                msg = "已取消文件发送" if err == "已取消" else "文件发送失败"
+                                m2.add("sys", "", msg, False, None)
+                            except Exception:
+                                pass
                         if (conv_key, row) in self.upload_workers:
                             try:
                                 del self.upload_workers[(conv_key, row)]
@@ -4222,6 +4347,40 @@ class ChatWindow(QtWidgets.QWidget):
                     worker.cancel()
                     if m and row >= 0:
                         m.set_upload_progress(row, None, None, "canceled")
+                        try:
+                            m.set_upload_alpha(row, 0)
+                        except Exception:
+                            pass
+                        try:
+                            key2 = (conv_key, row)
+                            t2 = self._fade_timers.get(key2)
+                            if t2:
+                                try:
+                                    t2.stop()
+                                    t2.deleteLater()
+                                except Exception:
+                                    pass
+                                try:
+                                    del self._fade_timers[key2]
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(self, "view") and self.view:
+                                self.view.viewport().update()
+                        except Exception:
+                            pass
+                    try:
+                        if self.current_conv and self.current_conv.startswith("dm:"):
+                            target = self.current_conv.split(":",1)[1]
+                            self._send_seq(f"DM {target} FILE_CANCEL {name}")
+                        else:
+                            rid = (self.current_conv.split(":",1)[1] if self.current_conv and self.current_conv.startswith("group:") else self.room)
+                            if rid:
+                                self._send_seq(f"MSG FILE_CANCEL {name}", rid)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             worker.progress.connect(_on_progress)
@@ -4681,6 +4840,27 @@ class ChatWindow(QtWidgets.QWidget):
         try:
             dst = os.path.join(att_dir, filename)
             shutil.copyfile(src_path, dst)
+        except Exception:
+            pass
+    def _delete_part_globally(self, filename: str):
+        try:
+            base = self._attachment_dir(None)
+            for entry in os.listdir(base):
+                partp = os.path.join(base, entry, filename + ".part")
+                if os.path.isfile(partp):
+                    try:
+                        os.remove(partp)
+                    except Exception:
+                        pass
+            try:
+                for k in list(self._rx_files.keys()):
+                    if k and len(k) >= 3 and k[2] == filename:
+                        try:
+                            del self._rx_files[k]
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         except Exception:
             pass
     def _rx_write_chunk_async(self, conv_key: str, sender: str, filename: str, part_path: str, total: int, offset: int, b64: str):
