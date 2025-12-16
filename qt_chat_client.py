@@ -113,6 +113,7 @@ class ChatModel(QtCore.QAbstractListModel):
     UploadSentRole = QtCore.Qt.UserRole + 11
     UploadStateRole = QtCore.Qt.UserRole + 12
     UploadAlphaRole = QtCore.Qt.UserRole + 13
+    LinkUrlRole = QtCore.Qt.UserRole + 14
 
     def __init__(self):
         super().__init__()
@@ -152,6 +153,8 @@ class ChatModel(QtCore.QAbstractListModel):
             return item.get("upload_state")
         if role == ChatModel.UploadAlphaRole:
             return item.get("upload_alpha")
+        if role == ChatModel.LinkUrlRole:
+            return item.get("link_url")
         return None
 
     def add(self, kind: str, sender: str, text: str, is_self: bool, avatar: Optional[QtGui.QPixmap] = None, ts: Optional[int] = None):
@@ -165,7 +168,13 @@ class ChatModel(QtCore.QAbstractListModel):
         now = QtCore.QDateTime.fromSecsSinceEpoch(int(ts)) if ts is not None else QtCore.QDateTime.currentDateTime()
         self._maybe_time_separator(now)
         self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
-        self.items.append({"kind": "file", "sender": sender, "text": filename, "self": is_self, "time": now, "pixmap": pixmap, "filename": filename, "mime": mime, "avatar": avatar, "filesize": (int(size_bytes) if size_bytes is not None else None), "upload_sent": None, "upload_state": None, "upload_alpha": None})
+        self.items.append({"kind": "file", "sender": sender, "text": filename, "self": is_self, "time": now, "pixmap": pixmap, "filename": filename, "mime": mime, "avatar": avatar, "filesize": (int(size_bytes) if size_bytes is not None else None), "upload_sent": None, "upload_state": None, "upload_alpha": None, "link_url": None})
+        self.endInsertRows()
+    def add_link(self, sender: str, filename: str, url: str, is_self: bool, avatar: Optional[QtGui.QPixmap] = None, ts: Optional[int] = None, size_bytes: Optional[int] = None):
+        now = QtCore.QDateTime.fromSecsSinceEpoch(int(ts)) if ts is not None else QtCore.QDateTime.currentDateTime()
+        self._maybe_time_separator(now)
+        self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
+        self.items.append({"kind": "file", "sender": sender, "text": filename, "self": is_self, "time": now, "pixmap": None, "filename": filename, "mime": "application/x-download", "avatar": avatar, "filesize": (int(size_bytes) if size_bytes is not None else None), "upload_sent": None, "upload_state": None, "upload_alpha": None, "link_url": url})
         self.endInsertRows()
     def set_upload_progress(self, row: int, sent: Optional[int] = None, total: Optional[int] = None, state: Optional[str] = None):
         if 0 <= row < len(self.items):
@@ -2288,6 +2297,37 @@ class ChatWindow(QtWidgets.QWidget):
                             pass
                     self.view.scrollToBottom()
                 return
+            if len(parts) >= 7 and parts[1] == "FILE_LINK":
+                room = parts[2]
+                sender = parts[3]
+                url = parts[-1]
+                try:
+                    size = int(parts[-2])
+                except Exception:
+                    size = 0
+                filename = " ".join(parts[4:-2]) if len(parts) > 6 else ""
+                try:
+                    if sender == self.username:
+                        return
+                    key = f"group:{room}"
+                    self._ensure_conv(key)
+                    av = self.peer_avatars.get(sender)
+                    self.conv_models[key].add_link(sender, filename, url, False, av, None, size)
+                    try:
+                        self.store.add(key, sender, f"[LINK] {filename} {size} {url}", "file", False)
+                    except Exception:
+                        pass
+                    is_inactive = not self.isActiveWindow() or self.isMinimized() or QtWidgets.QApplication.instance().applicationState() != QtCore.Qt.ApplicationActive
+                    if self.current_conv != key or is_inactive:
+                        self._inc_unread(key)
+                    if self.current_conv == key:
+                        try:
+                            self.view.scrollToBottom()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                return
             if len(parts) >= 2 and parts[1] == "DISCONNECT":
                 try:
                     m = self.conv_models.get(self.current_conv) if self.current_conv else None
@@ -2617,7 +2657,7 @@ class ChatWindow(QtWidgets.QWidget):
                     note_text = self._sanitize_text(msg)
                     if msg.startswith("[FILE] ") or msg.startswith("file://"):
                         note_text = "[图片]"
-                    self._send_macos_notification(f"{name} (群聊)", note_text)
+                        self._send_macos_notification(f"{name} (群聊)", note_text)
                 except Exception:
                     pass
 
@@ -2661,6 +2701,38 @@ class ChatWindow(QtWidgets.QWidget):
                     self.view.scrollToBottom()
                 except Exception:
                     pass
+                return
+            if len(parts) >= 7 and parts[1] == "FILE_LINK":
+                room = parts[2]
+                sender = parts[3]
+                url = parts[-1]
+                try:
+                    size = int(parts[-2])
+                except Exception:
+                    size = 0
+                filename = " ".join(parts[4:-2]) if len(parts) > 6 else ""
+                if room == rid:
+                    try:
+                        if sender == self.username:
+                            return
+                        key = f"group:{room}"
+                        self._ensure_conv(key)
+                        av = self.peer_avatars.get(sender)
+                        self.conv_models[key].add_link(sender, filename, url, False, av, None, size)
+                        try:
+                            self.store.add(key, sender, f"[LINK] {filename} {size} {url}", "file", False)
+                        except Exception:
+                            pass
+                        is_inactive = not self.isActiveWindow() or self.isMinimized() or QtWidgets.QApplication.instance().applicationState() != QtCore.Qt.ApplicationActive
+                        if self.current_conv != key or is_inactive:
+                            self._inc_unread(key)
+                        if self.current_conv == key:
+                            try:
+                                self.view.scrollToBottom()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 return
             if len(parts) >= 2 and parts[1] == "DISCONNECT":
                 try:
@@ -3424,7 +3496,7 @@ class ChatWindow(QtWidgets.QWidget):
             limit_bytes = int(getattr(self, "max_upload_bytes", 40 * 1024 * 1024))
             if int(max(0, size_bytes)) > limit_bytes:
                 try:
-                    QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 40MB（{self._human_readable_size(size_bytes)}），无法发送")
+                    QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 {self._human_readable_size(limit_bytes)}（{self._human_readable_size(size_bytes)}），无法发送")
                 except Exception:
                     pass
                 try:
@@ -3482,7 +3554,7 @@ class ChatWindow(QtWidgets.QWidget):
                         sz = size_bytes
                     if int(max(0, sz)) > int(limit_bytes):
                         try:
-                            QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 40MB（{self._human_readable_size(sz)}），无法发送")
+                            QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 {self._human_readable_size(limit_bytes)}（{self._human_readable_size(sz)}），无法发送")
                         except Exception:
                             pass
                         try:
@@ -3496,8 +3568,26 @@ class ChatWindow(QtWidgets.QWidget):
                         self.view.scrollToBottom()
                         self.entry.clear()
                         return
-                    self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
-                    self.store.add(self.current_conv, self.username, f"[FILE] {uniq_name} {mime}", "file", True)
+                    if self.current_conv.startswith("group:"):
+                        rid = self.current_conv.split(":",1)[1]
+                        self._ensure_conv(self.current_conv)
+                        self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
+                        self.store.add(self.current_conv, self.username, f"[FILE] {uniq_name} {mime}", "file", True)
+                        try:
+                            # 图片且小于2MB则直接走内嵌发送，否则上传服务器
+                            if mime.lower().startswith("image/") and int(max(0, sz or 0)) < (2 * 1024 * 1024):
+                                with open(temp_path, "rb") as f:
+                                    b64 = base64.b64encode(f.read()).decode("ascii")
+                                payload_text = f"[FILE] {uniq_name} {mime} {b64}"
+                                self._send_seq(f"MSG {payload_text}", rid)
+                                self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
+                            else:
+                                self._http_upload_group_file(temp_path, rid, uniq_name)
+                        except Exception:
+                            pass
+                    else:
+                        self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
+                        self.store.add(self.current_conv, self.username, f"[FILE] {uniq_name} {mime}", "file", True)
                     try:
                         placeholder = f"[文件: {uniq_name}]"
                         if placeholder in text:
@@ -3508,7 +3598,8 @@ class ChatWindow(QtWidgets.QWidget):
                         text = "\n".join(lines).strip()
                     except Exception:
                         pass
-                    self._start_async_upload(temp_path, uniq_name)
+                    if self.current_conv.startswith("dm:"):
+                        self._start_async_upload(temp_path, uniq_name)
                 except Exception:
                     pass
             else:
@@ -3530,18 +3621,47 @@ class ChatWindow(QtWidgets.QWidget):
                     target = self.current_conv.split(":",1)[1]
                     self._send_seq(f"DM {target} {payload_text}")
                     self.store.add(f"dm:{target}", self.username, payload_text, "file", True)
+                    self.logger.write("sent", self.username, payload_text)
+                    self._ensure_conv(self.current_conv)
+                    _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
+                    self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
+                    try:
+                        self._save_attachment(uniq_name, b64, self.current_conv)
+                    except Exception:
+                        pass
                 else:
                     rid = self.current_conv.split(":",1)[1]
-                    self._send_seq(f"MSG {payload_text}", rid)
-                    self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
-                self.logger.write("sent", self.username, payload_text)
-                self._ensure_conv(self.current_conv)
-                _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
-                self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
-                try:
-                    self._save_attachment(uniq_name, b64, self.current_conv)
-                except Exception:
-                    pass
+                    try:
+                        limit_inline = 2 * 1024 * 1024
+                        size_inline = len(self.pending_image_bytes) if self.pending_image_bytes is not None else 0
+                        if mime.lower().startswith("image/") and size_inline < limit_inline:
+                            self._send_seq(f"MSG {payload_text}", rid)
+                            self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
+                            self.logger.write("sent", self.username, payload_text)
+                            self._ensure_conv(self.current_conv)
+                            _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
+                            self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, _pix, True, self.avatar_pixmap, None, size_inline if size_inline else None)
+                            try:
+                                self._save_attachment(uniq_name, b64, self.current_conv)
+                            except Exception:
+                                pass
+                        else:
+                            att_dir = self._attachment_dir(self.current_conv)
+                            os.makedirs(att_dir, exist_ok=True)
+                            temp_path = os.path.join(att_dir, uniq_name)
+                            with open(temp_path, "wb") as f:
+                                f.write(self.pending_image_bytes)
+                            pix = QtGui.QPixmap(temp_path)
+                            try:
+                                sz = os.path.getsize(temp_path)
+                            except Exception:
+                                sz = len(self.pending_image_bytes) if self.pending_image_bytes is not None else None
+                            self._ensure_conv(self.current_conv)
+                            self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
+                            self.store.add(self.current_conv, self.username, f"[FILE] {uniq_name} {mime}", "file", True)
+                            self._http_upload_group_file(temp_path, rid, uniq_name)
+                    except Exception:
+                        pass
             
             self.pending_image_bytes = None
             self.pending_image_mime = None
@@ -3580,27 +3700,50 @@ class ChatWindow(QtWidgets.QWidget):
             
         try:
             if self.pending_image_bytes:
-                b64 = base64.b64encode(self.pending_image_bytes).decode("ascii")
                 name = self.pending_image_name or ("paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png")
                 mime = self.pending_image_mime or "image/png"
                 uniq_name = self._ensure_unique_filename(self.current_conv, self.username, name)
-                payload_text = f"[FILE] {uniq_name} {mime} {b64}"
                 if self.current_conv.startswith("dm:"):
+                    b64 = base64.b64encode(self.pending_image_bytes).decode("ascii")
+                    payload_text = f"[FILE] {uniq_name} {mime} {b64}"
                     target = self.current_conv.split(":",1)[1]
                     self._send_seq(f"DM {target} {payload_text}")
                     self.store.add(f"dm:{target}", self.username, payload_text, "file", True)
+                    self.logger.write("sent", self.username, payload_text)
+                    self._ensure_conv(self.current_conv)
+                    _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
+                    self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
+                    try:
+                        self._save_attachment(uniq_name, b64, self.current_conv)
+                    except Exception:
+                        pass
                 else:
                     rid = self.current_conv.split(":",1)[1]
-                    self._send_seq(f"MSG {payload_text}", rid)
-                    self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
-                self.logger.write("sent", self.username, payload_text)
-                self._ensure_conv(self.current_conv)
-                _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
-                self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, _pix, True, self.avatar_pixmap, None, len(self.pending_image_bytes) if self.pending_image_bytes is not None else None)
-                try:
-                    self._save_attachment(uniq_name, b64, self.current_conv)
-                except Exception:
-                    pass
+                    try:
+                        limit_inline = 2 * 1024 * 1024
+                        size_inline = len(self.pending_image_bytes) if self.pending_image_bytes is not None else 0
+                        b64 = base64.b64encode(self.pending_image_bytes).decode("ascii")
+                        payload_text = f"[FILE] {uniq_name} {mime} {b64}"
+                        if mime.lower().startswith("image/") and size_inline < limit_inline:
+                            self._send_seq(f"MSG {payload_text}", rid)
+                            self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
+                            self.logger.write("sent", self.username, payload_text)
+                            self._ensure_conv(self.current_conv)
+                            _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
+                            self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, _pix, True, self.avatar_pixmap, None, size_inline if size_inline else None)
+                            try:
+                                self._save_attachment(uniq_name, b64, self.current_conv)
+                            except Exception:
+                                pass
+                        else:
+                            att_dir = self._attachment_dir(self.current_conv)
+                            os.makedirs(att_dir, exist_ok=True)
+                            temp_path = os.path.join(att_dir, uniq_name)
+                            with open(temp_path, "wb") as f:
+                                f.write(self.pending_image_bytes)
+                            self._http_upload_group_file(temp_path, rid, uniq_name)
+                    except Exception:
+                        pass
                 self.pending_image_bytes = None
                 self.pending_image_mime = None
                 self.pending_image_name = None
@@ -3620,7 +3763,7 @@ class ChatWindow(QtWidgets.QWidget):
                         limit_bytes = int(getattr(self, "max_upload_bytes", 40 * 1024 * 1024))
                         if int(max(0, sz or 0)) > int(limit_bytes):
                             try:
-                                QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 40MB（{self._human_readable_size(sz or 0)}），无法发送")
+                                QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 {self._human_readable_size(limit_bytes)}（{self._human_readable_size(sz or 0)}），无法发送")
                             except Exception:
                                 pass
                             try:
@@ -3656,18 +3799,70 @@ class ChatWindow(QtWidgets.QWidget):
                                 self.logger.write("sent", self.username, wire_text)
                             self.entry.clear()
                             return
-                        pix = QtGui.QPixmap(url_path)
-                        self.conv_models[self.current_conv].add_file(self.username, name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
-                        self.store.add(self.current_conv, self.username, f"[FILE] {name} {mime}", "file", True)
-                        try:
-                            text = self._sanitize_text(text.replace(f"file://{url_path}", ""))
-                        except Exception:
-                            pass
-                        try:
-                            self._start_async_upload(url_path)
-                        except Exception:
-                            pass
-                        self.view.scrollToBottom()
+                        if self.current_conv.startswith("group:"):
+                            rid = self.current_conv.split(":",1)[1]
+                            try:
+                                att_dir = self._attachment_dir(self.current_conv)
+                                os.makedirs(att_dir, exist_ok=True)
+                                uniq_name = self._ensure_unique_filename(self.current_conv, self.username, name)
+                                dst = os.path.join(att_dir, uniq_name)
+                                try:
+                                    shutil.copy2(url_path, dst)
+                                except Exception:
+                                    with open(url_path, "rb") as sf, open(dst, "wb") as df:
+                                        df.write(sf.read())
+                                pix = QtGui.QPixmap(dst)
+                                try:
+                                    sz = os.path.getsize(dst)
+                                except Exception:
+                                    sz = os.path.getsize(url_path) if os.path.exists(url_path) else None
+                                self._ensure_conv(self.current_conv)
+                                self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
+                                self.store.add(self.current_conv, self.username, f"[FILE] {uniq_name} {mime}", "file", True)
+                                # 图片且小于2MB则直接走内嵌发送，否则上传服务器
+                                if mime.lower().startswith("image/") and int(max(0, sz or 0)) < (2 * 1024 * 1024):
+                                    try:
+                                        with open(dst, "rb") as f:
+                                            b64 = base64.b64encode(f.read()).decode("ascii")
+                                        payload_text = f"[FILE] {uniq_name} {mime} {b64}"
+                                        self._send_seq(f"MSG {payload_text}", rid)
+                                        self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
+                                    except Exception:
+                                        pass
+                                else:
+                                    self._http_upload_group_file(dst, rid, uniq_name)
+                            except Exception:
+                                pass
+                            try:
+                                text = self._sanitize_text(text.replace(f"file://{url_path}", ""))
+                            except Exception:
+                                pass
+                            if text:
+                                wire_text = text.replace("\n", "\\n")
+                                try:
+                                    self._send_seq(f"MSG {wire_text}", rid)
+                                    self.store.add(f"group:{rid}", self.username, text, "msg", True)
+                                    self._ensure_conv(self.current_conv)
+                                    self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                                    self.view.scrollToBottom()
+                                    self.logger.write("sent", self.username, wire_text)
+                                except Exception:
+                                    pass
+                            self.entry.clear()
+                            return
+                        else:
+                            pix = QtGui.QPixmap(url_path)
+                            self.conv_models[self.current_conv].add_file(self.username, name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
+                            self.store.add(self.current_conv, self.username, f"[FILE] {name} {mime}", "file", True)
+                            try:
+                                text = self._sanitize_text(text.replace(f"file://{url_path}", ""))
+                            except Exception:
+                                pass
+                            try:
+                                self._start_async_upload(url_path)
+                            except Exception:
+                                pass
+                            self.view.scrollToBottom()
                     except Exception:
                         pass
             if text:
@@ -3834,16 +4029,21 @@ class ChatWindow(QtWidgets.QWidget):
                 name = os.path.basename(path)
                 mime = self._guess_mime(path)
                 try:
-                    pix = QtGui.QPixmap(path)
-                    self._ensure_conv(self.current_conv)
-                    try:
-                        sz = os.path.getsize(path)
-                    except Exception:
-                        sz = None
-                    self.conv_models[self.current_conv].add_file(self.username, name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
-                    self.store.add(self.current_conv, self.username, f"[FILE] {name} {mime}", "file", True)
-                    self._start_async_upload(path)
-                    self.view.scrollToBottom()
+                    if self.current_conv and self.current_conv.startswith("group:"):
+                        rid = self.current_conv.split(":",1)[1]
+                        self._http_upload_group_file(path, rid, name)
+                        self.view.scrollToBottom()
+                    else:
+                        pix = QtGui.QPixmap(path)
+                        self._ensure_conv(self.current_conv)
+                        try:
+                            sz = os.path.getsize(path)
+                        except Exception:
+                            sz = None
+                        self.conv_models[self.current_conv].add_file(self.username, name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
+                        self.store.add(self.current_conv, self.username, f"[FILE] {name} {mime}", "file", True)
+                        self._start_async_upload(path)
+                        self.view.scrollToBottom()
                 except Exception:
                     pass
 
@@ -4199,6 +4399,19 @@ class ChatWindow(QtWidgets.QWidget):
             conv = key
             missing = 0
             for sender, ts, kind, text, selfflag in self.store.recent(conv, 100):
+                if text.startswith("[LINK] "):
+                    try:
+                        toks = text.split(" ")
+                        url = toks[-1] if len(toks) >= 2 else ""
+                        size = int(toks[-2]) if len(toks) >= 3 else 0
+                        filename = " ".join(toks[1:-2]) if len(toks) >= 3 else (toks[1] if len(toks) > 1 else "")
+                    except Exception:
+                        filename = ""
+                        url = ""
+                        size = 0
+                    av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                    self.current_model.add_link(sender, filename, url, bool(selfflag), av, int(ts) if ts else None, size)
+                    continue
                 if kind == "file" and text.startswith("[FILE] "):
                     fn, mime, _ = self._parse_file(text)
                     p = self._attachment_path(fn, conv)
@@ -4271,21 +4484,36 @@ class ChatWindow(QtWidgets.QWidget):
         if kind == "file":
             filename = index.data(ChatModel.FileNameRole)
             mime = index.data(ChatModel.MimeRole) or ""
+            link_url = index.data(ChatModel.LinkUrlRole) or ""
             act_open = menu.addAction("打开文件")
             def do_open_file():
-                path = self._attachment_path(filename, self.current_conv)
-                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
+                if link_url:
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl(str(link_url)))
+                else:
+                    path = self._attachment_path(filename, self.current_conv)
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(path))
             act_open.triggered.connect(do_open_file)
             
             act_save_as = menu.addAction("另存为...")
             def do_save_as():
                 try:
-                    src = self._attachment_path(filename, self.current_conv)
-                    if not os.path.isfile(src):
-                        return
-                    dst, _ = QtWidgets.QFileDialog.getSaveFileName(self, "另存为", filename)
-                    if dst:
-                        shutil.copy2(src, dst)
+                    if link_url:
+                        dst, _ = QtWidgets.QFileDialog.getSaveFileName(self, "另存为", filename or "")
+                        if dst:
+                            try:
+                                with urllib.request.urlopen(link_url, timeout=10.0) as resp:
+                                    data = resp.read()
+                                with open(dst, "wb") as f:
+                                    f.write(data)
+                            except Exception:
+                                QtWidgets.QMessageBox.warning(self, "下载失败", "无法下载该文件")
+                    else:
+                        src = self._attachment_path(filename, self.current_conv)
+                        if not os.path.isfile(src):
+                            return
+                        dst, _ = QtWidgets.QFileDialog.getSaveFileName(self, "另存为", filename)
+                        if dst:
+                            shutil.copy2(src, dst)
                 except Exception:
                     pass
             act_save_as.triggered.connect(do_save_as)
@@ -4401,8 +4629,12 @@ class ChatWindow(QtWidgets.QWidget):
         kind = index.data(ChatModel.KindRole)
         if kind == "file":
             filename = index.data(ChatModel.FileNameRole)
+            link_url = index.data(ChatModel.LinkUrlRole) or ""
             if filename:
-                QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_path(filename, self.current_conv)))
+                if link_url:
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl(str(link_url)))
+                else:
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_path(filename, self.current_conv)))
         elif kind == "msg":
             txt = index.data(ChatModel.TextRole) or ""
             self._open_text_viewer(txt)
@@ -4464,8 +4696,12 @@ class ChatWindow(QtWidgets.QWidget):
             QtWidgets.QApplication.clipboard().setText(text)
         elif kind == "file":
             fn = index.data(ChatModel.FileNameRole) or ""
-            path = self._attachment_path(fn, self.current_conv)
-            QtWidgets.QApplication.clipboard().setText(path if os.path.exists(path) else fn)
+            url = index.data(ChatModel.LinkUrlRole) or ""
+            if url:
+                QtWidgets.QApplication.clipboard().setText(str(url))
+            else:
+                path = self._attachment_path(fn, self.current_conv)
+                QtWidgets.QApplication.clipboard().setText(path if os.path.exists(path) else fn)
 
     def _bootstrap_local(self):
         peers = self.store.peers()
@@ -4481,6 +4717,19 @@ class ChatWindow(QtWidgets.QWidget):
         self._ensure_conv(f"group:{self.room}")
         missing = 0
         for sender, ts, kind, text, selfflag in self.store.recent(f"group:{self.room}", 100):
+            if text.startswith("[LINK] "):
+                try:
+                    toks = text.split(" ")
+                    url = toks[-1] if len(toks) >= 2 else ""
+                    size = int(toks[-2]) if len(toks) >= 3 else 0
+                    filename = " ".join(toks[1:-2]) if len(toks) >= 3 else (toks[1] if len(toks) > 1 else "")
+                except Exception:
+                    filename = ""
+                    url = ""
+                    size = 0
+                av = self.avatar_pixmap if sender == self.username else self.peer_avatars.get(sender)
+                self.conv_models[f"group:{self.room}"].add_link(sender, filename, url, bool(selfflag), av, int(ts) if ts else None, size)
+                continue
             if kind == "file" and text.startswith("[FILE] "):
                 fn, mime, _ = self._parse_file(text)
                 p = self._attachment_path(fn, f"group:{self.room}")
@@ -4607,7 +4856,7 @@ class ChatWindow(QtWidgets.QWidget):
                 sz0 = os.path.getsize(path)
                 if int(max(0, sz0)) > int(limit_bytes):
                     try:
-                        QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 40MB（{self._human_readable_size(sz0)}），无法发送")
+                        QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 {self._human_readable_size(limit_bytes)}（{self._human_readable_size(sz0)}），无法发送")
                     except Exception:
                         pass
                     return
@@ -4784,6 +5033,69 @@ class ChatWindow(QtWidgets.QWidget):
             worker.finished.connect(_on_finished)
             # controls via context menu actions
             worker.start()
+        except Exception:
+            pass
+    def _http_upload_group_file(self, path: str, rid: str, name: Optional[str] = None):
+        try:
+            url = f"http://{self.host}:34568/api/upload_file"
+            boundary = "----XiaoCaiBoundary" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch()))
+            parts = []
+            def _p(s: str):
+                return s.encode("utf-8")
+            parts.append(_p(f"--{boundary}\r\nContent-Disposition: form-data; name=\"room\"\r\n\r\n{rid}\r\n"))
+            parts.append(_p(f"--{boundary}\r\nContent-Disposition: form-data; name=\"sender\"\r\n\r\n{self.username}\r\n"))
+            fname = name or os.path.basename(path)
+            parts.append(_p(f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{fname}\"\r\nContent-Type: application/octet-stream\r\n\r\n"))
+            data = b""
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except Exception:
+                data = b""
+            parts.append(data)
+            parts.append(_p("\r\n"))
+            parts.append(_p(f"--{boundary}--\r\n"))
+            body = b"".join(parts)
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}", "Content-Length": str(len(body))}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=10.0) as resp:
+                    raw = resp.read()
+                    try:
+                        info = json.loads(raw.decode("utf-8"))
+                    except Exception:
+                        info = {}
+                    try:
+                        link_url = info.get("url") or ""
+                        fname2 = info.get("file_name") or fname
+                        fsize = int(info.get("size") or (len(data) if isinstance(data, (bytes, bytearray)) else 0))
+                    except Exception:
+                        link_url = ""
+                        fname2 = fname
+                        try:
+                            fsize = len(data) if isinstance(data, (bytes, bytearray)) else 0
+                        except Exception:
+                            fsize = 0
+                    if link_url:
+                        try:
+                            key = f"group:{rid}"
+                            self._ensure_conv(key)
+                            av = self.avatar_pixmap
+                            m = self.conv_models.get(key)
+                            if m:
+                                m.add_link(self.username, fname2, link_url, True, av, None, fsize)
+                            try:
+                                self.store.add(key, self.username, f"[LINK] {fname2} {fsize} {link_url}", "file", True)
+                            except Exception:
+                                pass
+                            try:
+                                if self.current_conv == key:
+                                    self.view.scrollToBottom()
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         except Exception:
             pass
 

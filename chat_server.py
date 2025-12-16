@@ -10,6 +10,9 @@ import hmac
 import hashlib
 import json
 import sys
+import uuid
+import cgi
+import io
 try:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 except Exception:
@@ -351,6 +354,11 @@ class Hub:
 _data_dir = os.path.expanduser("~/Library/Application Support/XiaoCaiChatServer")
 try:
     os.makedirs(_data_dir, exist_ok=True)
+except Exception:
+    pass
+FILES_DIR = os.path.join(_data_dir, "files")
+try:
+    os.makedirs(FILES_DIR, exist_ok=True)
 except Exception:
     pass
 DB_PATH = os.path.join(_data_dir, "chat_history.db")
@@ -825,6 +833,61 @@ def start_server(host: str, port: int):
                     def do_GET(self):
                         try:
                             p = self.path.split("?", 1)[0]
+                            if p.startswith("/files/"):
+                                fid = None
+                                try:
+                                    fid = p.split("/", 2)[2]
+                                except Exception:
+                                    fid = None
+                                if not fid:
+                                    try:
+                                        print(f"[HTTP] GET /files - missing fid path={self.path}")
+                                    except Exception:
+                                        pass
+                                    self.send_response(404)
+                                    self.end_headers()
+                                    return
+                                fname = None
+                                fpath = None
+                                try:
+                                    for entry in os.listdir(FILES_DIR):
+                                        if entry.startswith(str(fid) + "__"):
+                                            fname = entry.split("__", 1)[1]
+                                            fpath = os.path.join(FILES_DIR, entry)
+                                            break
+                                except Exception:
+                                    fname = None
+                                    fpath = None
+                                if not (fname and fpath and os.path.isfile(fpath)):
+                                    try:
+                                        print(f"[HTTP] GET /files - not found fid={fid}")
+                                    except Exception:
+                                        pass
+                                    self.send_response(404)
+                                    self.end_headers()
+                                    return
+                                try:
+                                    with open(fpath, "rb") as f:
+                                        data = f.read()
+                                except Exception:
+                                    data = b""
+                                try:
+                                    print(f"[HTTP] GET /files - serve fid={fid} name={fname} size={len(data)}")
+                                except Exception:
+                                    pass
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/octet-stream")
+                                self.send_header("Content-Length", str(len(data)))
+                                try:
+                                    self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                                except Exception:
+                                    pass
+                                self.end_headers()
+                                try:
+                                    self.wfile.write(data)
+                                except Exception:
+                                    pass
+                                return
                             if p == "/api/status":
                                 rooms = list(hub.rooms.keys())
                                 data = {"rooms": [{"id": r, "name": hub.room_names.get(r, r), "users": hub.users(r)} for r in rooms]}
@@ -903,6 +966,165 @@ def start_server(host: str, port: int):
                     def do_POST(self):
                         try:
                             p = self.path
+                            if p == "/api/upload_file":
+                                # read raw body first to allow robust parsing
+                                try:
+                                    n = int(self.headers.get("Content-Length") or "0")
+                                except Exception:
+                                    n = 0
+                                try:
+                                    raw = self.rfile.read(n) if n > 0 else b""
+                                except Exception:
+                                    raw = b""
+                                # primary: cgi.FieldStorage over buffered body
+                                try:
+                                    form = cgi.FieldStorage(
+                                        fp=io.BytesIO(raw),
+                                        headers=self.headers,
+                                        environ={
+                                            'REQUEST_METHOD': 'POST',
+                                            'CONTENT_TYPE': self.headers.get('Content-Type') or '',
+                                            'CONTENT_LENGTH': str(len(raw)),
+                                        }
+                                    )
+                                except Exception:
+                                    form = None
+                                try:
+                                    print(f"[HTTP] POST /api/upload_file - ct={self.headers.get('Content-Type')} cl={self.headers.get('Content-Length')}")
+                                except Exception:
+                                    pass
+                                room = ""
+                                sender = ""
+                                filename = ""
+                                payload = b""
+                                try:
+                                    room = form.getvalue("room") or ""
+                                except Exception:
+                                    room = ""
+                                try:
+                                    sender = form.getvalue("sender") or ""
+                                except Exception:
+                                    sender = ""
+                                try:
+                                    fileitem = form["file"] if form and "file" in form else None
+                                except Exception:
+                                    fileitem = None
+                                try:
+                                    filename = (fileitem.filename if fileitem and getattr(fileitem, "filename", None) else "") or "file"
+                                except Exception:
+                                    filename = "file"
+                                try:
+                                    payload = (fileitem.file.read() if fileitem and hasattr(fileitem, "file") else b"")
+                                except Exception:
+                                    payload = b""
+                                try:
+                                    print(f"[HTTP] POST /api/upload_file - room={room} sender={sender} filename={filename} payload_len={len(payload)}")
+                                except Exception:
+                                    pass
+                                # fallback: manual multipart parse when payload missing
+                                try:
+                                    ct = self.headers.get("Content-Type") or ""
+                                    if (not payload or filename == "file") and ct.startswith("multipart/form-data;"):
+                                        bmark = "boundary="
+                                        bpos = ct.find(bmark)
+                                        boundary = ct[bpos+len(bmark):].strip() if bpos >= 0 else ""
+                                        if boundary:
+                                            def _parse_multipart(data: bytes, boundary_str: str):
+                                                out = {}
+                                                sep = ("--" + boundary_str).encode("utf-8")
+                                                parts = data.split(sep)
+                                                for part in parts:
+                                                    part = part.strip(b"\r\n")
+                                                    if not part or part == b"--":
+                                                        continue
+                                                    try:
+                                                        head, body = part.split(b"\r\n\r\n", 1)
+                                                    except Exception:
+                                                        continue
+                                                    headers = head.decode("utf-8", errors="ignore").split("\r\n")
+                                                    disp = ""
+                                                    for h in headers:
+                                                        if h.lower().startswith("content-disposition:"):
+                                                            disp = h
+                                                            break
+                                                    name = None
+                                                    fname = None
+                                                    if disp:
+                                                        # parse name="..." and filename="..."
+                                                        try:
+                                                            for token in disp.split(";"):
+                                                                token = token.strip()
+                                                                if token.startswith("name="):
+                                                                    v = token.split("=",1)[1].strip().strip("\"")
+                                                                    name = v
+                                                                elif token.startswith("filename="):
+                                                                    v = token.split("=",1)[1].strip().strip("\"")
+                                                                    fname = v
+                                                        except Exception:
+                                                            pass
+                                                    # body may end with \r\n before next boundary
+                                                    data_bytes = body.rstrip(b"\r\n")
+                                                    if name:
+                                                        out[name] = {"filename": fname, "data": data_bytes}
+                                                return out
+                                            parsed = _parse_multipart(raw, boundary)
+                                            try:
+                                                room = (room or "").strip() or (parsed.get("room", {}).get("data") or b"").decode("utf-8", errors="ignore")
+                                            except Exception:
+                                                pass
+                                            try:
+                                                sender = (sender or "").strip() or (parsed.get("sender", {}).get("data") or b"").decode("utf-8", errors="ignore")
+                                            except Exception:
+                                                pass
+                                            try:
+                                                finfo = parsed.get("file") or {}
+                                                if finfo:
+                                                    filename = (finfo.get("filename") or "") or "file"
+                                                    payload = finfo.get("data") or b""
+                                            except Exception:
+                                                pass
+                                            try:
+                                                print(f"[HTTP] POST /api/upload_file - fallback parsed room={room} sender={sender} filename={filename} payload_len={len(payload)}")
+                                            except Exception:
+                                                pass
+                                except Exception:
+                                    pass
+                                try:
+                                    os.makedirs(FILES_DIR, exist_ok=True)
+                                except Exception:
+                                    pass
+                                fid = uuid.uuid4().hex
+                                base = os.path.basename(filename)
+                                save = fid + "__" + base
+                                fpath = os.path.join(FILES_DIR, save)
+                                try:
+                                    with open(fpath, "wb") as f:
+                                        f.write(payload)
+                                except Exception:
+                                    try:
+                                        print(f"[HTTP] POST /api/upload_file - write failed fpath={fpath}")
+                                    except Exception:
+                                        pass
+                                size = len(payload) if isinstance(payload, (bytes, bytearray)) else 0
+                                host_hdr = self.headers.get("Host") or ""
+                                url = f"http://{host_hdr}/files/{fid}" if host_hdr else f"/files/{fid}"
+                                try:
+                                    if room:
+                                        hub.broadcast_sys(room, f"[SYS] FILE_LINK {room} {sender} {base} {size} {url}")
+                                        print(f"[SYS] FILE_LINK {room} {sender} {base} {size} {url}")
+                                except Exception:
+                                    pass
+                                resp = {"file_id": fid, "file_name": base, "size": size, "url": url}
+                                b = json.dumps(resp, ensure_ascii=False).encode("utf-8")
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/json; charset=utf-8")
+                                self.send_header("Content-Length", str(len(b)))
+                                self.end_headers()
+                                try:
+                                    self.wfile.write(b)
+                                except Exception:
+                                    pass
+                                return
                             if p == "/api/add_room":
                                 form = self._read_form()
                                 room = form.get("room") or ""
