@@ -3572,7 +3572,6 @@ class ChatWindow(QtWidgets.QWidget):
                         rid = self.current_conv.split(":",1)[1]
                         self._ensure_conv(self.current_conv)
                         self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
-                        self.store.add(self.current_conv, self.username, f"[FILE] {uniq_name} {mime}", "file", True)
                         try:
                             # 图片且小于2MB则直接走内嵌发送，否则上传服务器
                             if mime.lower().startswith("image/") and int(max(0, sz or 0)) < (2 * 1024 * 1024):
@@ -3818,7 +3817,6 @@ class ChatWindow(QtWidgets.QWidget):
                                     sz = os.path.getsize(url_path) if os.path.exists(url_path) else None
                                 self._ensure_conv(self.current_conv)
                                 self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
-                                self.store.add(self.current_conv, self.username, f"[FILE] {uniq_name} {mime}", "file", True)
                                 # 图片且小于2MB则直接走内嵌发送，否则上传服务器
                                 if mime.lower().startswith("image/") and int(max(0, sz or 0)) < (2 * 1024 * 1024):
                                     try:
@@ -5082,6 +5080,14 @@ class ChatWindow(QtWidgets.QWidget):
                             av = self.avatar_pixmap
                             m = self.conv_models.get(key)
                             if m:
+                                try:
+                                    for idx in range(len(m.items) - 1, -1, -1):
+                                        it = m.items[idx]
+                                        if it.get("kind") == "file" and it.get("sender") == self.username and it.get("filename") == fname2 and not it.get("link_url"):
+                                            m.remove_row(idx)
+                                            break
+                                except Exception:
+                                    pass
                                 m.add_link(self.username, fname2, link_url, True, av, None, fsize)
                             try:
                                 self.store.add(key, self.username, f"[LINK] {fname2} {fsize} {link_url}", "file", True)
