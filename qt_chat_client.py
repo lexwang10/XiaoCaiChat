@@ -1278,7 +1278,7 @@ class FileUploadWorker(QtCore.QThread):
 class FileChunkSender(QtCore.QThread):
     progress = QtCore.Signal(int)
     finished = QtCore.Signal(bool, str)
-    def __init__(self, sock: socket.socket, path: str, chunks: list, prefix: str, paused_ref: list, canceled_ref: list, chunk_size: int):
+    def __init__(self, sock: socket.socket, path: str, chunks: list, prefix: str, paused_ref: list, canceled_ref: list, chunk_size: int, logger: Optional[ChatLogger] = None, username: Optional[str] = None):
         super().__init__()
         self.sock = sock
         self.path = path
@@ -1287,6 +1287,8 @@ class FileChunkSender(QtCore.QThread):
         self._paused_ref = paused_ref
         self._canceled_ref = canceled_ref
         self.sz = int(max(1024, chunk_size))
+        self._logger = logger
+        self._log_user = username or ""
     def run(self):
         try:
             f = open(self.path, "rb")
@@ -1294,6 +1296,10 @@ class FileChunkSender(QtCore.QThread):
             self.finished.emit(False, str(e))
             return
         try:
+            try:
+                total = os.path.getsize(self.path)
+            except Exception:
+                total = 0
             for offset in self.chunks:
                 if self._canceled_ref[0]:
                     break
@@ -1305,7 +1311,25 @@ class FileChunkSender(QtCore.QThread):
                     break
                 try:
                     f.seek(offset)
-                    buf = f.read(self.sz)
+                    expected = self.sz
+                    try:
+                        if total > 0:
+                            rem = int(max(0, total - int(max(0, offset))))
+                            expected = int(max(0, min(self.sz, rem)))
+                    except Exception:
+                        expected = self.sz
+                    if expected <= 0:
+                        buf = b""
+                    else:
+                        parts = []
+                        remaining = expected
+                        while remaining > 0:
+                            b = f.read(remaining)
+                            if not b:
+                                break
+                            parts.append(b)
+                            remaining -= len(b)
+                        buf = b"".join(parts)
                 except Exception as e:
                     self.finished.emit(False, str(e))
                     try:
@@ -1313,10 +1337,23 @@ class FileChunkSender(QtCore.QThread):
                     except Exception:
                         pass
                     return
+                try:
+                    if expected > 0 and len(buf) < expected:
+                        try:
+                            if self._logger:
+                                self._logger.write("send", self._log_user, f"WARN short_read off={int(max(0,offset))} expected={int(max(0,expected))} got={len(buf)}")
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 if not buf:
                     continue
                 try:
-                    print(f"[UploadChunk] off={offset} size={len(buf)}")
+                    try:
+                        if self._logger:
+                            self._logger.write("send", self._log_user, f"FILE_CHUNK off={int(max(0,offset))} size={len(buf)}")
+                    except Exception:
+                        pass
                     b64 = base64.b64encode(buf).decode("ascii")
                     line = f"{self.prefix} FILE_CHUNK {offset} {b64}\n".encode("utf-8")
                     self.sock.sendall(line)
@@ -1346,7 +1383,7 @@ class FileChunkSender(QtCore.QThread):
 class MultiConnFileUploader(QtCore.QObject):
     progress = QtCore.Signal(int, int)
     finished = QtCore.Signal(bool, str)
-    def __init__(self, host: str, port: int, username: str, room_or_rid: str, mode: str, target: Optional[str], path: str, conn_count: int = 3, chunk_size: int = 2097152, extra: Optional[str] = "", override_name: Optional[str] = None):
+    def __init__(self, host: str, port: int, username: str, room_or_rid: str, mode: str, target: Optional[str], path: str, conn_count: int = 3, chunk_size: int = 2097152, extra: Optional[str] = "", override_name: Optional[str] = None, logger: Optional[ChatLogger] = None):
         super().__init__()
         self.host = host
         self.port = port
@@ -1367,6 +1404,12 @@ class MultiConnFileUploader(QtCore.QObject):
         self._md5 = ""
         self._resume_written = 0
         self._threads = []
+        self._logger = logger
+        self._prefix = ""
+        self._offsets = set()
+        self._acked = set()
+        self._resend_rounds = 0
+        self._max_resend_rounds = 2
     def pause_toggle(self):
         try:
             self._paused[0] = not self._paused[0]
@@ -1451,34 +1494,51 @@ class MultiConnFileUploader(QtCore.QObject):
             except Exception:
                 pass
             prefix = ("DM " + self.target) if self.mode == "dm" and self.target else "MSG"
+            self._prefix = prefix
             self._md5 = self._calc_md5()
             try:
                 meta_line = f"{prefix} FILE_META {name} {mime} {self._total} {self._md5}\n".encode("utf-8")
                 if self._socks:
                     self._socks[0].sendall(meta_line)
-                print(f"[UploadBegin] name={name} mime={mime} size={self._total} md5={self._md5} conns={len(self._socks)} chunk={self.chunk_size}")
-                if self.mode == "dm" and self.target:
+                try:
+                    if self._logger:
+                        self._logger.write("send", self.username, f"FILE_META name={name} mime={mime} size={int(max(0,self._total))} md5={self._md5}")
+                except Exception:
+                    pass
+                if (self.mode == "dm" and self.target) or (self.mode == "group"):
                     qline = f"{prefix} FILE_QUERY {self._md5}\n".encode("utf-8")
                     self._socks[0].sendall(qline)
-                    print(f"[UploadQuery] md5={self._md5}")
+                    try:
+                        if self._logger:
+                            self._logger.write("send", self.username, f"FILE_QUERY md5={self._md5}")
+                    except Exception:
+                        pass
             except Exception:
                 pass
             begin_line = f"{prefix} FILE_BEGIN {name} {mime} {self._total}\n".encode("utf-8")
             try:
                 if self._socks:
                     self._socks[0].sendall(begin_line)
-                print(f"[UploadStart] FILE_BEGIN sent")
+                try:
+                    if self._logger:
+                        self._logger.write("send", self.username, f"FILE_BEGIN name={name} mime={mime} size={int(max(0,self._total))}")
+                except Exception:
+                    pass
             except Exception:
                 pass
             start_off = int(max(0, self._resume_written))
             offsets = list(range(start_off, self._total, self.chunk_size))
-            print(f"[UploadResume] start_off={start_off} total_chunks={len(offsets)}")
+            try:
+                self._offsets = set(offsets)
+                self._acked = set()
+            except Exception:
+                pass
             groups = [[] for _ in range(max(1, len(self._socks)))]
             for i, off in enumerate(offsets):
                 groups[i % len(groups)].append(off)
             threads = []
             for i, s in enumerate(self._socks):
-                t = FileChunkSender(s, self.path, groups[i], prefix, self._paused, self._canceled, self.chunk_size)
+                t = FileChunkSender(s, self.path, groups[i], prefix, self._paused, self._canceled, self.chunk_size, logger=self._logger, username=self.username)
                 t.progress.connect(self._on_piece_sent)
                 t.finished.connect(self._on_piece_finished)
                 threads.append(t)
@@ -1488,32 +1548,81 @@ class MultiConnFileUploader(QtCore.QObject):
                 t.start()
         except Exception as e:
             self.finished.emit(False, str(e))
+    def note_ack(self, off: int, wrote: int):
+        try:
+            if self._canceled[0]:
+                return
+            self._acked.add(int(max(0, off)))
+            if self._pending <= 0:
+                self._maybe_finalize_or_resend()
+        except Exception:
+            pass
+    def _missing_offsets(self) -> list:
+        try:
+            return [o for o in sorted(list(self._offsets)) if o not in self._acked]
+        except Exception:
+            return []
+    def _start_resend_round(self, offs: list):
+        try:
+            if not offs:
+                self._maybe_finalize_or_resend()
+                return
+            groups = [[] for _ in range(max(1, len(self._socks)))]
+            for i, off in enumerate(offs):
+                groups[i % len(groups)].append(off)
+            threads = []
+            for i, s in enumerate(self._socks):
+                t = FileChunkSender(s, self.path, groups[i], self._prefix, self._paused, self._canceled, self.chunk_size, logger=self._logger, username=self.username)
+                t.progress.connect(self._on_piece_sent)
+                t.finished.connect(self._on_piece_finished)
+                threads.append(t)
+            self._pending = len(threads)
+            self._threads = threads
+            for t in threads:
+                t.start()
+        except Exception:
+            try:
+                self._maybe_finalize_or_resend()
+            except Exception:
+                pass
+    def _maybe_finalize_or_resend(self):
+        try:
+            missing = self._missing_offsets()
+            if missing and (self._resend_rounds < self._max_resend_rounds):
+                self._resend_rounds += 1
+                self._start_resend_round(missing)
+                return
+            try:
+                if self._socks:
+                    end_line = f"MSG FILE_END\n".encode("utf-8") if self.mode != "dm" else f"DM {self.target} FILE_END\n".encode("utf-8")
+                    self._socks[0].sendall(end_line)
+                    try:
+                        if self._logger:
+                            self._logger.write("send", self.username, "FILE_END")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            self.finished.emit(True, "")
+        except Exception:
+            pass
     def _on_piece_sent(self, n: int):
         try:
             self._sent += int(max(0, n))
             self.progress.emit(self._sent, self._total)
             if self._total > 0:
                 pct = int((self._sent / self._total) * 100)
-                if pct % 10 == 0:
-                    print(f"[UploadProgress] sent={self._sent}/{self._total} ({pct}%)")
+                pass
         except Exception:
             pass
     def _on_piece_finished(self, ok: bool, err: str):
         try:
             self._pending -= 1
-            print(f"[UploadThreadFinished] ok={ok} err={err} pending={self._pending}")
             if self._pending <= 0:
                 if self._canceled[0]:
                     self.finished.emit(False, "已取消")
                 else:
-                    try:
-                        if self._socks:
-                            end_line = f"MSG FILE_END\n".encode("utf-8") if self.mode != "dm" else f"DM {self.target} FILE_END\n".encode("utf-8")
-                            self._socks[0].sendall(end_line)
-                            print("[UploadEnd] FILE_END sent")
-                    except Exception:
-                        pass
-                    self.finished.emit(True, "")
+                    self._maybe_finalize_or_resend()
         except Exception:
             pass
 class ChatWindow(QtWidgets.QWidget):
@@ -1545,6 +1654,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.room_name_map = {}
         self.socks = {}
         self.receivers = {}
+        self.max_upload_bytes = 40 * 1024 * 1024
         self.pending_dm = set()
         self.pending_dm_users = set()
         self.pending_join_users = set()
@@ -1558,6 +1668,15 @@ class ChatWindow(QtWidgets.QWidget):
             app = QtWidgets.QApplication.instance()
             if app:
                 app.aboutToQuit.connect(self._on_app_quit)
+        except Exception:
+            pass
+        try:
+            cfg_path = os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json")
+            if os.path.isfile(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    data = json.load(f) or {}
+                mb = int(data.get("max_upload_mb") or 40)
+                self.max_upload_bytes = int(max(1, mb)) * 1024 * 1024
         except Exception:
             pass
         try:
@@ -1957,10 +2076,18 @@ class ChatWindow(QtWidgets.QWidget):
     def _connect(self) -> bool:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            s.settimeout(2.0)
+        except Exception:
+            pass
+        try:
             s.connect((self.host, self.port))
         except Exception:
             self.sock = None
             return False
+        try:
+            s.settimeout(None)
+        except Exception:
+            pass
         self.sock = s
         try:
             extra = (self.avatar_filename or "").strip() if isinstance(self.avatar_filename, str) else ""
@@ -2028,9 +2155,17 @@ class ChatWindow(QtWidgets.QWidget):
     def _connect_room(self, rid: str) -> bool:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
+            s.settimeout(2.0)
+        except Exception:
+            pass
+        try:
             s.connect((self.host, self.port))
         except Exception:
             return False
+        try:
+            s.settimeout(None)
+        except Exception:
+            pass
         try:
             extra = (self.avatar_filename or "").strip() if isinstance(self.avatar_filename, str) else ""
             hello = f"HELLO {self.username} {rid} {extra}\n".encode("utf-8")
@@ -2062,7 +2197,13 @@ class ChatWindow(QtWidgets.QWidget):
                 self._sync_room_from_server()
             rooms = self.rooms_info or []
             if not rooms:
-                return self._connect()
+                ok = self._connect()
+                if not ok:
+                    try:
+                        self._show_connect_error(self.host, self.port, "网络或服务器不可用")
+                    except Exception:
+                        pass
+                return ok
             # init view model once
             self.current_conv = None
             self.current_model = ChatModel()
@@ -2074,10 +2215,39 @@ class ChatWindow(QtWidgets.QWidget):
             self.hb.start()
             for r in rooms:
                 rid = str(r.get("id"))
-                self._connect_room(rid)
+                if not self._connect_room(rid):
+                    try:
+                        self._show_connect_error(self.host, self.port, f"房间 {rid} 连接失败")
+                    except Exception:
+                        pass
             return True
         except Exception:
             return False
+    def _show_connect_error(self, host: str, port: int, detail: str = ""):
+        try:
+            m = QtWidgets.QMessageBox(self)
+            m.setIcon(QtWidgets.QMessageBox.Critical)
+            m.setWindowTitle("连接失败")
+            m.setText(f"无法连接到服务器 {host}:{port}")
+            if detail:
+                m.setInformativeText(str(detail))
+            m.setStandardButtons(QtWidgets.QMessageBox.Retry | QtWidgets.QMessageBox.Close)
+            def _done(code: int):
+                try:
+                    if code == QtWidgets.QMessageBox.Retry:
+                        QtCore.QTimer.singleShot(0, lambda: self._connect_all_rooms())
+                except Exception:
+                    pass
+            m.finished.connect(_done)
+            m.setModal(False)
+            m.open()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'status_left') and self.status_left:
+                self.status_left.setText(f"未连接 {host}:{port}")
+        except Exception:
+            pass
 
     def on_received(self, text: str):
         self.logger.write("recv", self.host, text)
@@ -2713,14 +2883,25 @@ class ChatWindow(QtWidgets.QWidget):
                             except Exception:
                                 pass
                             try:
+                                if k not in self._rx_files:
+                                    self._rx_files[k] = {"mime": mime, "total": int(max(0, tot)), "part": part, "chunks": {}, "md5": md5}
+                                else:
+                                    self._rx_files[k]["mime"] = mime
+                                    self._rx_files[k]["total"] = int(max(0, tot))
+                                    self._rx_files[k]["part"] = part
+                                    self._rx_files[k]["md5"] = md5
+                            except Exception:
+                                pass
+                            try:
                                 written = os.path.getsize(part) if os.path.isfile(part) else 0
                             except Exception:
                                 written = 0
                             try:
-                                self._send_seq(f"DM {name} FILE_HAVE {md5} {written} PARTIAL")
+                                if md5:
+                                    self._send_seq(f"DM {name} FILE_HAVE {md5} {written} PARTIAL")
                             except Exception:
                                 pass
-                    return
+                        return
                 if msg.startswith("FILE_QUERY "):
                     toks = msg.split(" ", 2)
                     try:
@@ -2782,7 +2963,7 @@ class ChatWindow(QtWidgets.QWidget):
                         self._rx_file_begin(f"dm:{name}", name, fn, mime, tot)
                         return
                 elif msg.startswith("FILE_CHUNK "):
-                    toks = msg.split(" ", 3)
+                    toks = msg.split(" ", 2)
                     if len(toks) >= 3:
                         try:
                             off = int(toks[1])
@@ -2901,6 +3082,29 @@ class ChatWindow(QtWidgets.QWidget):
                     return
                 if msg.startswith("FILE_QUERY "):
                     return
+                if msg.startswith("FILE_ACK "):
+                    toks = msg.split(" ", 4)
+                    if len(toks) >= 4:
+                        md5 = toks[1]
+                        try:
+                            off = int(toks[2])
+                        except Exception:
+                            off = 0
+                        try:
+                            wrote = int(toks[3])
+                        except Exception:
+                            wrote = 0
+                        try:
+                            for (_, _), w in list(self.upload_workers.items()):
+                                if hasattr(w, "_md5") and w._md5 == md5:
+                                    try:
+                                        if hasattr(w, "note_ack"):
+                                            w.note_ack(off, wrote)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    return
                 if msg.startswith("FILE_HAVE "):
                     toks = msg.split(" ", 4)
                     if len(toks) >= 4:
@@ -2993,8 +3197,39 @@ class ChatWindow(QtWidgets.QWidget):
                                 os.remove(part)
                             except Exception:
                                 pass
+                        if k not in self._rx_files:
+                            self._rx_files[k] = {"mime": mime, "total": int(max(0, tot)), "part": part, "chunks": {}, "md5": md5}
+                        else:
+                            self._rx_files[k]["mime"] = mime
+                            self._rx_files[k]["total"] = int(max(0, tot))
+                            self._rx_files[k]["part"] = part
+                            self._rx_files[k]["md5"] = md5
                     except Exception:
                         pass
+            elif msg.startswith("FILE_QUERY "):
+                toks = msg.split(" ", 2)
+                try:
+                    md5 = toks[1]
+                except Exception:
+                    md5 = ""
+                try:
+                    d_entry = None
+                    for k, v in list(self._rx_files.items()):
+                        if k[0] == rid_key and v.get("md5") == md5:
+                            d_entry = v
+                            break
+                    written = 0
+                    if d_entry:
+                        partp = d_entry.get("part")
+                        try:
+                            written = os.path.getsize(partp) if partp and os.path.isfile(partp) else 0
+                        except Exception:
+                            written = 0
+                    if md5:
+                        self._send_seq(f"MSG FILE_HAVE {md5} {int(max(0, written))} PARTIAL", rid)
+                except Exception:
+                    pass
+                return
             elif msg.startswith("FILE_BEGIN "):
                 toks = msg.split(" ")
                 if len(toks) >= 4:
@@ -3011,7 +3246,7 @@ class ChatWindow(QtWidgets.QWidget):
                     self._rx_file_begin(rid_key, name, fn, mime, tot)
                     return
             elif msg.startswith("FILE_CHUNK "):
-                toks = msg.split(" ", 3)
+                toks = msg.split(" ", 2)
                 if len(toks) >= 3:
                     try:
                         off = int(toks[1])
@@ -3061,6 +3296,62 @@ class ChatWindow(QtWidgets.QWidget):
                         except Exception:
                             pass
                     return
+            elif msg.startswith("FILE_HAVE "):
+                toks = msg.split(" ", 4)
+                if len(toks) >= 4:
+                    md5 = toks[1]
+                    try:
+                        written = int(toks[2])
+                    except Exception:
+                        written = 0
+                    status = toks[3] if len(toks) >= 4 else "PARTIAL"
+                    try:
+                        for (key,row), w in list(self.upload_workers.items()):
+                            if key == rid_key and hasattr(w, "_md5") and w._md5 == md5:
+                                if status == "COMPLETE":
+                                    try:
+                                        w.cancel()
+                                    except Exception:
+                                        pass
+                                    m = self.conv_models.get(key)
+                                    if m:
+                                        try:
+                                            it = m.items[row]
+                                            tot = int(it.get("filesize") or 0)
+                                            m.set_upload_progress(row, tot, tot, None)
+                                        except Exception:
+                                            pass
+                                else:
+                                    try:
+                                        w.set_resume_written(written)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+                return
+            elif msg.startswith("FILE_ACK "):
+                toks = msg.split(" ", 4)
+                if len(toks) >= 4:
+                    md5 = toks[1]
+                    try:
+                        off = int(toks[2])
+                    except Exception:
+                        off = 0
+                    try:
+                        wrote = int(toks[3])
+                    except Exception:
+                        wrote = 0
+                    try:
+                        for (key,row), w in list(self.upload_workers.items()):
+                            if key == rid_key and hasattr(w, "_md5") and w._md5 == md5:
+                                try:
+                                    if hasattr(w, "note_ack"):
+                                        w.note_ack(off, wrote)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                return
             elif msg.startswith("FILE_CANCEL "):
                 toks = msg.split(" ", 1)
                 fn = toks[1] if len(toks) >= 2 else ""
@@ -3127,13 +3418,53 @@ class ChatWindow(QtWidgets.QWidget):
         
         # Check if we have a pending pasted file/image
         if self.pending_image_bytes:
-            try:
-                print(f"[Send] pending file detected name={self.pending_image_name} mime={self.pending_image_mime} size={len(self.pending_image_bytes)}")
-            except Exception:
-                pass
             name = self.pending_image_name or ("paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png")
             mime = self.pending_image_mime or "application/octet-stream"
             size_bytes = len(self.pending_image_bytes) if self.pending_image_bytes is not None else 0
+            limit_bytes = int(getattr(self, "max_upload_bytes", 40 * 1024 * 1024))
+            if int(max(0, size_bytes)) > limit_bytes:
+                try:
+                    QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 40MB（{self._human_readable_size(size_bytes)}），无法发送")
+                except Exception:
+                    pass
+                try:
+                    placeholder = f"[文件: {name}]"
+                    if placeholder in text:
+                        text = text.replace(placeholder, "").strip()
+                    try:
+                        size_str = self._human_readable_size(int(max(0, size_bytes)))
+                    except Exception:
+                        size_str = ""
+                    try:
+                        lines = [ln for ln in (text.splitlines()) if ln.strip() not in {name.strip(), size_str.strip()}]
+                        lines = [ln for ln in lines if ln.strip() != ""]
+                        text = "\n".join(lines).strip()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                self.pending_image_bytes = None
+                self.pending_image_mime = None
+                self.pending_image_name = None
+                self.pending_image_pixmap = None
+                if text:
+                    wire_text = text.replace("\n", "\\n")
+                    if self.current_conv.startswith("dm:"):
+                        target = self.current_conv.split(":",1)[1]
+                        self._send_seq(f"DM {target} {wire_text}")
+                        self.store.add(f"dm:{target}", self.username, text, "msg", True)
+                        self._ensure_conv(self.current_conv)
+                        self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                    else:
+                        rid = self.current_conv.split(":",1)[1]
+                        self._send_seq(f"MSG {wire_text}", rid)
+                        self.store.add(f"group:{rid}", self.username, text, "msg", True)
+                        self._ensure_conv(self.current_conv)
+                        self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                        self.view.scrollToBottom()
+                    self.logger.write("sent", self.username, wire_text)
+                self.entry.clear()
+                return
             is_image = bool(mime and mime.lower().startswith("image/"))
             uniq_name = self._ensure_unique_filename(self.current_conv, self.username, name)
             if (not is_image) and size_bytes >= (2 * 1024 * 1024):
@@ -3149,6 +3480,22 @@ class ChatWindow(QtWidgets.QWidget):
                         sz = os.path.getsize(temp_path)
                     except Exception:
                         sz = size_bytes
+                    if int(max(0, sz)) > int(limit_bytes):
+                        try:
+                            QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 40MB（{self._human_readable_size(sz)}），无法发送")
+                        except Exception:
+                            pass
+                        try:
+                            os.remove(temp_path)
+                        except Exception:
+                            pass
+                        self.pending_image_bytes = None
+                        self.pending_image_mime = None
+                        self.pending_image_name = None
+                        self.pending_image_pixmap = None
+                        self.view.scrollToBottom()
+                        self.entry.clear()
+                        return
                     self.conv_models[self.current_conv].add_file(self.username, uniq_name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
                     self.store.add(self.current_conv, self.username, f"[FILE] {uniq_name} {mime}", "file", True)
                     try:
@@ -3266,11 +3613,50 @@ class ChatWindow(QtWidgets.QWidget):
                         name = os.path.basename(url_path)
                         mime = self._guess_mime(url_path)
                         self._ensure_conv(self.current_conv)
-                        pix = QtGui.QPixmap(url_path)
                         try:
                             sz = os.path.getsize(url_path)
                         except Exception:
                             sz = None
+                        limit_bytes = int(getattr(self, "max_upload_bytes", 40 * 1024 * 1024))
+                        if int(max(0, sz or 0)) > int(limit_bytes):
+                            try:
+                                QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 40MB（{self._human_readable_size(sz or 0)}），无法发送")
+                            except Exception:
+                                pass
+                            try:
+                                text = self._sanitize_text(text.replace(f"file://{url_path}", ""))
+                            except Exception:
+                                pass
+                            if text:
+                                try:
+                                    size_str = self._human_readable_size(int(max(0, sz or 0)))
+                                except Exception:
+                                    size_str = ""
+                                try:
+                                    base = os.path.basename(url_path)
+                                    lines = [ln for ln in (text.splitlines()) if ln.strip() not in {base.strip(), size_str.strip()}]
+                                    lines = [ln for ln in lines if ln.strip() != ""]
+                                    text = "\n".join(lines).strip()
+                                except Exception:
+                                    pass
+                                wire_text = text.replace("\n", "\\n")
+                                if self.current_conv.startswith("dm:"):
+                                    target = self.current_conv.split(":",1)[1]
+                                    self._send_seq(f"DM {target} {wire_text}")
+                                    self.store.add(f"dm:{target}", self.username, text, "msg", True)
+                                    self._ensure_conv(self.current_conv)
+                                    self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                                else:
+                                    rid = self.current_conv.split(":",1)[1]
+                                    self._send_seq(f"MSG {wire_text}", rid)
+                                    self.store.add(f"group:{rid}", self.username, text, "msg", True)
+                                    self._ensure_conv(self.current_conv)
+                                    self.conv_models[self.current_conv].add("msg", self.username, text, True, self.avatar_pixmap)
+                                    self.view.scrollToBottom()
+                                self.logger.write("sent", self.username, wire_text)
+                            self.entry.clear()
+                            return
+                        pix = QtGui.QPixmap(url_path)
                         self.conv_models[self.current_conv].add_file(self.username, name, mime, pix if not pix.isNull() else None, True, self.avatar_pixmap, None, sz)
                         self.store.add(self.current_conv, self.username, f"[FILE] {name} {mime}", "file", True)
                         try:
@@ -4216,19 +4602,30 @@ class ChatWindow(QtWidgets.QWidget):
         try:
             if not path or not os.path.isfile(path):
                 return
+            try:
+                limit_bytes = int(getattr(self, "max_upload_bytes", 40 * 1024 * 1024))
+                sz0 = os.path.getsize(path)
+                if int(max(0, sz0)) > int(limit_bytes):
+                    try:
+                        QtWidgets.QMessageBox.warning(self, "发送文件", f"文件大小超过 40MB（{self._human_readable_size(sz0)}），无法发送")
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
             name = override_name or os.path.basename(path)
             mime = self._guess_mime(path)
             rid = None
             uploader = None
             if self.current_conv and self.current_conv.startswith("dm:"):
                 target = self.current_conv.split(":",1)[1]
-                uploader = MultiConnFileUploader(self.host, self.port, self.username, self.room, "dm", target, path, 2, 1048576, (self.avatar_filename or ""), name)
+                uploader = MultiConnFileUploader(self.host, self.port, self.username, self.room, "dm", target, path, 2, 1048576, (self.avatar_filename or ""), name, logger=self.logger)
             elif self.current_conv and self.current_conv.startswith("group:"):
                 rid = self.current_conv.split(":",1)[1]
-                uploader = MultiConnFileUploader(self.host, self.port, self.username, rid, "group", None, path, 2, 1048576, (self.avatar_filename or ""), name)
+                uploader = MultiConnFileUploader(self.host, self.port, self.username, rid, "group", None, path, 2, 1048576, (self.avatar_filename or ""), name, logger=self.logger)
             else:
                 rid = self.room
-                uploader = MultiConnFileUploader(self.host, self.port, self.username, rid, "group", None, path, 2, 1048576, (self.avatar_filename or ""), name)
+                uploader = MultiConnFileUploader(self.host, self.port, self.username, rid, "group", None, path, 2, 1048576, (self.avatar_filename or ""), name, logger=self.logger)
             total = 0
             try:
                 total = os.path.getsize(path)
@@ -4593,10 +4990,18 @@ class ChatWindow(QtWidgets.QWidget):
             self.port_edit.setValue(int(self.port))
         except Exception:
             pass
+        self.max_upload_mb_spin = QtWidgets.QSpinBox()
+        try:
+            self.max_upload_mb_spin.setRange(1, 2048)
+            cur_mb = int(getattr(self, "max_upload_bytes", 40 * 1024 * 1024) // (1024 * 1024))
+            self.max_upload_mb_spin.setValue(int(max(1, cur_mb)))
+        except Exception:
+            pass
         apply_btn = QtWidgets.QPushButton("保存")
         clear_btn = QtWidgets.QPushButton("清除缓存")
         form.addRow("服务器 IP", self.host_edit)
         form.addRow("端口", self.port_edit)
+        form.addRow("最大发送大小 (MB)", self.max_upload_mb_spin)
         v.addLayout(form)
         # 移除状态未连接提示
         h = QtWidgets.QHBoxLayout()
@@ -4612,6 +5017,25 @@ class ChatWindow(QtWidgets.QWidget):
                 _save_client_config(os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json"), new_host, new_port, self.room)
                 self.host = new_host
                 self.port = new_port
+                try:
+                    mb = int(self.max_upload_mb_spin.value())
+                    self.max_upload_bytes = int(max(1, mb)) * 1024 * 1024
+                except Exception:
+                    pass
+                try:
+                    cfg_path = os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json")
+                    data = {}
+                    if os.path.isfile(cfg_path):
+                        with open(cfg_path, "r", encoding="utf-8") as f:
+                            try:
+                                data = json.load(f) or {}
+                            except Exception:
+                                data = {}
+                    data["max_upload_mb"] = int(max(1, self.max_upload_bytes // (1024 * 1024)))
+                    with open(cfg_path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
                 try:
                     m = QtWidgets.QMessageBox(self)
                     m.setIcon(QtWidgets.QMessageBox.Information)
@@ -4814,8 +5238,9 @@ class ChatWindow(QtWidgets.QWidget):
         att_dir = self._attachment_dir(conv_key)
         os.makedirs(att_dir, exist_ok=True)
         class _Task(QtCore.QRunnable):
-            def __init__(self, dirp: str, fname: str, payload: str):
+            def __init__(self, owner, dirp: str, fname: str, payload: str):
                 super().__init__()
+                self.owner = owner
                 self.dirp = dirp
                 self.fname = fname
                 self.payload = payload
@@ -4825,13 +5250,14 @@ class ChatWindow(QtWidgets.QWidget):
                     with open(os.path.join(self.dirp, self.fname), "wb") as f:
                         f.write(data)
                     try:
-                        print(f"[RecvSave] path={os.path.join(self.dirp, self.fname)} size={len(data)}")
+                        if hasattr(self.owner, "logger") and self.owner.logger:
+                            self.owner.logger.write("recv", self.owner.username, f"FILE_SAVE path={os.path.join(self.dirp, self.fname)} size={len(data)}")
                     except Exception:
                         pass
                 except Exception:
                     pass
         try:
-            QtCore.QThreadPool.globalInstance().start(_Task(att_dir, filename, b64))
+            QtCore.QThreadPool.globalInstance().start(_Task(self, att_dir, filename, b64))
         except Exception:
             pass
     def _copy_attachment_from_path(self, filename: str, src_path: str, conv_key: Optional[str] = None):
@@ -4879,16 +5305,80 @@ class ChatWindow(QtWidgets.QWidget):
                 try:
                     key = (self.conv_key, self.sender, self.filename)
                     try:
-                        if (hasattr(self.owner, "_finalizing_files") and key in self.owner._finalizing_files) or (hasattr(self.owner, "_rx_files") and key not in self.owner._rx_files):
+                        if (hasattr(self.owner, "_rx_files") and key not in self.owner._rx_files):
                             return
                     except Exception:
                         pass
-                    data = base64.b64decode(self.payload)
-                    with open(self.path, "r+b") as f:
-                        f.seek(self.off)
-                        f.write(data)
+                    data = None
                     try:
-                        print(f"[RecvChunkWrite] part={self.path} off={self.off} wrote={len(data)}")
+                        data = base64.b64decode(self.payload)
+                    except Exception:
+                        try:
+                            data = base64.b64decode(self.payload.encode("ascii"), validate=False)
+                        except Exception:
+                            data = b""
+                    if not isinstance(data, (bytes, bytearray)):
+                        data = b""
+                    try:
+                        if not os.path.isfile(self.path):
+                            with open(self.path, "wb") as _f:
+                                _f.write(b"")
+                    except Exception:
+                        pass
+                    mode = "r+b"
+                    try:
+                        cur_sz = os.path.getsize(self.path) if os.path.isfile(self.path) else 0
+                    except Exception:
+                        cur_sz = 0
+                    try:
+                        if self.off == cur_sz:
+                            mode = "ab"
+                    except Exception:
+                        mode = "r+b"
+                    with open(self.path, mode) as f:
+                        if mode != "ab":
+                            try:
+                                f.seek(self.off)
+                            except Exception:
+                                f.seek(0, os.SEEK_END)
+                        f.write(data)
+                        try:
+                            f.flush()
+                        except Exception:
+                            pass
+                        try:
+                            os.fsync(f.fileno())
+                        except Exception:
+                            pass
+                    try:
+                        d = self.owner._rx_files.get(key) or {}
+                        chunks = d.get("chunks")
+                        if isinstance(chunks, dict):
+                            chunks[self.off] = len(data)
+                    except Exception:
+                        pass
+                    try:
+                        d = self.owner._rx_files.get(key) or {}
+                        md5 = d.get("md5")
+                        wrote = len(data)
+                        if md5 and wrote > 0:
+                            if self.conv_key.startswith("dm:"):
+                                peer = self.sender
+                                try:
+                                    self.owner._send_seq(f"DM {peer} FILE_ACK {md5} {int(max(0,self.off))} {int(max(0,wrote))}")
+                                except Exception:
+                                    pass
+                            elif self.conv_key.startswith("group:"):
+                                try:
+                                    rid = self.conv_key.split(":",1)[1]
+                                    self.owner._send_seq(f"MSG FILE_ACK {md5} {int(max(0,self.off))} {int(max(0,wrote))}", rid)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    try:
+                        if hasattr(self.owner, "logger") and self.owner.logger:
+                            self.owner.logger.write("recv", self.sender, f"FILE_CHUNK_WRITE part={self.path} off={int(max(0,self.off))} wrote={len(data)}")
                     except Exception:
                         pass
                     try:
@@ -4955,7 +5445,7 @@ class ChatWindow(QtWidgets.QWidget):
                 pass
         except Exception:
             pass
-        self._rx_files[(conv_key, sender, filename)] = {"mime": mime, "total": int(max(0, total)), "part": part}
+        self._rx_files[(conv_key, sender, filename)] = {"mime": mime, "total": int(max(0, total)), "part": part, "chunks": {}, "md5": None}
         try:
             if hasattr(self, "logger") and self.logger:
                 self.logger.write("recv", sender, f"RX_BEGIN conv={conv_key} name={filename} mime={mime} total={int(max(0,total))} part={part}")
@@ -4985,6 +5475,28 @@ class ChatWindow(QtWidgets.QWidget):
             pass
         att_dir = self._attachment_dir(conv_key)
         dst = os.path.join(att_dir, filename)
+        def _contiguous_prefix_size() -> int:
+            try:
+                chunks = d.get("chunks") or {}
+                file_sz = 0
+                try:
+                    file_sz = os.path.getsize(d.get("part") or "")
+                except Exception:
+                    file_sz = 0
+                if not isinstance(chunks, dict) or not chunks:
+                    return int(max(0, file_sz))
+                off = 0
+                while True:
+                    ln = chunks.get(off)
+                    if not ln or ln <= 0:
+                        break
+                    off += int(max(0, ln))
+                return int(max(0, max(off, file_sz)))
+            except Exception:
+                try:
+                    return os.path.getsize(d.get("part") or "")
+                except Exception:
+                    return 0
         def _do_update_and_cleanup():
             try:
                 if hasattr(self, "logger") and self.logger:
@@ -5044,21 +5556,38 @@ class ChatWindow(QtWidgets.QWidget):
                     self._finalizing_files.remove(key)
             except Exception:
                 pass
+            try:
+                if key in self._rx_files:
+                    del self._rx_files[key]
+            except Exception:
+                pass
         def _attempt_finalize():
             partp = d.get("part")
             total = int(d.get("total") or 0)
+            cur = _contiguous_prefix_size()
+            part_sz = 0
             try:
-                cur = os.path.getsize(partp) if partp and os.path.isfile(partp) else 0
+                part_sz = os.path.getsize(partp) if partp and os.path.isfile(partp) else 0
             except Exception:
-                cur = 0
-            if partp and os.path.isfile(partp) and (total <= 0 or cur >= total):
+                part_sz = 0
+            if partp and os.path.isfile(partp) and (total <= 0 or cur >= total or part_sz >= total):
                 try:
                     if os.path.isfile(dst):
                         try:
                             os.remove(dst)
                         except Exception:
                             pass
-                    shutil.move(partp, dst)
+                    try:
+                        shutil.move(partp, dst)
+                    except Exception:
+                        try:
+                            shutil.copyfile(partp, dst)
+                            try:
+                                os.remove(partp)
+                            except Exception:
+                                pass
+                        except Exception:
+                            return False
                 except Exception:
                     return False
                 _do_update_and_cleanup()
@@ -5066,39 +5595,40 @@ class ChatWindow(QtWidgets.QWidget):
             return False
         if not _attempt_finalize():
             try:
-                max_tries = 40  # ~6s with 150ms interval
+                max_tries = 200  # ~30s with 150ms interval
                 tries = [0]
                 def _tick():
                     if _attempt_finalize():
                         return
                     tries[0] += 1
+                    try:
+                        cur = _contiguous_prefix_size()
+                        md5 = d.get("md5")
+                        if md5 and cur > 0:
+                            if conv_key.startswith("dm:"):
+                                peer = sender
+                                try:
+                                    self._send_seq(f"DM {peer} FILE_HAVE {md5} {cur} PARTIAL")
+                                except Exception:
+                                    pass
+                            elif conv_key.startswith("group:"):
+                                try:
+                                    rid = conv_key.split(":",1)[1]
+                                    self._send_seq(f"MSG FILE_HAVE {md5} {cur} PARTIAL", rid)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     if tries[0] < max_tries:
                         QtCore.QTimer.singleShot(150, _tick)
                     else:
-                        # force finalize by moving if exists even if size not reached
-                        partp = d.get("part")
-                        if partp and os.path.isfile(partp):
-                            try:
-                                if os.path.isfile(dst):
-                                    try:
-                                        os.remove(dst)
-                                    except Exception:
-                                        pass
-                                shutil.move(partp, dst)
-                            except Exception:
-                                pass
-                        _do_update_and_cleanup()
+                        pass
                 QtCore.QTimer.singleShot(150, _tick)
             except Exception:
                 try:
                     _do_update_and_cleanup()
                 except Exception:
                     pass
-        try:
-            if key in self._rx_files:
-                del self._rx_files[key]
-        except Exception:
-            pass
 
     def _open_text_viewer(self, text: str):
         dlg = QtWidgets.QDialog(self)
@@ -5289,7 +5819,7 @@ def _ensure_user_config(path: str):
         p = path or os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json")
         ddir = os.path.dirname(p)
         os.makedirs(ddir, exist_ok=True)
-        defaults = {"host": "127.0.0.1", "port": 34567, "room": "世界", "theme": "flat"}
+        defaults = {"host": "127.0.0.1", "port": 34567, "room": "世界", "theme": "flat", "max_upload_mb": 40}
         if os.path.isfile(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:

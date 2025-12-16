@@ -121,7 +121,63 @@ class Hub:
 
     def broadcast_text(self, room: str, origin: socket.socket, username: str, text: str):
         try:
-            print(f"broadcast_text from {username}: len={len(text)} head={text[:80]}")
+            if text.startswith("FILE_META "):
+                toks = text.split(" ")
+                if len(toks) >= 5:
+                    name = " ".join(toks[1:-3])
+                    mime = toks[-3]
+                    try:
+                        tot = int(toks[-2])
+                    except Exception:
+                        tot = 0
+                    md5 = toks[-1]
+                    print(f"[srv] group FILE_META from={username} room={room} name={name} mime={mime} size={tot} md5={md5}")
+            elif text.startswith("FILE_BEGIN "):
+                toks = text.split(" ")
+                if len(toks) >= 4:
+                    name = " ".join(toks[1:-2])
+                    mime = toks[-2]
+                    try:
+                        tot = int(toks[-1])
+                    except Exception:
+                        tot = 0
+                    print(f"[srv] group FILE_BEGIN from={username} room={room} name={name} mime={mime} size={tot}")
+            elif text.startswith("FILE_CHUNK "):
+                toks = text.split(" ", 2)
+                if len(toks) >= 3:
+                    try:
+                        off = int(toks[1])
+                    except Exception:
+                        off = 0
+                    b64 = toks[2]
+                    print(f"[srv] group FILE_CHUNK from={username} room={room} off={off} len={len(b64)}")
+            elif text.startswith("FILE_END"):
+                print(f"[srv] group FILE_END from={username} room={room}")
+            elif text.startswith("FILE_HAVE "):
+                toks = text.split(" ", 3)
+                if len(toks) >= 4:
+                    md5 = toks[1]
+                    try:
+                        written = int(toks[2])
+                    except Exception:
+                        written = 0
+                    status = toks[3]
+                    print(f"[srv] group FILE_HAVE from={username} room={room} md5={md5} written={written} status={status}")
+            elif text.startswith("FILE_QUERY "):
+                toks = text.split(" ", 1)
+                md5 = toks[1] if len(toks) >= 2 else ""
+                print(f"[srv] group FILE_QUERY from={username} room={room} md5={md5}")
+            elif text.startswith("FILE_CANCEL "):
+                toks = text.split(" ", 1)
+                name = toks[1] if len(toks) >= 2 else ""
+                print(f"[srv] group FILE_CANCEL from={username} room={room} name={name}")
+            elif text.startswith("[FILE] "):
+                toks = text.split(" ")
+                if len(toks) >= 4:
+                    mime = toks[-2]
+                    b64 = toks[-1]
+                    name = " ".join(toks[1:-2])
+                    print(f"[srv] group INLINE_FILE from={username} room={room} name={name} mime={mime} len={len(b64)}")
         except Exception:
             pass
         msg = f"{username}> {text}\n".encode("utf-8")
@@ -178,7 +234,63 @@ class Hub:
 
     def send_dm(self, room: str, origin: socket.socket, origin_user: str, target_user: str, text: str):
         try:
-            print(f"send_dm {origin_user} -> {target_user}: len={len(text)} head={text[:80]}")
+            if text.startswith("FILE_META "):
+                toks = text.split(" ")
+                if len(toks) >= 5:
+                    name = " ".join(toks[1:-3])
+                    mime = toks[-3]
+                    try:
+                        tot = int(toks[-2])
+                    except Exception:
+                        tot = 0
+                    md5 = toks[-1]
+                    print(f"[srv] dm FILE_META from={origin_user} to={target_user} name={name} mime={mime} size={tot} md5={md5}")
+            elif text.startswith("FILE_BEGIN "):
+                toks = text.split(" ")
+                if len(toks) >= 4:
+                    name = " ".join(toks[1:-2])
+                    mime = toks[-2]
+                    try:
+                        tot = int(toks[-1])
+                    except Exception:
+                        tot = 0
+                    print(f"[srv] dm FILE_BEGIN from={origin_user} to={target_user} name={name} mime={mime} size={tot}")
+            elif text.startswith("FILE_CHUNK "):
+                toks = text.split(" ", 2)
+                if len(toks) >= 3:
+                    try:
+                        off = int(toks[1])
+                    except Exception:
+                        off = 0
+                    b64 = toks[2]
+                    print(f"[srv] dm FILE_CHUNK from={origin_user} to={target_user} off={off} len={len(b64)}")
+            elif text.startswith("FILE_END"):
+                print(f"[srv] dm FILE_END from={origin_user} to={target_user}")
+            elif text.startswith("FILE_HAVE "):
+                toks = text.split(" ", 3)
+                if len(toks) >= 4:
+                    md5 = toks[1]
+                    try:
+                        written = int(toks[2])
+                    except Exception:
+                        written = 0
+                    status = toks[3]
+                    print(f"[srv] dm FILE_HAVE from={origin_user} to={target_user} md5={md5} written={written} status={status}")
+            elif text.startswith("FILE_QUERY "):
+                toks = text.split(" ", 1)
+                md5 = toks[1] if len(toks) >= 2 else ""
+                print(f"[srv] dm FILE_QUERY from={origin_user} to={target_user} md5={md5}")
+            elif text.startswith("FILE_CANCEL "):
+                toks = text.split(" ", 1)
+                name = toks[1] if len(toks) >= 2 else ""
+                print(f"[srv] dm FILE_CANCEL from={origin_user} to={target_user} name={name}")
+            elif text.startswith("[FILE] "):
+                toks = text.split(" ")
+                if len(toks) >= 4:
+                    mime = toks[-2]
+                    b64 = toks[-1]
+                    name = " ".join(toks[1:-2])
+                    print(f"[srv] dm INLINE_FILE from={origin_user} to={target_user} name={name} mime={mime} len={len(b64)}")
         except Exception:
             pass
         targets = []

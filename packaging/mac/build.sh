@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="XiaoCaiChat"
 ICON_PNG="icons/ui/xiaocaichat.png"
 BUILD_DIR="packaging/mac/build"
+ENV_NAME="${ENV_NAME:-xiaocaichat}"
 
 mkdir -p "$BUILD_DIR"
 
@@ -24,8 +25,9 @@ done
 
 iconutil -c icns "$ICONSET" -o "$BUILD_DIR/xiaocaichat.icns"
 
-# Ensure PyInstaller and hooks are available and version-compatible
-python -m pip install -U --upgrade-strategy eager "pyinstaller>=6.17" "pyinstaller-hooks-contrib>=2025.10" >/dev/null 2>&1 || true
+conda run -n "$ENV_NAME" python -m pip install -U --upgrade-strategy eager "pyinstaller>=6.17" "pyinstaller-hooks-contrib>=2025.10" >/dev/null 2>&1 || true
+conda run -n "$ENV_NAME" python -m pip install -U --upgrade-strategy eager "PySide6>=6.7" >/dev/null 2>&1 || true
+conda run -n "$ENV_NAME" python -m pip install -U --upgrade-strategy eager "pyobjc-core" "pyobjc-framework-Cocoa" "pyobjc-framework-UserNotifications" >/dev/null 2>&1 || true
 
 # Build app
 ADD_DATA_ARGS=(--add-data "icons:icons" --add-data "themes:themes")
@@ -33,11 +35,19 @@ if [ -f client_config.json ]; then
   ADD_DATA_ARGS+=(--add-data "client_config.json:.")
 fi
 
-pyinstaller \
+conda run -n "$ENV_NAME" python -m PyInstaller \
   --noconfirm \
   --windowed \
   --name "$APP_NAME" \
   --icon "$BUILD_DIR/xiaocaichat.icns" \
+  --osx-bundle-identifier "com.xiaocai.chat" \
+  --hidden-import "Cocoa" \
+  --hidden-import "UserNotifications" \
+  --hidden-import "PySide6" \
+  --hidden-import "PySide6.QtCore" \
+  --hidden-import "PySide6.QtGui" \
+  --hidden-import "PySide6.QtWidgets" \
+  --hidden-import "shiboken6" \
   "${ADD_DATA_ARGS[@]}" \
   qt_chat_client.py
 

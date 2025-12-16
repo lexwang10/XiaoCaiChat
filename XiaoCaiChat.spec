@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[('icons', 'icons'), ('themes', 'themes')],
-    hiddenimports=[],
+    hiddenimports=['Cocoa', 'UserNotifications', 'PySide6', 'PySide6.QtCore', 'PySide6.QtGui', 'PySide6.QtWidgets', 'shiboken6'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -47,5 +47,5 @@ app = BUNDLE(
     coll,
     name='XiaoCaiChat.app',
     icon='packaging/mac/build/xiaocaichat.icns',
-    bundle_identifier=None,
+    bundle_identifier='com.xiaocai.chat',
 )
