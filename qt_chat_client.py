@@ -1,5 +1,6 @@
 import argparse
 import socket
+import subprocess
 from typing import Optional
 import os
 import sys
@@ -11,6 +12,7 @@ import hmac
 import hashlib
 import time
 import re
+import math
 import urllib.request
 import urllib.error
 
@@ -1684,6 +1686,491 @@ class MultiConnFileUploader(QtCore.QObject):
                     self._maybe_finalize_or_resend()
         except Exception:
             pass
+class ScreenshotEditDialog(QtWidgets.QDialog):
+    TOOL_PEN = 0
+    TOOL_RECT = 1
+    TOOL_CIRCLE = 2
+    TOOL_ARROW = 3
+
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("截图编辑")
+        
+        # Scale down if too large (70% of screen) to avoid huge windows
+        screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        max_w = int(screen.width() * 0.7)
+        max_h = int(screen.height() * 0.7)
+        if pixmap.width() > max_w or pixmap.height() > max_h:
+             self.pixmap = pixmap.scaled(max_w, max_h, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        else:
+             self.pixmap = pixmap
+             
+        # Undo history: stack of committed pixmaps
+        self.history = [self.pixmap.copy()]
+        
+        self.current_tool = self.TOOL_PEN
+        
+        # Setup UI
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        layout.setSpacing(0)
+        
+        self.image_label = QtWidgets.QLabel()
+        self.image_label.setPixmap(self.history[-1])
+        self.image_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.image_label.setMouseTracking(True)
+        self.image_label.installEventFilter(self)
+        
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidget(self.image_label)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setAlignment(QtCore.Qt.AlignCenter)
+        self.scroll.setStyleSheet("QScrollArea{border:none;background:#333;}")
+        
+        layout.addWidget(self.scroll, 1)
+        
+        # Toolbar
+        bar = QtWidgets.QWidget()
+        bar.setObjectName("ToolBar")
+        bar.setStyleSheet("""
+            #ToolBar { background: #eee; border-top: 1px solid #ccc; }
+            QPushButton { color: black; border: none; padding: 6px; border-radius: 4px; background: transparent; }
+            QPushButton:hover { background: #e0e0e0; }
+            QPushButton:checked { background: #d0d0d0; }
+            QPushButton:pressed { background: #c0c0c0; }
+        """)
+        hbox = QtWidgets.QHBoxLayout(bar)
+        hbox.setContentsMargins(10, 5, 10, 5)
+        
+        # Tools
+        self.btn_pen = QtWidgets.QPushButton("画笔")
+        self.btn_pen.setCheckable(True)
+        self.btn_pen.setChecked(True)
+        self.btn_pen.clicked.connect(lambda: self.set_tool(self.TOOL_PEN))
+        
+        self.btn_rect = QtWidgets.QPushButton("方框")
+        self.btn_rect.setCheckable(True)
+        self.btn_rect.clicked.connect(lambda: self.set_tool(self.TOOL_RECT))
+        
+        self.btn_circle = QtWidgets.QPushButton("圆圈")
+        self.btn_circle.setCheckable(True)
+        self.btn_circle.clicked.connect(lambda: self.set_tool(self.TOOL_CIRCLE))
+        
+        self.btn_arrow = QtWidgets.QPushButton("箭头")
+        self.btn_arrow.setCheckable(True)
+        self.btn_arrow.clicked.connect(lambda: self.set_tool(self.TOOL_ARROW))
+
+        self.btn_undo = QtWidgets.QPushButton("撤销")
+        self.btn_undo.clicked.connect(self.undo)
+        self.shortcut_undo = QtGui.QShortcut(QtGui.QKeySequence.Undo, self)
+        self.shortcut_undo.activated.connect(self.undo)
+        
+        hbox.addWidget(self.btn_pen)
+        hbox.addWidget(self.btn_rect)
+        hbox.addWidget(self.btn_circle)
+        hbox.addWidget(self.btn_arrow)
+        hbox.addWidget(self.btn_undo)
+        
+        hbox.addStretch(1)
+        
+        self.btn_cancel = QtWidgets.QPushButton("取消 (Esc)")
+        self.btn_cancel.clicked.connect(self.reject)
+        self.btn_ok = QtWidgets.QPushButton("确定 (Enter)")
+        self.btn_ok.clicked.connect(self.on_accept)
+        
+        hbox.addWidget(self.btn_cancel)
+        hbox.addWidget(self.btn_ok)
+        
+        layout.addWidget(bar)
+        
+        # Drawing state
+        self.drawing = False
+        self.start_pos = QtCore.QPoint()
+        self.last_pos = QtCore.QPoint()
+        self.active_shape = None # Stores {type, start, end, selected}
+        self.dragging_shape = False
+        self.resizing_shape = False
+        self.drag_start_pos = QtCore.QPoint()
+        self.shape_start_pos = QtCore.QPoint()
+        self.shape_end_pos = QtCore.QPoint()
+        self.shapes = []
+        self.active_index = None
+        self.pending_shape_start = None
+        self.drag_threshold = 5
+        self.pending_shape_start = None
+        self.drag_threshold = 5
+        
+        # Initial resize
+        screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        w = min(screen.width() - 100, self.pixmap.width() + 50)
+        h = min(screen.height() - 100, self.pixmap.height() + 100)
+        self.resize(w, h)
+
+    def set_tool(self, tool):
+        if self.active_shape:
+            self.commit_shape()
+        self.current_tool = tool
+        self.btn_pen.setChecked(tool == self.TOOL_PEN)
+        self.btn_rect.setChecked(tool == self.TOOL_RECT)
+        self.btn_circle.setChecked(tool == self.TOOL_CIRCLE)
+        self.btn_arrow.setChecked(tool == self.TOOL_ARROW)
+
+    def undo(self):
+        if self.active_shape:
+            self.active_shape = None
+            self.active_index = None
+            self.update_display()
+            return
+        if len(self.shapes) > 0:
+            self.shapes.pop()
+            self.update_display()
+            return
+        if len(self.history) > 1:
+            self.history.pop()
+            self.update_display()
+
+    def commit_shape(self):
+        if not self.active_shape:
+            return
+        
+        if self.active_index is not None:
+            self.shapes[self.active_index] = dict(self.active_shape)
+        else:
+            self.shapes.append(dict(self.active_shape))
+        self.active_shape = None
+        self.active_index = None
+        self.update_display()
+
+    def update_display(self):
+        pixmap = self.history[-1].copy()
+        if len(self.shapes) > 0:
+            painter = QtGui.QPainter(pixmap)
+            try:
+                painter.setPen(QtGui.QPen(QtCore.Qt.red, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+                for i, shp in enumerate(self.shapes):
+                    if self.active_index is not None and i == self.active_index:
+                        continue
+                    tool = shp['type']
+                    start = shp['start']
+                    end = shp['end']
+                    if tool == self.TOOL_RECT:
+                        rect = QtCore.QRect(start, end).normalized()
+                        painter.drawRect(rect)
+                    elif tool == self.TOOL_CIRCLE:
+                        rect = QtCore.QRect(start, end).normalized()
+                        painter.drawEllipse(rect)
+                    elif tool == self.TOOL_ARROW:
+                        self.draw_arrow(painter, start, end)
+            finally:
+                painter.end()
+        if self.active_shape:
+            painter = QtGui.QPainter(pixmap)
+            try:
+                painter.setPen(QtGui.QPen(QtCore.Qt.red, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+                
+                tool = self.active_shape['type']
+                start = self.active_shape['start']
+                end = self.active_shape['end']
+                
+                if tool == self.TOOL_RECT:
+                    rect = QtCore.QRect(start, end).normalized()
+                    painter.drawRect(rect)
+                    self.draw_handles(painter, rect)
+                elif tool == self.TOOL_CIRCLE:
+                    rect = QtCore.QRect(start, end).normalized()
+                    painter.drawEllipse(rect)
+                    self.draw_handles(painter, rect)
+                elif tool == self.TOOL_ARROW:
+                    self.draw_arrow(painter, start, end)
+                    painter.setBrush(QtCore.Qt.white)
+                    painter.setPen(QtCore.Qt.blue)
+                    painter.drawEllipse(start, 4, 4)
+                    painter.drawEllipse(end, 4, 4)
+            finally:
+                painter.end()
+        self.image_label.setPixmap(pixmap)
+
+    def _image_offset(self) -> QtCore.QPoint:
+        pm = self.history[-1]
+        w = self.image_label.width()
+        h = self.image_label.height()
+        dx = max(0, (w - pm.width()) // 2)
+        dy = max(0, (h - pm.height()) // 2)
+        return QtCore.QPoint(dx, dy)
+    
+    def _to_image_pos(self, pos: QtCore.QPoint) -> QtCore.QPoint:
+        off = self._image_offset()
+        return pos - off
+    
+    def _is_in_image(self, pos_img: QtCore.QPoint) -> bool:
+        pm = self.history[-1]
+        return 0 <= pos_img.x() < pm.width() and 0 <= pos_img.y() < pm.height()
+    
+    def _event_pos(self, event) -> QtCore.QPoint:
+        try:
+            return event.position().toPoint()
+        except Exception:
+            return event.pos()
+ 
+    def draw_handles(self, painter, rect):
+        painter.setBrush(QtCore.Qt.white)
+        painter.setPen(QtCore.Qt.blue)
+        r = 4
+        # Corners
+        painter.drawEllipse(rect.topLeft(), r, r)
+        painter.drawEllipse(rect.topRight(), r, r)
+        painter.drawEllipse(rect.bottomLeft(), r, r)
+        painter.drawEllipse(rect.bottomRight(), r, r)
+
+    def get_handle_at(self, pos):
+        if not self.active_shape:
+            return None
+        
+        tool = self.active_shape['type']
+        start = self.active_shape['start']
+        end = self.active_shape['end']
+        limit = 10
+        
+        if tool in (self.TOOL_RECT, self.TOOL_CIRCLE):
+            rect = QtCore.QRect(start, end).normalized()
+            tl = rect.topLeft()
+            tr = rect.topRight()
+            bl = rect.bottomLeft()
+            br = rect.bottomRight()
+            
+            if (pos - tl).manhattanLength() < limit: return 'tl'
+            if (pos - tr).manhattanLength() < limit: return 'tr'
+            if (pos - bl).manhattanLength() < limit: return 'bl'
+            if (pos - br).manhattanLength() < limit: return 'br'
+            if rect.contains(pos): return 'move'
+            
+        elif tool == self.TOOL_ARROW:
+            if (pos - start).manhattanLength() < limit: return 'start'
+            if (pos - end).manhattanLength() < limit: return 'end'
+            # Check if close to line for move
+            # Simplified: just bounding box for move
+            rect = QtCore.QRect(start, end).normalized()
+            if rect.contains(pos): return 'move'
+            
+        return None
+    
+    def get_handle_for(self, shape, pos):
+        tool = shape['type']
+        start = shape['start']
+        end = shape['end']
+        limit = 10
+        if tool in (self.TOOL_RECT, self.TOOL_CIRCLE):
+            rect = QtCore.QRect(start, end).normalized()
+            tl = rect.topLeft()
+            tr = rect.topRight()
+            bl = rect.bottomLeft()
+            br = rect.bottomRight()
+            if (pos - tl).manhattanLength() < limit: return 'tl'
+            if (pos - tr).manhattanLength() < limit: return 'tr'
+            if (pos - bl).manhattanLength() < limit: return 'bl'
+            if (pos - br).manhattanLength() < limit: return 'br'
+            if rect.contains(pos): return 'move'
+        elif tool == self.TOOL_ARROW:
+            if (pos - start).manhattanLength() < limit: return 'start'
+            if (pos - end).manhattanLength() < limit: return 'end'
+            rect = QtCore.QRect(start, end).normalized()
+            if rect.contains(pos): return 'move'
+        return None
+    
+    def find_shape_at(self, pos):
+        for i in range(len(self.shapes) - 1, -1, -1):
+            h = self.get_handle_for(self.shapes[i], pos)
+            if h:
+                return i, h
+        return None, None
+
+    def eventFilter(self, obj, event):
+        if obj == self.image_label:
+            if event.type() == QtCore.QEvent.MouseButtonPress:
+                if event.button() == QtCore.Qt.LeftButton:
+                    # Check if clicking on active shape handle
+                    pos_img = self._to_image_pos(self._event_pos(event))
+                    handle = self.get_handle_at(pos_img)
+                    
+                    if self.active_shape and handle:
+                        self.dragging_shape = (handle == 'move')
+                        self.resizing_shape = (handle != 'move')
+                        self.drag_handle = handle
+                        self.drag_start_pos = self._event_pos(event)
+                        self.drag_start_img_pos = pos_img
+                        self.shape_start_pos = self.active_shape['start']
+                        self.shape_end_pos = self.active_shape['end']
+                        return True
+                    
+                    if not self.active_shape:
+                        idx, h2 = self.find_shape_at(pos_img)
+                        if idx is not None and h2:
+                            self.active_index = idx
+                            self.active_shape = dict(self.shapes[idx])
+                            self.dragging_shape = (h2 == 'move')
+                            self.resizing_shape = (h2 != 'move')
+                            self.drag_handle = h2
+                            self.drag_start_pos = self._event_pos(event)
+                            self.drag_start_img_pos = pos_img
+                            self.shape_start_pos = self.active_shape['start']
+                            self.shape_end_pos = self.active_shape['end']
+                            self.update_display()
+                            return True
+                    
+                    # If clicking elsewhere, commit existing shape
+                    if self.active_shape:
+                        self.commit_shape()
+                    
+                    self.drawing = True
+                    self.start_pos = pos_img
+                    self.last_pos = pos_img
+                    
+                    if self.current_tool == self.TOOL_PEN:
+                         self.temp_pixmap = self.history[-1].copy()
+                    else:
+                        self.pending_shape_start = pos_img
+                    return True
+            
+            elif event.type() == QtCore.QEvent.MouseMove:
+                if self.dragging_shape or self.resizing_shape:
+                    pos_img = self._to_image_pos(self._event_pos(event))
+                    delta = pos_img - self.drag_start_img_pos
+                    
+                    if self.dragging_shape:
+                        self.active_shape['start'] = self.shape_start_pos + delta
+                        self.active_shape['end'] = self.shape_end_pos + delta
+                    elif self.resizing_shape:
+                        if self.active_shape['type'] == self.TOOL_ARROW:
+                            if self.drag_handle == 'start':
+                                self.active_shape['start'] = self.shape_start_pos + delta
+                            elif self.drag_handle == 'end':
+                                self.active_shape['end'] = self.shape_end_pos + delta
+                        else:
+                            r = QtCore.QRect(self.shape_start_pos, self.shape_end_pos).normalized()
+                            tl, tr, bl, br = r.topLeft(), r.topRight(), r.bottomLeft(), r.bottomRight()
+                            new_pos = self.drag_start_img_pos + delta
+                            if self.drag_handle == 'tl':
+                                anchor = br
+                            elif self.drag_handle == 'tr':
+                                anchor = bl
+                            elif self.drag_handle == 'bl':
+                                anchor = tr
+                            elif self.drag_handle == 'br':
+                                anchor = tl
+                            else:
+                                anchor = tl
+                            new_rect = QtCore.QRect(anchor, new_pos).normalized()
+                            self.active_shape['start'] = new_rect.topLeft()
+                            self.active_shape['end'] = new_rect.bottomRight()
+                    
+                    self.update_display()
+                    return True
+
+                if self.drawing:
+                    pos_img = self._to_image_pos(self._event_pos(event))
+                    if not self._is_in_image(pos_img):
+                        return True
+                    if self.current_tool == self.TOOL_PEN:
+                        if not hasattr(self, 'temp_pixmap'):
+                            self.temp_pixmap = self.history[-1].copy()
+                        painter = QtGui.QPainter(self.temp_pixmap)
+                        try:
+                            painter.setPen(QtGui.QPen(QtCore.Qt.red, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+                            painter.drawLine(self.last_pos, pos_img)
+                        finally:
+                            painter.end()
+                        self.last_pos = pos_img
+                        self.image_label.setPixmap(self.temp_pixmap)
+                    else:
+                        if self.active_shape is None:
+                            if (pos_img - (self.pending_shape_start or pos_img)).manhattanLength() >= self.drag_threshold:
+                                self.active_shape = {
+                                    'type': self.current_tool,
+                                    'start': self.pending_shape_start,
+                                    'end': pos_img
+                                }
+                                self.update_display()
+                        else:
+                            self.active_shape['end'] = pos_img
+                            self.update_display()
+                    return True
+                    
+                # Hover effect for handles
+                pos_img = self._to_image_pos(self._event_pos(event))
+                handle = None
+                if self._is_in_image(pos_img):
+                    if self.active_shape:
+                        handle = self.get_handle_at(pos_img)
+                    else:
+                        _, handle = self.find_shape_at(pos_img)
+                if handle:
+                    if handle == 'move':
+                        self.setCursor(QtCore.Qt.SizeAllCursor)
+                    elif handle in ('tl', 'br', 'start', 'end'):
+                        self.setCursor(QtCore.Qt.SizeFDiagCursor)
+                    elif handle in ('tr', 'bl'):
+                        self.setCursor(QtCore.Qt.SizeBDiagCursor)
+                else:
+                    self.setCursor(QtCore.Qt.ArrowCursor)
+                    
+            elif event.type() == QtCore.QEvent.MouseButtonRelease:
+                if event.button() == QtCore.Qt.LeftButton:
+                    if self.dragging_shape or self.resizing_shape:
+                        self.dragging_shape = False
+                        self.resizing_shape = False
+                        return True
+                        
+                    if self.drawing:
+                        self.drawing = False
+                        if self.current_tool == self.TOOL_PEN:
+                            if hasattr(self, 'temp_pixmap'):
+                                self.history.append(self.temp_pixmap)
+                        else:
+                            if self.active_shape is None:
+                                self.pending_shape_start = None
+                        return True
+        return super().eventFilter(obj, event)
+
+
+    def draw_arrow(self, painter, start, end):
+        painter.drawLine(start, end)
+        dx = end.x() - start.x()
+        dy = end.y() - start.y()
+        angle = math.atan2(dy, dx)
+        arrow_len = 15
+        arrow_angle = math.pi / 6
+        x1 = end.x() - arrow_len * math.cos(angle - arrow_angle)
+        y1 = end.y() - arrow_len * math.sin(angle - arrow_angle)
+        painter.drawLine(end, QtCore.QPoint(int(x1), int(y1)))
+        x2 = end.x() - arrow_len * math.cos(angle + arrow_angle)
+        y2 = end.y() - arrow_len * math.sin(angle + arrow_angle)
+        painter.drawLine(end, QtCore.QPoint(int(x2), int(y2)))
+
+    def on_accept(self):
+        if self.active_shape:
+            self.commit_shape()
+        pm = self.history[-1].copy()
+        if len(self.shapes) > 0:
+            painter = QtGui.QPainter(pm)
+            try:
+                painter.setPen(QtGui.QPen(QtCore.Qt.red, 3, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+                for shp in self.shapes:
+                    tool = shp['type']
+                    start = shp['start']
+                    end = shp['end']
+                    if tool == self.TOOL_RECT:
+                        rect = QtCore.QRect(start, end).normalized()
+                        painter.drawRect(rect)
+                    elif tool == self.TOOL_CIRCLE:
+                        rect = QtCore.QRect(start, end).normalized()
+                        painter.drawEllipse(rect)
+                    elif tool == self.TOOL_ARROW:
+                        self.draw_arrow(painter, start, end)
+            finally:
+                painter.end()
+        self.result_pixmap = pm
+        self.accept()
+
 class EmojiPicker(QtWidgets.QDialog):
     emojiSelected = QtCore.Signal(str)
 
@@ -1875,8 +2362,11 @@ class ChatWindow(QtWidgets.QWidget):
                     data = json.load(f) or {}
                 mb = int(data.get("max_upload_mb") or 40)
                 self.max_upload_bytes = int(max(1, mb)) * 1024 * 1024
+                self.screenshot_shortcut_seq = data.get("screenshot_shortcut", "Ctrl+Meta+S")
+            else:
+                self.screenshot_shortcut_seq = "Ctrl+Meta+S"
         except Exception:
-            pass
+            self.screenshot_shortcut_seq = "Ctrl+Meta+S"
         try:
             self.status_icon_online = QtGui.QPixmap(os.path.join(os.getcwd(), "icons", "ui", "online.png"))
         except Exception:
@@ -1926,6 +2416,11 @@ class ChatWindow(QtWidgets.QWidget):
             pass
         self.copy_shortcut = QtGui.QShortcut(QtGui.QKeySequence.Copy, self.view)
         self.copy_shortcut.activated.connect(self.copy_selected)
+        try:
+            self.screenshot_shortcut = QtGui.QShortcut(QtGui.QKeySequence(self.screenshot_shortcut_seq), self)
+            self.screenshot_shortcut.activated.connect(self.do_screenshot)
+        except Exception:
+            pass
         self.conv_list = QtWidgets.QListWidget()
         self.conv_list.setIconSize(QtCore.QSize(24, 24))
         try:
@@ -2098,7 +2593,22 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
             
+        self.btn_screenshot = QtWidgets.QPushButton()
+        try:
+            spath = os.path.join(os.getcwd(), "icons", "ui", "screenshot.png")
+            self.btn_screenshot.setIcon(QtGui.QIcon(spath))
+            self.btn_screenshot.setIconSize(QtCore.QSize(20, 20))
+            self.btn_screenshot.setFlat(True)
+            self.btn_screenshot.setFocusPolicy(QtCore.Qt.NoFocus)
+            self.btn_screenshot.setStyleSheet("QPushButton{border:none;background:transparent;}QPushButton:hover{background:transparent;}QPushButton:pressed{background:transparent;}")
+            self.btn_screenshot.setCursor(QtCore.Qt.PointingHandCursor)
+            self.btn_screenshot.setFixedSize(28, 28)
+            self.btn_screenshot.clicked.connect(self.do_screenshot)
+        except Exception:
+            pass
+            
         tb_layout.addWidget(self.btn_emoji)
+        tb_layout.addWidget(self.btn_screenshot)
         tb_layout.addStretch(1)
         
         input_layout.addWidget(input_toolbar)
@@ -3832,6 +4342,52 @@ class ChatWindow(QtWidgets.QWidget):
                     self._send_macos_notification(f"{name} ({room_title})", note_text)
                 except Exception:
                     pass
+
+    def do_screenshot(self):
+        try:
+            import tempfile
+            fd, path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            cmd = ["screencapture", "-i", "-x", path]
+            subprocess.run(cmd, check=False)
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                try:
+                    pm = QtGui.QPixmap(path)
+                    dlg = ScreenshotEditDialog(pm, self)
+                    if dlg.exec() == QtWidgets.QDialog.Accepted:
+                        final_pm = dlg.result_pixmap
+                        buf = QtCore.QBuffer()
+                        buf.open(QtCore.QIODevice.WriteOnly)
+                        final_pm.save(buf, "PNG")
+                        data = bytes(buf.data())
+                        
+                        try:
+                            if hasattr(self, "entry") and self.entry:
+                                self.entry._insert_preview_datauri(data, "image/png")
+                        except Exception:
+                            pass
+                        name = f"screenshot_{int(time.time())}.png"
+                        try:
+                            self._on_image_pasted(data, None, "image/png", name)
+                        except Exception:
+                            try:
+                                self.entry.imagePasted.emit(data, None, "image/png", name)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            else:
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def show_emoji_picker(self):
         try:
@@ -5797,11 +6353,18 @@ class ChatWindow(QtWidgets.QWidget):
             self.max_upload_mb_spin.setValue(int(max(1, cur_mb)))
         except Exception:
             pass
+        self.shortcut_edit = QtWidgets.QLineEdit()
+        try:
+            self.shortcut_edit.setPlaceholderText("Ctrl+Meta+S")
+            self.shortcut_edit.setText(getattr(self, "screenshot_shortcut_seq", "Ctrl+Meta+S"))
+        except Exception:
+            pass
         apply_btn = QtWidgets.QPushButton("保存")
         clear_btn = QtWidgets.QPushButton("清除缓存")
         form.addRow("服务器 IP", self.host_edit)
         form.addRow("端口", self.port_edit)
         form.addRow("最大发送大小 (MB)", self.max_upload_mb_spin)
+        form.addRow("截图快捷键", self.shortcut_edit)
         v.addLayout(form)
         # 移除状态未连接提示
         h = QtWidgets.QHBoxLayout()
@@ -5823,6 +6386,14 @@ class ChatWindow(QtWidgets.QWidget):
                 except Exception:
                     pass
                 try:
+                    sc = self.shortcut_edit.text().strip()
+                    if sc:
+                        self.screenshot_shortcut_seq = sc
+                        if hasattr(self, "screenshot_shortcut"):
+                            self.screenshot_shortcut.setKey(QtGui.QKeySequence(sc))
+                except Exception:
+                    pass
+                try:
                     cfg_path = os.path.expanduser("~/Library/Application Support/XiaoCaiChat/client_config.json")
                     data = {}
                     if os.path.isfile(cfg_path):
@@ -5832,6 +6403,7 @@ class ChatWindow(QtWidgets.QWidget):
                             except Exception:
                                 data = {}
                     data["max_upload_mb"] = int(max(1, self.max_upload_bytes // (1024 * 1024)))
+                    data["screenshot_shortcut"] = getattr(self, "screenshot_shortcut_seq", "Ctrl+Meta+S")
                     with open(cfg_path, "w", encoding="utf-8") as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
                 except Exception:
