@@ -2698,6 +2698,21 @@ class ChatWindow(QtWidgets.QWidget):
             self.status_bar.setStyleSheet("QFrame{border-top:1px solid #e0e0e0;}")
         except Exception:
             pass
+        try:
+            self.menu_bar = QtWidgets.QMenuBar(self)
+            try:
+                self.menu_bar.setNativeMenuBar(True)
+            except Exception:
+                pass
+            app_menu = self.menu_bar.addMenu("XiaoCaiChat")
+            about_act = app_menu.addAction("About XiaoCaiChat")
+            try:
+                about_act.setMenuRole(QtGui.QAction.AboutRole)
+            except Exception:
+                pass
+            about_act.triggered.connect(self.on_about_clicked)
+        except Exception:
+            pass
         sbot = QtWidgets.QHBoxLayout()
         try:
             sbot.setContentsMargins(8, 4, 8, 4)
@@ -2719,6 +2734,10 @@ class ChatWindow(QtWidgets.QWidget):
         try:
             root.setContentsMargins(0, 0, 0, 0)
             root.setSpacing(0)
+        except Exception:
+            pass
+        try:
+            root.setMenuBar(self.menu_bar)
         except Exception:
             pass
         root.addLayout(layout, 1)
@@ -7119,6 +7138,45 @@ class ChatWindow(QtWidgets.QWidget):
         try:
             e.ignore()
             self.hide()
+        except Exception:
+            pass
+    
+    def on_about_clicked(self):
+        try:
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("About XiaoCaiChat")
+            v = QtWidgets.QVBoxLayout()
+            try:
+                v.setContentsMargins(24, 24, 24, 24)
+                v.setSpacing(12)
+            except Exception:
+                pass
+            icon_label = QtWidgets.QLabel()
+            try:
+                pm = QtGui.QPixmap(os.path.join(os.getcwd(), "icons", "ui", "xiaocaichat.png"))
+                if not pm.isNull():
+                    pm = pm.scaled(128, 128, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+                    icon_label.setPixmap(pm)
+            except Exception:
+                pass
+            try:
+                icon_label.setAlignment(QtCore.Qt.AlignCenter)
+            except Exception:
+                pass
+            info = f"XiaoCaiChat 版本 {APP_VERSION}\n作者：LexWang\n版权所有 © 2025 Sai Yeung Choi Technology"
+            info_label = QtWidgets.QLabel(info)
+            try:
+                info_label.setAlignment(QtCore.Qt.AlignCenter)
+            except Exception:
+                pass
+            v.addWidget(icon_label, 0, QtCore.Qt.AlignCenter)
+            v.addWidget(info_label, 0, QtCore.Qt.AlignCenter)
+            dlg.setLayout(v)
+            try:
+                dlg.setModal(True)
+            except Exception:
+                pass
+            dlg.exec()
         except Exception:
             pass
 
