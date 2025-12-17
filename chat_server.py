@@ -358,6 +358,8 @@ except Exception:
     pass
 CONFIG_JSON = os.path.join(_data_dir, "config.json")
 SERVER_CONFIG = {"retention_days": 7}
+USERS_JSON = os.path.join(_data_dir, "users.json")
+REGISTERED_USERS = set()
 
 def _load_config():
     try:
@@ -388,6 +390,25 @@ db.execute(
     "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conv TEXT, sender TEXT, ts INTEGER, text TEXT)"
 )
 db.commit()
+def _load_users():
+    global REGISTERED_USERS
+    try:
+        if os.path.isfile(USERS_JSON):
+            with open(USERS_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            users = data.get("users") or []
+            REGISTERED_USERS = set([str(u) for u in users if isinstance(u, str)])
+        else:
+            REGISTERED_USERS = set()
+    except Exception:
+        REGISTERED_USERS = set()
+def _save_users():
+    try:
+        data = {"users": sorted(list(REGISTERED_USERS))}
+        with open(USERS_JSON, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 def conv_group(room: str):
     return f"group:{room}"
@@ -444,6 +465,11 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
     f = conn.makefile("r", encoding="utf-8", newline="\n")
     username = addr[0]
     room = "世界"
+    if not REGISTERED_USERS:
+        try:
+            _load_users()
+        except Exception:
+            pass
     def parse_dm(line: str):
         s = line.strip()
         if not s:
@@ -556,6 +582,23 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
         return None
     try:
         first = f.readline()
+        if first.startswith("NAME_CHECK "):
+            parts = first.strip().split()
+            r = parts[1] if len(parts) >= 2 else room
+            u = parts[2] if len(parts) >= 3 else username
+            taken = (u in REGISTERED_USERS)
+            try:
+                if taken:
+                    conn.sendall(f"[SYS] NAME_TAKEN {r} {u}\n".encode("utf-8"))
+                else:
+                    conn.sendall(f"[SYS] NAME_OK {r} {u}\n".encode("utf-8"))
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
         if first.startswith("HELLO "):
             parts = first.strip().split()
             if len(parts) >= 3:
@@ -563,12 +606,44 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                 room = parts[2] or "世界"
             else:
                 username = first[len("HELLO ") :].rstrip("\n") or addr[0]
+            if username in hub.users(room):
+                try:
+                    conn.sendall(f"[SYS] NAME_TAKEN {room} {username}\n".encode("utf-8"))
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+            if username not in REGISTERED_USERS:
+                try:
+                    REGISTERED_USERS.add(username)
+                    _save_users()
+                except Exception:
+                    pass
             hub.add(conn, username, room)
             print(f"joined {username}@{addr[0]}:{addr[1]} room={room}")
             if len(parts) >= 4 and parts[3]:
                 hub.set_avatar(room, username, parts[3])
         else:
             text = first.rstrip("\n")
+            if username in hub.users(room):
+                try:
+                    conn.sendall(f"[SYS] NAME_TAKEN {room} {username}\n".encode("utf-8"))
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+            if username not in REGISTERED_USERS:
+                try:
+                    REGISTERED_USERS.add(username)
+                    _save_users()
+                except Exception:
+                    pass
             hub.add(conn, username, room)
             print(f"joined {username}@{addr[0]}:{addr[1]} room={room}")
             if text:

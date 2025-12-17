@@ -7342,10 +7342,49 @@ def main():
                 listw.addItem(it)
     except Exception:
         pass
-    btn_ok.clicked.connect(dlg.accept)
+    def on_ok():
+        try:
+            sel = prof_list.selectedItems()
+            if sel:
+                dlg.accept()
+                return
+            login_stack.setCurrentIndex(1)
+            name = name_edit.text().strip()
+            if not name:
+                QtWidgets.QMessageBox.warning(None, "提示", "请输入用户名")
+                try:
+                    name_edit.setFocus()
+                except Exception:
+                    pass
+                return
+            try:
+                if name in (profiles or {}):
+                    QtWidgets.QMessageBox.warning(None, "提示", "该用户名已存在（本机），请更换")
+                    try:
+                        name_edit.setFocus()
+                    except Exception:
+                        pass
+                    return
+            except Exception:
+                pass
+            host, port, room, _theme_cfg = _load_client_config(args.config)
+            if not _check_username_available(host, port, room, name):
+                QtWidgets.QMessageBox.warning(None, "提示", "用户名已存在，请更换")
+                try:
+                    name_edit.setFocus()
+                except Exception:
+                    pass
+                return
+            dlg.accept()
+        except Exception:
+            try:
+                dlg.accept()
+            except Exception:
+                pass
+    btn_ok.clicked.connect(on_ok)
     btn_cancel.clicked.connect(dlg.reject)
-    listw.itemDoubleClicked.connect(lambda *_: dlg.accept())
-    prof_list.itemDoubleClicked.connect(lambda *_: dlg.accept())
+    listw.itemDoubleClicked.connect(lambda *_: on_ok())
+    prof_list.itemDoubleClicked.connect(lambda *_: on_ok())
     prof_list.itemClicked.connect(lambda it: name_edit.setText(it.text()))
     def do_new_user():
         try:
@@ -7371,13 +7410,12 @@ def main():
         pitem = sel[0]
         name = pitem.text().strip() or args.username
         avatar = pitem.data(QtCore.Qt.UserRole)
+        is_new_user = False
     else:
         name = name_edit.text().strip()
-        if not name:
-            QtWidgets.QMessageBox.warning(None, "提示", "请输入用户名")
-            return
         it = listw.currentItem()
         avatar = it.data(QtCore.Qt.UserRole) if it else None
+        is_new_user = True
     try:
         _save_profile(args.log_dir, name, os.path.basename(avatar) if avatar else None)
     except Exception:
@@ -7438,6 +7476,52 @@ def _save_profile(base_dir: str, username: str, avatar_filename: Optional[str]):
             json.dump(d, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+def _check_username_available(host: str, port: int, room: str, username: str) -> bool:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.settimeout(2.0)
+        except Exception:
+            pass
+        try:
+            s.connect((host, port))
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+            return True
+        try:
+            s.sendall(f"NAME_CHECK {room} {username}\n".encode("utf-8"))
+        except Exception:
+            try:
+                s.close()
+            except Exception:
+                pass
+            return True
+        f = None
+        try:
+            f = s.makefile("r", encoding="utf-8", newline="\n")
+            line = f.readline()
+        except Exception:
+            line = ""
+        ok = True
+        if line.startswith("[SYS] NAME_TAKEN"):
+            ok = False
+        elif line.startswith("[SYS] NAME_OK"):
+            ok = True
+        try:
+            if f:
+                f.close()
+        except Exception:
+            pass
+        try:
+            s.close()
+        except Exception:
+            pass
+        return ok
+    except Exception:
+        return True
 
 def _apply_theme(app: QtWidgets.QApplication, name: str):
     base = os.path.join(os.getcwd(), "themes", f"{name}.qss")
