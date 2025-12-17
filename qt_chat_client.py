@@ -479,11 +479,17 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             painter.restore()
             return
         maxw = int(r.width() * 0.65)
-        fm = option.fontMetrics
+        fdoc = QtGui.QFont(option.font)
+        try:
+            base_ps = int(fdoc.pointSize()) if fdoc.pointSize() > 0 else 14
+            fdoc.setPointSize(base_ps + 2)
+        except Exception:
+            pass
+        fm = QtGui.QFontMetrics(fdoc)
         doc = QtGui.QTextDocument()
         opt = QtGui.QTextOption()
         opt.setWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
-        doc.setDefaultFont(option.font)
+        doc.setDefaultFont(fdoc)
         doc.setDefaultTextOption(opt)
         doc.setDocumentMargin(0)
         w0 = fm.horizontalAdvance(text)
@@ -492,21 +498,37 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         try:
             import html as _html
             s = text or ""
+            base_sz = option.font.pointSize()
+            if base_sz is None or base_sz <= 0:
+                base_sz = 14
+            big_sz = int(base_sz) + 8
+            def _emoji_html(seg: str) -> str:
+                try:
+                    pat_emoji = re.compile(r'([\u2600-\u27BF\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FAFF](?:\uFE0F)?(?:\u200D[\u2600-\u27BF\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FAFF](?:\uFE0F)?)*)')
+                    out = []
+                    pos = 0
+                    for m in pat_emoji.finditer(seg):
+                        out.append(_html.escape(seg[pos:m.start()]))
+                        out.append("<span style='font-size:{}pt;line-height:1.0em'>".format(big_sz) + _html.escape(m.group(0)) + "</span>")
+                        pos = m.end()
+                    out.append(_html.escape(seg[pos:]))
+                    return "".join(out)
+                except Exception:
+                    return _html.escape(seg)
             if kw:
                 pat = re.compile(re.escape(str(kw)), re.IGNORECASE)
                 parts = []
                 last = 0
                 for m in pat.finditer(s):
-                    parts.append(_html.escape(s[last:m.start()]))
+                    parts.append(_emoji_html(s[last:m.start()]))
                     parts.append("<span style='background:#fff59d'>" + _html.escape(m.group(0)) + "</span>")
                     last = m.end()
-                parts.append(_html.escape(s[last:]))
-                html_text = "".join(parts)
-                doc.setHtml(html_text)
+                parts.append(_emoji_html(s[last:]))
+                doc.setHtml("".join(parts))
             else:
-                doc.setPlainText(s)
+                doc.setHtml(_emoji_html(s))
         except Exception:
-            doc.setPlainText(text or "")
+            doc.setHtml(text or "")
         pad = 12
         bubble_w = int(text_w) + pad * 2
         bubble_h = int(doc.size().height()) + pad * 2
@@ -590,7 +612,13 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             h = chip_h + spacing
             h = max(h, avatar_block)
             return QtCore.QSize(option.rect.width(), h)
-        fm = option.fontMetrics
+        fdoc = QtGui.QFont(option.font)
+        try:
+            base_ps2 = int(fdoc.pointSize()) if fdoc.pointSize() > 0 else 14
+            fdoc.setPointSize(base_ps2 + 2)
+        except Exception:
+            pass
+        fm = QtGui.QFontMetrics(fdoc)
         try:
             vw = option.rect.width() if option.rect.width() > 0 else (option.widget.viewport().width() if option.widget else 0)
         except Exception:
@@ -599,13 +627,35 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         doc = QtGui.QTextDocument()
         opt = QtGui.QTextOption()
         opt.setWrapMode(QtGui.QTextOption.WordWrap)
-        doc.setDefaultFont(option.font)
+        doc.setDefaultFont(fdoc)
         doc.setDefaultTextOption(opt)
         doc.setDocumentMargin(0)
         w0 = fm.horizontalAdvance(text)
         text_w = min(w0, maxw)
         doc.setTextWidth(text_w)
-        doc.setPlainText(text)
+        try:
+            import html as _html
+            s2 = text or ""
+            base_sz2 = option.font.pointSize()
+            if base_sz2 is None or base_sz2 <= 0:
+                base_sz2 = 14
+            big_sz2 = int(base_sz2) + 8
+            def _emoji_html2(seg: str) -> str:
+                try:
+                    pat_emoji2 = re.compile(r'([\u2600-\u27BF\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FAFF](?:\uFE0F)?(?:\u200D[\u2600-\u27BF\U0001F300-\U0001F6FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FAFF](?:\uFE0F)?)*)')
+                    out2 = []
+                    pos2 = 0
+                    for m2 in pat_emoji2.finditer(seg):
+                        out2.append(_html.escape(seg[pos2:m2.start()]))
+                        out2.append("<span style='font-size:{}pt;line-height:1.0em'>".format(big_sz2) + _html.escape(m2.group(0)) + "</span>")
+                        pos2 = m2.end()
+                    out2.append(_html.escape(seg[pos2:]))
+                    return "".join(out2)
+                except Exception:
+                    return _html.escape(seg)
+            doc.setHtml(_emoji_html2(s2))
+        except Exception:
+            doc.setHtml(text or "")
         is_self = bool(index.data(ChatModel.SelfRole))
         pad = 12
         bubble_h = int(doc.size().height()) + pad * 2
@@ -1634,6 +1684,133 @@ class MultiConnFileUploader(QtCore.QObject):
                     self._maybe_finalize_or_resend()
         except Exception:
             pass
+class EmojiPicker(QtWidgets.QDialog):
+    emojiSelected = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(QtCore.Qt.Popup | QtCore.Qt.FramelessWindowHint)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        try:
+            self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        except Exception:
+            pass
+        layout = QtWidgets.QVBoxLayout(self)
+        try:
+            layout.setContentsMargins(0, 0, 0, 0)
+        except Exception:
+            pass
+        
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        
+        container = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(container)
+        try:
+            grid.setSpacing(4)
+            grid.setContentsMargins(8, 8, 8, 8)
+        except Exception:
+            pass
+        
+        emoji_dir = os.path.join(os.getcwd(), "icons", "emoji")
+        files = []
+        if os.path.exists(emoji_dir):
+            try:
+                files = sorted([f for f in os.listdir(emoji_dir) if f.endswith(".png")])
+            except Exception:
+                files = []
+            
+        row = 0
+        col = 0
+        max_cols = 8
+        
+        for fname in files:
+            path = os.path.join(emoji_dir, fname)
+            btn = QtWidgets.QPushButton()
+            btn.setFixedSize(32, 32)
+            btn.setIcon(QtGui.QIcon(path))
+            btn.setIconSize(QtCore.QSize(24, 24))
+            btn.setFlat(True)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            
+            # Parse unicode
+            try:
+                base = os.path.splitext(fname)[0]
+                parts = base.split("-")
+                chars = "".join([chr(int(p, 16)) for p in parts])
+                btn.clicked.connect(lambda checked=False, c=chars: self._on_click(c))
+                btn.setToolTip(chars)
+            except Exception:
+                continue
+                
+            grid.addWidget(btn, row, col)
+            col += 1
+            if col >= max_cols:
+                col = 0
+                row += 1
+                
+        scroll.setWidget(container)
+        layout.addWidget(scroll)
+        
+        # Calculate size
+        rows = row + (1 if col > 0 else 0)
+        h = min(300, max(100, rows * 36 + 20))
+        w = max_cols * 36 + 30
+        self.setFixedSize(w, h)
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app:
+                app.installEventFilter(self)
+        except Exception:
+            pass
+        
+    def _on_click(self, char):
+        self.emojiSelected.emit(char)
+        self.accept()
+    
+    def focusOutEvent(self, e: QtGui.QFocusEvent):
+        try:
+            self.close()
+        except Exception:
+            pass
+        try:
+            super().focusOutEvent(e)
+        except Exception:
+            pass
+    
+    def eventFilter(self, obj, event):
+        try:
+            if event.type() == QtCore.QEvent.MouseButtonPress:
+                gp = None
+                try:
+                    gp = event.globalPosition().toPoint()
+                except Exception:
+                    try:
+                        gp = event.globalPos()
+                    except Exception:
+                        gp = None
+                if gp is not None:
+                    p = self.mapFromGlobal(gp)
+                    if not self.rect().contains(p):
+                        self.close()
+                        return True
+        except Exception:
+            pass
+        return False
+    
+    def closeEvent(self, e: QtGui.QCloseEvent):
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app:
+                app.removeEventFilter(self)
+        except Exception:
+            pass
+        try:
+            super().closeEvent(e)
+        except Exception:
+            pass
+
 class ChatWindow(QtWidgets.QWidget):
     def __init__(self, host: str, port: int, username: str, log_dir: str, room: str, avatar_path: Optional[str] = None):
         super().__init__()
@@ -1810,6 +1987,13 @@ class ChatWindow(QtWidgets.QWidget):
             self.entry.setMinimumHeight(100)
         except Exception:
             pass
+        try:
+            f = self.entry.font()
+            ps = int(f.pointSize()) if f.pointSize() > 0 else 14
+            f.setPointSize(ps + 1)
+            self.entry.setFont(f)
+        except Exception:
+            pass
         self.pending_image_bytes = None
         self.pending_image_mime = None
         self.pending_image_name = None
@@ -1878,7 +2062,49 @@ class ChatWindow(QtWidgets.QWidget):
         
         splitter_chat = ChatSplitter(QtCore.Qt.Vertical)
         splitter_chat.addWidget(self.view)
-        splitter_chat.addWidget(self.entry)
+        
+        # Input container with toolbar
+        input_container = QtWidgets.QWidget()
+        input_layout = QtWidgets.QVBoxLayout(input_container)
+        try:
+            input_layout.setContentsMargins(0, 0, 0, 0)
+            input_layout.setSpacing(0)
+        except Exception:
+            pass
+            
+        input_toolbar = QtWidgets.QWidget()
+        try:
+            input_toolbar.setStyleSheet("background-color: #f5f5f5; border-top: 1px solid #e0e0e0;")
+        except Exception:
+            pass
+        tb_layout = QtWidgets.QHBoxLayout(input_toolbar)
+        try:
+            tb_layout.setContentsMargins(4, 2, 4, 2)
+            tb_layout.setSpacing(8)
+        except Exception:
+            pass
+            
+        self.btn_emoji = QtWidgets.QPushButton()
+        try:
+            epath = os.path.join(os.getcwd(), "icons", "ui", "emoji.png")
+            self.btn_emoji.setIcon(QtGui.QIcon(epath))
+            self.btn_emoji.setIconSize(QtCore.QSize(20, 20))
+            self.btn_emoji.setFlat(True)
+            self.btn_emoji.setFocusPolicy(QtCore.Qt.NoFocus)
+            self.btn_emoji.setStyleSheet("QPushButton{border:none;background:transparent;}QPushButton:hover{background:transparent;}QPushButton:pressed{background:transparent;}")
+            self.btn_emoji.setCursor(QtCore.Qt.PointingHandCursor)
+            self.btn_emoji.setFixedSize(28, 28)
+            self.btn_emoji.clicked.connect(self.show_emoji_picker)
+        except Exception:
+            pass
+            
+        tb_layout.addWidget(self.btn_emoji)
+        tb_layout.addStretch(1)
+        
+        input_layout.addWidget(input_toolbar)
+        input_layout.addWidget(self.entry)
+        
+        splitter_chat.addWidget(input_container)
         splitter_chat.setStretchFactor(0, 1)
         splitter_chat.setStretchFactor(1, 0)
         splitter_chat.setHandleWidth(1)
@@ -3606,6 +3832,24 @@ class ChatWindow(QtWidgets.QWidget):
                     self._send_macos_notification(f"{name} ({room_title})", note_text)
                 except Exception:
                     pass
+
+    def show_emoji_picker(self):
+        try:
+            picker = EmojiPicker(self)
+            picker.emojiSelected.connect(self.insert_emoji)
+            
+            p = self.btn_emoji.mapToGlobal(QtCore.QPoint(0, 0))
+            picker.move(p.x(), p.y() - picker.height() - 5)
+            picker.show()
+        except Exception:
+            pass
+            
+    def insert_emoji(self, char):
+        try:
+            self.entry.textCursor().insertText(char)
+            self.entry.setFocus()
+        except Exception:
+            pass
 
     def on_send(self):
         if not self.current_conv:
