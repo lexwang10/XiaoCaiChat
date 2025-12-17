@@ -23,10 +23,10 @@ done
 
 iconutil -c icns "$ICONSET" -o "$BUILD_DIR/server.icns"
 
-conda install -n xiaocai -c conda-forge -y pyobjc-core pyobjc-framework-Cocoa >/dev/null 2>&1 || true
+conda install -n xiaocaichat -c conda-forge -y pyobjc-core pyobjc-framework-Cocoa >/dev/null 2>&1 || true
 
-PYENV_PY="/opt/anaconda3/envs/xiaocai/bin/python"
-"$PYENV_PY" -m pip show pyinstaller >/dev/null 2>&1 || conda install -n xiaocai -c conda-forge -y pyinstaller
+PYENV_PY="/opt/anaconda3/envs/xiaocaichat/bin/python"
+"$PYENV_PY" -m pip show pyinstaller >/dev/null 2>&1 || conda install -n xiaocaichat -c conda-forge -y pyinstaller
 
 ADD_DATA_ARGS=(--add-data "icons:icons")
 "$PYENV_PY" -m PyInstaller \

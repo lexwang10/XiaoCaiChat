@@ -356,6 +356,27 @@ try:
     os.makedirs(_data_dir, exist_ok=True)
 except Exception:
     pass
+CONFIG_JSON = os.path.join(_data_dir, "config.json")
+SERVER_CONFIG = {"retention_days": 7}
+
+def _load_config():
+    try:
+        if os.path.isfile(CONFIG_JSON):
+            with open(CONFIG_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                SERVER_CONFIG.update(data)
+    except Exception:
+        pass
+
+def _save_config():
+    try:
+        with open(CONFIG_JSON, "w", encoding="utf-8") as f:
+            json.dump(SERVER_CONFIG, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+_load_config()
+
 FILES_DIR = os.path.join(_data_dir, "files")
 try:
     os.makedirs(FILES_DIR, exist_ok=True)
@@ -824,40 +845,83 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
         print(f"left {username}@{addr[0]}:{addr[1]} room={room}")
 
 
+def _cleanup_files_loop():
+    while True:
+        try:
+            if os.path.isdir(FILES_DIR):
+                now = time.time()
+                days = SERVER_CONFIG.get("retention_days", 7)
+                limit = days * 24 * 3600
+                for f in os.listdir(FILES_DIR):
+                    p = os.path.join(FILES_DIR, f)
+                    if os.path.isfile(p):
+                        try:
+                            if now - os.path.getmtime(p) > limit:
+                                os.remove(p)
+                                print(f"[SYS] Removed old file {f}")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        time.sleep(24 * 3600)
+
+
 def start_server(host: str, port: int):
     hub = Hub()
+    threading.Thread(target=_cleanup_files_loop, daemon=True).start()
     try:
         if ThreadingHTTPServer and BaseHTTPRequestHandler:
             def start_status_server():
                 class H(BaseHTTPRequestHandler):
+                    def _get_file_info(self):
+                        try:
+                            p = self.path.split("?", 1)[0]
+                            if not p.startswith("/files/"):
+                                return None, None, None
+                            fid = p.split("/", 2)[2]
+                            if not fid:
+                                return None, None, None
+                            for entry in os.listdir(FILES_DIR):
+                                if entry.startswith(str(fid) + "__"):
+                                    fname = entry.split("__", 1)[1]
+                                    fpath = os.path.join(FILES_DIR, entry)
+                                    return fid, fname, fpath
+                        except Exception:
+                            pass
+                        return None, None, None
+
+                    def do_HEAD(self):
+                        try:
+                            p = self.path.split("?", 1)[0]
+                            if p.startswith("/files/"):
+                                fid, fname, fpath = self._get_file_info()
+                                if not (fname and fpath and os.path.isfile(fpath)):
+                                    self.send_response(404)
+                                    self.end_headers()
+                                    return
+                                try:
+                                    sz = os.path.getsize(fpath)
+                                except Exception:
+                                    sz = 0
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/octet-stream")
+                                self.send_header("Content-Length", str(sz))
+                                try:
+                                    self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                                except Exception:
+                                    pass
+                                self.end_headers()
+                                return
+                            self.send_response(404)
+                            self.end_headers()
+                        except Exception:
+                            pass
+
                     def do_GET(self):
                         try:
                             p = self.path.split("?", 1)[0]
                             if p.startswith("/files/"):
-                                fid = None
-                                try:
-                                    fid = p.split("/", 2)[2]
-                                except Exception:
-                                    fid = None
-                                if not fid:
-                                    try:
-                                        print(f"[HTTP] GET /files - missing fid path={self.path}")
-                                    except Exception:
-                                        pass
-                                    self.send_response(404)
-                                    self.end_headers()
-                                    return
-                                fname = None
-                                fpath = None
-                                try:
-                                    for entry in os.listdir(FILES_DIR):
-                                        if entry.startswith(str(fid) + "__"):
-                                            fname = entry.split("__", 1)[1]
-                                            fpath = os.path.join(FILES_DIR, entry)
-                                            break
-                                except Exception:
-                                    fname = None
-                                    fpath = None
+                                fid, fname, fpath = self._get_file_info()
                                 if not (fname and fpath and os.path.isfile(fpath)):
                                     try:
                                         print(f"[HTTP] GET /files - not found fid={fid}")
@@ -908,6 +972,7 @@ def start_server(host: str, port: int):
                                         "</head><body>",
                                         "<h1>群聊后台管理</h1>",
                                         "<form method=\"post\" action=\"/api/quit\"><button type=\"submit\">关闭服务器</button></form>",
+                                        f"<form method=\"post\" action=\"/api/set_retention\" style=\"border:1px solid #ddd;padding:10px;margin:10px 0;max_width:300px\"><div><b>系统设置</b></div><div style=\"margin-top:8px\"><label>文件保留天数: <input name=\"days\" type=\"number\" value=\"{SERVER_CONFIG.get('retention_days', 7)}\" style=\"width:60px\"></label> <button type=\"submit\">保存</button></div></form>",
                                         "<form method=\"post\" action=\"/api/add_room\"><input name=\"room\" placeholder=\"新房间ID\"><button type=\"submit\">添加房间</button></form>",
                                         "<table><tr><th>房间ID</th><th>显示名称</th><th>在线用户</th><th>操作</th></tr>"]
                                 for r in rooms:
@@ -1181,6 +1246,19 @@ def start_server(host: str, port: int):
                                         hub._save_rooms()
                                     except Exception:
                                         pass
+                                self.send_response(302)
+                                self.send_header("Location", "/")
+                                self.end_headers()
+                                return
+                            if p == "/api/set_retention":
+                                form = self._read_form()
+                                try:
+                                    days = int(form.get("days") or "7")
+                                    if days < 1: days = 1
+                                    SERVER_CONFIG["retention_days"] = days
+                                    _save_config()
+                                except Exception:
+                                    pass
                                 self.send_response(302)
                                 self.send_header("Location", "/")
                                 self.end_headers()

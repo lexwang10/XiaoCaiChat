@@ -1659,6 +1659,7 @@ class ChatWindow(QtWidgets.QWidget):
                 self.avatar_pixmap = None
                 self.avatar_filename = None
         self.peer_avatars = {}
+        self.avatar_file_map = {}
         self.rooms_info = []
         self.room_name_map = {}
         self.socks = {}
@@ -1677,6 +1678,17 @@ class ChatWindow(QtWidgets.QWidget):
             app = QtWidgets.QApplication.instance()
             if app:
                 app.aboutToQuit.connect(self._on_app_quit)
+        except Exception:
+            pass
+        try:
+            d = os.path.join(self.logger.log_dir, "avatars")
+            p = os.path.join(d, "avatar_map.json")
+            if os.path.isfile(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    try:
+                        self.avatar_file_map = json.load(f) or {}
+                    except Exception:
+                        self.avatar_file_map = {}
         except Exception:
             pass
         try:
@@ -2432,7 +2444,7 @@ class ChatWindow(QtWidgets.QWidget):
                 mime = parts[5]
                 b64 = " ".join(parts[6:]) if len(parts) > 6 else ""
                 if room == self.room and user != self.username and filename and b64:
-                    p = self._save_peer_avatar_file(filename, b64)
+                    p = self._save_peer_avatar_file(user, filename, mime, b64)
                     if p:
                         try:
                             self._set_peer_avatar(user, filename)
@@ -2525,6 +2537,39 @@ class ChatWindow(QtWidgets.QWidget):
                         self._add_file_from_path(f"dm:{name}", name, local_path, False)
                     except Exception:
                         pass
+                elif msg.startswith("FILE_BEGIN "):
+                    toks = msg.split(" ")
+                    if len(toks) >= 4:
+                         fn = " ".join(toks[1:-2])
+                         mime = toks[-2]
+                         try:
+                             tot = int(toks[-1])
+                         except:
+                             tot = 0
+                         self._rx_file_begin(f"dm:{name}", name, fn, mime, tot, "")
+                    return
+                elif msg.startswith("FILE_CHUNK "):
+                    toks = msg.split(" ")
+                    if len(toks) >= 4:
+                        try:
+                            offset = int(toks[-2])
+                            fn = " ".join(toks[1:-2])
+                            b64 = toks[-1]
+                            self._rx_file_chunk(f"dm:{name}", name, fn, offset, b64)
+                        except:
+                            pass
+                    return
+                elif msg.startswith("FILE_END"):
+                    toks = msg.split(" ")
+                    fn = ""
+                    if len(toks) >= 2 and toks[1].startswith("name="):
+                        fn = msg[len("FILE_END name="):]
+                    self._rx_file_end(f"dm:{name}", name, fn)
+                    
+                    is_inactive = not self.isActiveWindow() or self.isMinimized() or QtWidgets.QApplication.instance().applicationState() != QtCore.Qt.ApplicationActive
+                    if self.current_conv != f"dm:{name}" or is_inactive:
+                        self._send_macos_notification(name, "[文件]")
+                    return
                 else:
                     msg_clean = self._sanitize_text(msg)
                     try:
@@ -2562,8 +2607,16 @@ class ChatWindow(QtWidgets.QWidget):
                 if self.current_conv != f"dm:{name}" or is_inactive:
                     try:
                         note_text = self._sanitize_text(msg)
-                        if msg.startswith("[FILE] ") or msg.startswith("file://"):
-                            note_text = "[图片]"
+                        if msg.startswith("[FILE] "):
+                            note_text = "[文件]"
+                            try:
+                                _, mime, _ = self._parse_file(msg)
+                                if mime.lower().startswith("image/"):
+                                    note_text = "[图片]"
+                            except Exception:
+                                pass
+                        elif msg.startswith("file://"):
+                            note_text = "[文件]"
                         self._send_macos_notification(name, note_text)
                     except Exception:
                         pass
@@ -2619,7 +2672,21 @@ class ChatWindow(QtWidgets.QWidget):
                 fn, mime, b64 = self._parse_file(msg)
                 if self._is_deleted(f"group:{self.room}", "file", fn, mime):
                     return
-                
+                if name == self.username:
+                    try:
+                        m = self.conv_models.get(f"group:{self.room}")
+                        if m:
+                            for i in reversed(range(len(m.items))):
+                                it = m.items[i]
+                                if it.get("kind") == "file" and it.get("sender") == self.username and it.get("filename") == fn:
+                                    m.remove_row(i)
+                                    break
+                        try:
+                            self.store.delete_message(f"group:{self.room}", self.username, "file", f"[FILE] {fn} {mime}", True, fn, mime)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
                 pix = self._pix_from_b64(mime, b64)
                 self._save_attachment(fn, b64, f"group:{self.room}")
                 self._ensure_conv(f"group:{self.room}")
@@ -2636,6 +2703,39 @@ class ChatWindow(QtWidgets.QWidget):
                     self._add_file_from_path(f"group:{self.room}", name, local_path, name == self.username)
                 except Exception:
                     pass
+            elif msg.startswith("FILE_BEGIN "):
+                toks = msg.split(" ")
+                if len(toks) >= 4:
+                     fn = " ".join(toks[1:-2])
+                     mime = toks[-2]
+                     try:
+                         tot = int(toks[-1])
+                     except:
+                         tot = 0
+                     self._rx_file_begin(f"group:{self.room}", name, fn, mime, tot, "")
+                return
+            elif msg.startswith("FILE_CHUNK "):
+                toks = msg.split(" ")
+                if len(toks) >= 4:
+                    try:
+                        offset = int(toks[-2])
+                        fn = " ".join(toks[1:-2])
+                        b64 = toks[-1]
+                        self._rx_file_chunk(f"group:{self.room}", name, fn, offset, b64)
+                    except:
+                        pass
+                return
+            elif msg.startswith("FILE_END"):
+                toks = msg.split(" ")
+                fn = ""
+                if len(toks) >= 2 and toks[1].startswith("name="):
+                    fn = msg[len("FILE_END name="):]
+                self._rx_file_end(f"group:{self.room}", name, fn)
+                
+                is_inactive = not self.isActiveWindow() or self.isMinimized() or QtWidgets.QApplication.instance().applicationState() != QtCore.Qt.ApplicationActive
+                if self.current_conv != f"group:{self.room}" or is_inactive:
+                    self._send_macos_notification(f"{name} (群聊)", "[文件]")
+                return
             else:
                 msg_clean = self._sanitize_text(msg)
                 if self._is_deleted(f"group:{self.room}", "msg", msg_clean, None):
@@ -2655,9 +2755,17 @@ class ChatWindow(QtWidgets.QWidget):
             if self.current_conv != f"group:{self.room}" or is_inactive:
                 try:
                     note_text = self._sanitize_text(msg)
-                    if msg.startswith("[FILE] ") or msg.startswith("file://"):
-                        note_text = "[图片]"
-                        self._send_macos_notification(f"{name} (群聊)", note_text)
+                    if msg.startswith("[FILE] "):
+                        note_text = "[文件]"
+                        try:
+                            _, mime, _ = self._parse_file(msg)
+                            if mime.lower().startswith("image/"):
+                                note_text = "[图片]"
+                        except Exception:
+                            pass
+                    elif msg.startswith("file://"):
+                        note_text = "[文件]"
+                    self._send_macos_notification(f"{name} (群聊)", note_text)
                 except Exception:
                     pass
 
@@ -2847,7 +2955,7 @@ class ChatWindow(QtWidgets.QWidget):
                 mime = parts[5]
                 b64 = " ".join(parts[6:]) if len(parts) > 6 else ""
                 if room == rid and user != self.username and filename and b64:
-                    p = self._save_peer_avatar_file(filename, b64)
+                    p = self._save_peer_avatar_file(user, filename, mime, b64)
                     if p:
                         try:
                             self._set_peer_avatar(user, filename)
@@ -3141,8 +3249,16 @@ class ChatWindow(QtWidgets.QWidget):
                 if self.current_conv != f"dm:{name}" or is_inactive:
                     try:
                         note_text = self._sanitize_text(msg)
-                        if msg.startswith("[FILE] ") or msg.startswith("file://"):
-                            note_text = "[图片]"
+                        if msg.startswith("[FILE] "):
+                            note_text = "[文件]"
+                            try:
+                                _, mime, _ = self._parse_file(msg)
+                                if mime.lower().startswith("image/"):
+                                    note_text = "[图片]"
+                            except Exception:
+                                pass
+                        elif msg.startswith("file://"):
+                            note_text = "[文件]"
                         self._send_macos_notification(name, note_text)
                     except Exception:
                         pass
@@ -3476,8 +3592,16 @@ class ChatWindow(QtWidgets.QWidget):
             if self.current_conv != rid_key or is_inactive:
                 try:
                     note_text = self._sanitize_text(msg)
-                    if msg.startswith("[FILE] ") or msg.startswith("file://"):
-                        note_text = "[图片]"
+                    if msg.startswith("[FILE] "):
+                        note_text = "[文件]"
+                        try:
+                            _, mime, _ = self._parse_file(msg)
+                            if mime.lower().startswith("image/"):
+                                note_text = "[图片]"
+                        except Exception:
+                            pass
+                    elif msg.startswith("file://"):
+                        note_text = "[文件]"
                     room_title = self.room_name_map.get(rid, rid)
                     self._send_macos_notification(f"{name} ({room_title})", note_text)
                 except Exception:
@@ -3579,7 +3703,6 @@ class ChatWindow(QtWidgets.QWidget):
                                     b64 = base64.b64encode(f.read()).decode("ascii")
                                 payload_text = f"[FILE] {uniq_name} {mime} {b64}"
                                 self._send_seq(f"MSG {payload_text}", rid)
-                                self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
                             else:
                                 self._http_upload_group_file(temp_path, rid, uniq_name)
                         except Exception:
@@ -3635,7 +3758,6 @@ class ChatWindow(QtWidgets.QWidget):
                         size_inline = len(self.pending_image_bytes) if self.pending_image_bytes is not None else 0
                         if mime.lower().startswith("image/") and size_inline < limit_inline:
                             self._send_seq(f"MSG {payload_text}", rid)
-                            self.store.add(f"group:{rid}", self.username, payload_text, "file", True)
                             self.logger.write("sent", self.username, payload_text)
                             self._ensure_conv(self.current_conv)
                             _pix = self.pending_image_pixmap or self._pix_from_b64(mime, b64)
@@ -4211,6 +4333,7 @@ class ChatWindow(QtWidgets.QWidget):
     def _try_local_peer_avatar(self, name: str) -> bool:
         try:
             icon_dir = os.path.join(os.getcwd(), "icons", "user")
+            avatars_dir = os.path.join(self.logger.log_dir, "avatars")
             for ext in (".png", ".jpg", ".jpeg"):
                 p = os.path.join(icon_dir, f"{name}{ext}")
                 if os.path.isfile(p):
@@ -4225,12 +4348,45 @@ class ChatWindow(QtWidgets.QWidget):
                             pass
                         return True
             try:
+                per_user_dir = os.path.join(self.logger.log_dir, name)
+                for ext in (".png", ".jpg", ".jpeg"):
+                    cand = os.path.join(per_user_dir, f"avatar{ext}")
+                    if os.path.isfile(cand):
+                        pm = QtGui.QPixmap(cand)
+                        if not pm.isNull():
+                            self.peer_avatars[name] = pm
+                            self._refresh_conv_icon(name)
+                            try:
+                                for m in self.conv_models.values():
+                                    m.set_sender_avatar(name, pm)
+                            except Exception:
+                                pass
+                            return True
+                for ext in (".png", ".jpg", ".jpeg"):
+                    cand2 = os.path.join(per_user_dir, f"{name}{ext}")
+                    if os.path.isfile(cand2):
+                        pm = QtGui.QPixmap(cand2)
+                        if not pm.isNull():
+                            self.peer_avatars[name] = pm
+                            self._refresh_conv_icon(name)
+                            try:
+                                for m in self.conv_models.values():
+                                    m.set_sender_avatar(name, pm)
+                            except Exception:
+                                pass
+                            return True
+            except Exception:
+                pass
+            try:
                 profiles = _load_profiles(self.logger.log_dir)
                 afn = profiles.get(name)
                 if afn:
-                    p = os.path.join(icon_dir, afn)
-                    if os.path.isfile(p):
-                        pm = QtGui.QPixmap(p)
+                    p1 = os.path.join(icon_dir, afn)
+                    p2 = os.path.join(avatars_dir, afn)
+                    p3 = os.path.join(self.logger.log_dir, name, afn)
+                    cand = p1 if os.path.isfile(p1) else (p2 if os.path.isfile(p2) else (p3 if os.path.isfile(p3) else None))
+                    if cand:
+                        pm = QtGui.QPixmap(cand)
                         if not pm.isNull():
                             self.peer_avatars[name] = pm
                             self._refresh_conv_icon(name)
@@ -4308,14 +4464,33 @@ class ChatWindow(QtWidgets.QWidget):
 
     def _set_peer_avatar(self, name: str, filename: str):
         try:
-            path = os.path.join(os.getcwd(), "icons", "user", filename)
             pm = None
-            if os.path.exists(path):
-                pm = QtGui.QPixmap(path)
-            else:
+            per_user_dir = os.path.join(self.logger.log_dir, name)
+            for ext in (".png", ".jpg", ".jpeg"):
+                cand = os.path.join(per_user_dir, f"avatar{ext}")
+                if os.path.exists(cand):
+                    pm = QtGui.QPixmap(cand)
+                    if not pm.isNull():
+                        break
+            if pm is None or pm.isNull():
+                per_user = os.path.join(per_user_dir, filename)
+                if os.path.exists(per_user):
+                    pm = QtGui.QPixmap(per_user)
+            if pm is None or pm.isNull():
+                for ext in (".png", ".jpg", ".jpeg"):
+                    cand = os.path.join(self.logger.log_dir, "avatars", f"avatar{ext}")
+                    if os.path.exists(cand):
+                        pm = QtGui.QPixmap(cand)
+                        if not pm.isNull():
+                            break
+            if pm is None or pm.isNull():
                 alt = os.path.join(self.logger.log_dir, "avatars", filename)
                 if os.path.exists(alt):
                     pm = QtGui.QPixmap(alt)
+            if pm is None or pm.isNull():
+                path = os.path.join(os.getcwd(), "icons", "user", filename)
+                if os.path.exists(path):
+                    pm = QtGui.QPixmap(path)
             if pm and not pm.isNull():
                 self.peer_avatars[name] = pm
                 self._refresh_conv_icon(name)
@@ -4324,10 +4499,18 @@ class ChatWindow(QtWidgets.QWidget):
                         m.set_sender_avatar(name, pm)
                 except Exception:
                     pass
+                try:
+                    d = os.path.join(self.logger.log_dir, "avatars")
+                    os.makedirs(d, exist_ok=True)
+                    self.avatar_file_map[name] = filename
+                    with open(os.path.join(d, "avatar_map.json"), "w", encoding="utf-8") as f:
+                        json.dump(self.avatar_file_map, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    def _save_peer_avatar_file(self, filename: str, b64: str) -> Optional[str]:
+    def _save_peer_avatar_file(self, user: str, filename: str, mime: str, b64: str) -> Optional[str]:
         try:
             d = os.path.join(self.logger.log_dir, "avatars")
             os.makedirs(d, exist_ok=True)
@@ -4335,7 +4518,29 @@ class ChatWindow(QtWidgets.QWidget):
             data = base64.b64decode(b64)
             with open(p, "wb") as f:
                 f.write(data)
-            return p
+            try:
+                per_user_dir = os.path.join(self.logger.log_dir, user)
+                os.makedirs(per_user_dir, exist_ok=True)
+                pu = os.path.join(per_user_dir, filename)
+                with open(pu, "wb") as f2:
+                    f2.write(data)
+            except Exception:
+                pass
+            try:
+                ext = ".png" if mime.lower() == "image/png" else (".jpg" if mime.lower() in ("image/jpg", "image/jpeg") else os.path.splitext(filename)[1] or ".png")
+                p_norm = os.path.join(d, f"avatar{ext}")
+                with open(p_norm, "wb") as f3:
+                    f3.write(data)
+                pu_norm = os.path.join(os.path.join(self.logger.log_dir, user), f"avatar{ext}")
+                with open(pu_norm, "wb") as f4:
+                    f4.write(data)
+                try:
+                    _save_profile(self.logger.log_dir, user, f"avatar{ext}")
+                except Exception:
+                    pass
+                return pu_norm
+            except Exception:
+                return p
         except Exception:
             return None
 
@@ -4350,6 +4555,12 @@ class ChatWindow(QtWidgets.QWidget):
         if name == self.username and self.avatar_pixmap:
             return self.avatar_pixmap.scaled(size, size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         pm = self.peer_avatars.get(name)
+        if not pm:
+            try:
+                self._try_local_peer_avatar(name)
+            except Exception:
+                pass
+            pm = self.peer_avatars.get(name)
         if pm:
             return pm.scaled(size, size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         return self._letter_pixmap(name, size)
@@ -4621,6 +4832,20 @@ class ChatWindow(QtWidgets.QWidget):
         act_clear.triggered.connect(do_clear)
         menu.exec(global_pos)
 
+    def _check_remote_file_exists(self, url: str) -> bool:
+        if not url.startswith("http"):
+            return True
+        try:
+            req = urllib.request.Request(url, method='HEAD')
+            with urllib.request.urlopen(req, timeout=2) as response:
+                return response.status == 200
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False
+            return True
+        except Exception:
+            return True
+
     def on_view_double_click(self, index: QtCore.QModelIndex):
         if not index.isValid():
             return
@@ -4630,6 +4855,9 @@ class ChatWindow(QtWidgets.QWidget):
             link_url = index.data(ChatModel.LinkUrlRole) or ""
             if filename:
                 if link_url:
+                    if not self._check_remote_file_exists(str(link_url)):
+                        QtWidgets.QMessageBox.warning(self, "提示", "该文件已过期（超过服务器保留时间）被删除，无法下载")
+                        return
                     QtGui.QDesktopServices.openUrl(QtCore.QUrl(str(link_url)))
                 else:
                     QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._attachment_path(filename, self.current_conv)))
@@ -4711,6 +4939,16 @@ class ChatWindow(QtWidgets.QWidget):
                     self._try_local_peer_avatar(p)
             except Exception:
                 pass
+        try:
+            profiles = _load_profiles(self.logger.log_dir)
+            for name in profiles.keys():
+                if name and name != self.username and name not in self.peer_avatars:
+                    try:
+                        self._try_local_peer_avatar(name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
         # preload group conv
         self._ensure_conv(f"group:{self.room}")
         missing = 0
