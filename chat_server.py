@@ -535,14 +535,15 @@ def _load_rooms_json():
                 data = json.load(f)
             rooms = data.get("rooms") or []
             names = data.get("names") or {}
-            return rooms, names
+            members = data.get("members") or {}
+            return rooms, names, members
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
-def _save_rooms_json(rooms: list[str], names: dict[str,str]):
+def _save_rooms_json(rooms: list[str], names: dict[str,str], members: dict[str, list[str]]):
     try:
-        data = {"rooms": rooms, "names": names}
+        data = {"rooms": rooms, "names": names, "members": members}
         with open(ROOMS_JSON, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
@@ -1051,6 +1052,7 @@ def _cleanup_files_loop():
 
 
 def start_server(host: str, port: int):
+    _load_users()
     hub = Hub()
     threading.Thread(target=_cleanup_files_loop, daemon=True).start()
     try:
@@ -1181,11 +1183,22 @@ def start_server(host: str, port: int):
                                 for r in rooms:
                                     u = hub.users(r)
                                     m = hub.room_members.get(r)
-                                    m_str = ",".join(m) if m else ""
+                                    
+                                    current_m = m if m else set()
+                                    reg_users = sorted(list(REGISTERED_USERS))
+                                    checks = []
+                                    for user in reg_users:
+                                        checked = " checked" if user in current_m else ""
+                                        checks.append(f'<label style="display:block;margin:2px 0"><input type="checkbox" name="members" value="{user}"{checked}> {user}</label>')
+                                    for user in current_m:
+                                        if user not in REGISTERED_USERS:
+                                            checks.append(f'<label style="display:block;margin:2px 0"><input type="checkbox" name="members" value="{user}" checked> {user} (未注册)</label>')
+                                    checks_html = "".join(checks) if checks else "<div style='color:#999'>无用户</div>"
+
                                     del_btn = "<button type=\"submit\" disabled>删除房间</button>" if len(u) > 0 else "<button type=\"submit\">删除房间</button>"
                                     html.append(
                                         f"<tr><td>{r}</td><td>{name_map.get(r,r)}</td>"
-                                        f"<td><form method=\"post\" action=\"/api/set_room_members\" style=\"margin:0\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"members\" value=\"{m_str}\" placeholder=\"用户1,用户2...\" style=\"width:150px\"><button type=\"submit\">更新</button></form></td>"
+                                        f"<td><form method=\"post\" action=\"/api/set_room_members\" style=\"margin:0\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><div style=\"max-height:150px;overflow-y:auto;border:1px solid #ddd;padding:5px;margin-bottom:5px;font-size:13px\">{checks_html}</div><button type=\"submit\">更新</button></form></td>"
                                         f"<td>{len(u)}</td><td>"
                                         f"<form method=\"post\" action=\"/api/set_room_name\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"name\" placeholder=\"新的显示名称\"><button type=\"submit\">设置名称</button></form>"
                                         f"<form method=\"post\" action=\"/api/delete_room\"><input type=\"hidden\" name=\"room\" value=\"{r}\">{del_btn}</form>"
@@ -1231,7 +1244,10 @@ def start_server(host: str, port: int):
                                 kv = p.split("=", 1)
                                 k = urllib.parse.unquote_plus(kv[0])
                                 v = urllib.parse.unquote_plus(kv[1]) if len(kv) > 1 else ""
-                                d[k] = v
+                                if k in d:
+                                    d[k].append(v)
+                                else:
+                                    d[k] = [v]
                             return d
                         except Exception:
                             return {}
@@ -1399,7 +1415,7 @@ def start_server(host: str, port: int):
                                 return
                             if p == "/api/add_room":
                                 form = self._read_form()
-                                room = form.get("room") or ""
+                                room = form.get("room", [""])[-1]
                                 if room:
                                     with hub.lock:
                                         if room not in hub.rooms:
@@ -1416,8 +1432,8 @@ def start_server(host: str, port: int):
                                 return
                             if p == "/api/set_room_name":
                                 form = self._read_form()
-                                room = form.get("room") or ""
-                                name = form.get("name") or ""
+                                room = form.get("room", [""])[-1]
+                                name = form.get("name", [""])[-1]
                                 if room and name:
                                     with hub.lock:
                                         hub.room_names[room] = name
@@ -1435,10 +1451,10 @@ def start_server(host: str, port: int):
                                 return
                             if p == "/api/set_room_members":
                                 form = self._read_form()
-                                room = form.get("room") or ""
-                                members_str = form.get("members") or ""
+                                room = form.get("room", [""])[-1]
+                                members_list = form.get("members", [])
                                 if room:
-                                    members_list = [x.strip() for x in members_str.replace("，", ",").split(",") if x.strip()]
+                                    members_list = [x.strip() for x in members_list if x.strip()]
                                     with hub.lock:
                                         if members_list:
                                             hub.room_members[room] = set(members_list)
@@ -1455,7 +1471,7 @@ def start_server(host: str, port: int):
                                 return
                             if p == "/api/delete_room":
                                 form = self._read_form()
-                                room = form.get("room") or ""
+                                room = form.get("room", [""])[-1]
                                 if room:
                                     with hub.lock:
                                         users = hub.rooms.get(room, {})
@@ -1480,7 +1496,8 @@ def start_server(host: str, port: int):
                             if p == "/api/set_retention":
                                 form = self._read_form()
                                 try:
-                                    days = int(form.get("days") or "7")
+                                    days_val = form.get("days", ["7"])[-1]
+                                    days = int(days_val)
                                     if days < 1: days = 1
                                     SERVER_CONFIG["retention_days"] = days
                                     _save_config()
