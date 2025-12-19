@@ -438,6 +438,47 @@ class Hub:
         except Exception:
             pass
 
+    def delete_user(self, username: str):
+        # 1. Remove from all rooms in memory and disconnect
+        with self.lock:
+            for room_id, room_map in self.rooms.items():
+                to_remove = []
+                for conn, user in room_map.items():
+                    if user == username:
+                        to_remove.append(conn)
+                for conn in to_remove:
+                    del room_map[conn]
+                    if conn in self.conn_info:
+                        del self.conn_info[conn]
+                    try:
+                        conn.shutdown(socket.SHUT_RDWR)
+                        conn.close()
+                    except Exception:
+                        pass
+        
+        # 2. Remove from room_members (persistent membership)
+        changed_rooms = False
+        with self.lock:
+            for room_id in self.room_members:
+                if username in self.room_members[room_id]:
+                    self.room_members[room_id].remove(username)
+                    changed_rooms = True
+            
+            # 3. Remove avatar
+            if username in self.avatars:
+                del self.avatars[username]
+            if username in self.avatar_data:
+                del self.avatar_data[username]
+
+        if changed_rooms:
+            self._save_rooms()
+        
+        # 4. Remove from REGISTERED_USERS
+        global REGISTERED_USERS
+        if username in REGISTERED_USERS:
+            REGISTERED_USERS.remove(username)
+            _save_users()
+
     def _unread_inc(self, user: str, conv: str):
         self.store.inc(user, conv)
 
@@ -1492,6 +1533,19 @@ def start_server(host: str, port: int):
                                 self.send_response(302)
                                 self.send_header("Location", "/")
                                 self.end_headers()
+                                return
+                            if p == "/api/delete_user":
+                                form = self._read_form()
+                                username = form.get("username", [""])[-1]
+                                if username:
+                                    hub.delete_user(username)
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/json; charset=utf-8")
+                                self.end_headers()
+                                try:
+                                    self.wfile.write(b'{"status":"ok"}')
+                                except Exception:
+                                    pass
                                 return
                             if p == "/api/set_retention":
                                 form = self._read_form()

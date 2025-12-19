@@ -8140,10 +8140,12 @@ def main():
     form.addRow("用户名", name_edit)
     hl_recent = QtWidgets.QHBoxLayout()
     lbl_recent = QtWidgets.QLabel("最近登录用户")
+    btn_del = QtWidgets.QPushButton("删除")
     btn_new = QtWidgets.QPushButton("新用户")
     try:
         hl_recent.addWidget(lbl_recent)
         hl_recent.addStretch(1)
+        hl_recent.addWidget(btn_del)
         hl_recent.addWidget(btn_new)
     except Exception:
         pass
@@ -8268,6 +8270,33 @@ def main():
             login_stack.setCurrentIndex(1)
         except Exception:
             pass
+    def on_delete():
+        try:
+            sel = prof_list.selectedItems()
+            if not sel:
+                QtWidgets.QMessageBox.warning(None, "提示", "请先选择要删除的用户")
+                return
+            item = sel[0]
+            uname = item.text()
+            ret = QtWidgets.QMessageBox.question(None, "确认", f"确定要删除用户 {uname} 吗？\n这将同时清除服务器上的用户信息。", 
+                                                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+            if ret != QtWidgets.QMessageBox.Yes:
+                return
+            
+            _delete_profile(args.log_dir, uname)
+            
+            host, port, room, _theme_cfg = _load_client_config(args.config)
+            _request_server_delete_user(host, uname)
+            
+            # Remove from list
+            row = prof_list.row(item)
+            prof_list.takeItem(row)
+            
+            QtWidgets.QMessageBox.information(None, "提示", "删除成功")
+        except Exception:
+            pass
+    btn_del.clicked.connect(on_delete)
+
     btn_new.clicked.connect(do_new_user)
     if dlg.exec() != QtWidgets.QDialog.Accepted:
         return
@@ -8389,6 +8418,35 @@ def _check_username_available(host: str, port: int, room: str, username: str) ->
         return ok
     except Exception:
         return True
+
+def _delete_profile(base_dir: str, username: str):
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        p = os.path.join(base_dir, "profiles.json")
+        d = {}
+        if os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f:
+                try:
+                    d = json.load(f)
+                except Exception:
+                    d = {}
+        if username in d:
+            del d[username]
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(d, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def _request_server_delete_user(host: str, username: str):
+    try:
+        # Assuming HTTP server is on port 34568 as per server code
+        url = f"http://{host}:34568/api/delete_user"
+        data = urllib.parse.urlencode({"username": username}).encode("utf-8")
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            pass
+    except Exception:
+        pass
 
 def _apply_theme(app: QtWidgets.QApplication, name: str):
     base = os.path.join(os.getcwd(), "themes", f"{name}.qss")
