@@ -116,6 +116,7 @@ class ChatModel(QtCore.QAbstractListModel):
     UploadStateRole = QtCore.Qt.UserRole + 12
     UploadAlphaRole = QtCore.Qt.UserRole + 13
     LinkUrlRole = QtCore.Qt.UserRole + 14
+    QuoteRole = QtCore.Qt.UserRole + 15
 
     def __init__(self):
         super().__init__()
@@ -157,13 +158,26 @@ class ChatModel(QtCore.QAbstractListModel):
             return item.get("upload_alpha")
         if role == ChatModel.LinkUrlRole:
             return item.get("link_url")
+        if role == ChatModel.QuoteRole:
+            return item.get("quote")
         return None
 
     def add(self, kind: str, sender: str, text: str, is_self: bool, avatar: Optional[QtGui.QPixmap] = None, ts: Optional[int] = None):
         now = QtCore.QDateTime.fromSecsSinceEpoch(int(ts)) if ts is not None else QtCore.QDateTime.currentDateTime()
+        
+        quote_data = None
+        display_text = text
+        if kind == "msg" and text and "\x1f" in text:
+            try:
+                parts = text.split("\x1f", 1)
+                display_text = parts[0]
+                quote_data = json.loads(parts[1])
+            except Exception:
+                display_text = text
+
         self._maybe_time_separator(now)
         self.beginInsertRows(QtCore.QModelIndex(), len(self.items), len(self.items))
-        self.items.append({"kind": kind, "sender": sender, "text": text, "self": is_self, "time": now, "avatar": avatar})
+        self.items.append({"kind": kind, "sender": sender, "text": display_text, "quote": quote_data, "self": is_self, "time": now, "avatar": avatar})
         self.endInsertRows()
 
     def add_file(self, sender: str, filename: str, mime: str, pixmap: Optional[QtGui.QPixmap], is_self: bool, avatar: Optional[QtGui.QPixmap] = None, ts: Optional[int] = None, size_bytes: Optional[int] = None):
@@ -583,11 +597,91 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             painter.setPen(QtGui.QColor(255, 255, 255))
             letter = sender[:1] if sender else "?"
             painter.drawText(QtCore.QRect(ax, ay, avatar_size, avatar_size), QtCore.Qt.AlignCenter, letter)
+        
+        # Render quote if present
+        quote = index.data(ChatModel.QuoteRole)
+        if quote and isinstance(quote, dict):
+            q_sender = quote.get("sender", "")
+            q_text = quote.get("text", "")
+            
+            q_font = QtGui.QFont(option.font)
+            try:
+                if q_font.pointSize() > 0:
+                    q_font.setPointSize(q_font.pointSize() - 1)
+            except:
+                pass
+            
+            q_doc = QtGui.QTextDocument()
+            q_opt = QtGui.QTextOption()
+            q_opt.setWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+            q_doc.setDefaultFont(q_font)
+            q_doc.setDefaultTextOption(q_opt)
+            q_doc.setDocumentMargin(6)
+            
+            q_max_w = min(int(r.width() * 0.65), 400) # Constrain quote width
+            q_doc.setTextWidth(q_max_w)
+            
+            import html as _html
+            # Light gray background, dark grey text
+            q_html = f"<div style='color:#4b5563;'><b>{_html.escape(q_sender)}</b>: {_html.escape(q_text)}</div>"
+            q_doc.setHtml(q_html)
+            
+            q_w = int(q_doc.idealWidth())
+            q_h = int(q_doc.size().height())
+            
+            qy = bubble_rect.bottom() + 4
+            
+            if is_self:
+                qx = r.right() - margin - avatar_size - avatar_pad - q_w
+            else:
+                qx = r.left() + margin + avatar_size + avatar_pad
+            
+            q_rect = QtCore.QRectF(qx, qy, q_w, q_h)
+            
+            painter.setPen(QtCore.Qt.NoPen)
+            painter.setBrush(QtGui.QColor(243, 244, 246)) # Light gray background
+            painter.drawRoundedRect(q_rect, 6, 6)
+            
+            painter.save()
+            painter.translate(qx, qy)
+            q_doc.drawContents(painter)
+            painter.restore()
+
         painter.restore()
 
     def sizeHint(self, option, index):
         kind = index.data(ChatModel.KindRole)
         text = index.data(ChatModel.TextRole)
+        
+        # Calculate quote height
+        quote_h = 0
+        quote = index.data(ChatModel.QuoteRole)
+        if quote and isinstance(quote, dict):
+            q_sender = quote.get("sender", "")
+            q_text = quote.get("text", "")
+            q_font = QtGui.QFont(option.font)
+            try:
+                if q_font.pointSize() > 0:
+                    q_font.setPointSize(q_font.pointSize() - 1)
+            except:
+                pass
+            q_doc = QtGui.QTextDocument()
+            q_opt = QtGui.QTextOption()
+            q_opt.setWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+            q_doc.setDefaultFont(q_font)
+            q_doc.setDefaultTextOption(q_opt)
+            q_doc.setDocumentMargin(6)
+            try:
+                vw = option.rect.width() if option.rect.width() > 0 else (option.widget.viewport().width() if option.widget else 0)
+            except Exception:
+                vw = option.rect.width()
+            q_max_w = min(int(vw * 0.65), 400)
+            q_doc.setTextWidth(q_max_w)
+            import html as _html
+            q_html = f"<div style='color:#4b5563;'><b>{_html.escape(q_sender)}</b>: {_html.escape(q_text)}</div>"
+            q_doc.setHtml(q_html)
+            quote_h = int(q_doc.size().height()) + 4
+
         if kind == "sys":
             fm = option.fontMetrics
             h = fm.height() + 20
@@ -608,6 +702,7 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
                 h = img_h + spacing
                 avatar_block = 22 + 24
                 h = max(h, avatar_block)
+                h += quote_h
                 return QtCore.QSize(option.rect.width(), h)
             # non-image file chip height
             chip_h = 56
@@ -615,6 +710,7 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
             avatar_block = 22 + 24
             h = chip_h + spacing
             h = max(h, avatar_block)
+            h += quote_h
             return QtCore.QSize(option.rect.width(), h)
         fdoc = QtGui.QFont(option.font)
         try:
@@ -669,6 +765,7 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         avatar_block = 22 + 24
         h = bubble_h + extra_top + extra_bottom + spacing
         h = max(h, avatar_block)
+        h += quote_h
         return QtCore.QSize(option.rect.width(), h)
 
 
@@ -685,6 +782,89 @@ class ChatInput(QtWidgets.QTextEdit):
         self._last_paste_tick = 0
         self._skip_image_paste_until = 0
         self._file_chip_range = None
+        self.current_quote = None
+
+    def get_quote(self):
+        # Verify if the quote table actually exists in the document
+        if not self.current_quote:
+            return None
+        
+        # Simple check: iterate over tables
+        doc = self.document()
+        root = doc.rootFrame()
+        found = False
+        for frame in root.childFrames():
+            if isinstance(frame, QtGui.QTextTable):
+                found = True
+                break
+        
+        if found:
+            return self.current_quote
+        else:
+            self.current_quote = None
+            return None
+
+    def get_quote_range(self):
+        if not self.current_quote:
+            return None
+            
+        doc = self.document()
+        root = doc.rootFrame()
+        
+        for frame in root.childFrames():
+            if isinstance(frame, QtGui.QTextTable):
+                start = frame.firstPosition()
+                end = frame.lastPosition()
+                cur = QtGui.QTextCursor(doc)
+                cur.setPosition(start)
+                cur.setPosition(end, QtGui.QTextCursor.KeepAnchor)
+                txt = cur.selectedText().replace("\u2029", "")
+                
+                s = self.current_quote.get("sender", "")
+                if s and s in txt:
+                    return (start, end)
+        return None
+
+    def get_clean_text(self):
+        text = self.toPlainText()
+        if not self.current_quote:
+            return text
+            
+        doc = self.document()
+        root = doc.rootFrame()
+        quote_table = None
+        
+        for frame in root.childFrames():
+            if isinstance(frame, QtGui.QTextTable):
+                start = frame.firstPosition()
+                end = frame.lastPosition()
+                cur = QtGui.QTextCursor(doc)
+                cur.setPosition(start)
+                cur.setPosition(end, QtGui.QTextCursor.KeepAnchor)
+                txt = cur.selectedText().replace("\u2029", "")
+                
+                s = self.current_quote.get("sender", "")
+                if s and s in txt:
+                    quote_table = frame
+                    break
+        
+        if not quote_table:
+            return text
+            
+        final_text = []
+        b = doc.begin()
+        while b.isValid():
+            # Check if block is inside quote table
+            is_in_quote = False
+            if quote_table:
+                if b.position() >= quote_table.firstPosition() and b.position() < quote_table.lastPosition():
+                    is_in_quote = True
+            
+            if not is_in_quote:
+                final_text.append(b.text())
+            b = b.next()
+            
+        return "\n".join(final_text).strip()
 
     def insertFromMimeData(self, source: QtCore.QMimeData):
         try:
@@ -1085,6 +1265,107 @@ class ChatInput(QtWidgets.QTextEdit):
             except Exception:
                 pass
             self.textCursor().insertText(f"[文件: {name}] {size_str}")
+
+    def mouseReleaseEvent(self, ev: QtGui.QMouseEvent):
+        try:
+            p = ev.position().toPoint()
+            anchor = self.anchorAt(p)
+            if anchor == "remove_quote":
+                c = self.cursorForPosition(p)
+                
+                # Check if we are in a table (the quote chip structure)
+                tbl = c.currentTable()
+                if tbl:
+                    # Select the entire table frame including boundaries
+                    # Frame range is [firstPosition-1, lastPosition+1]
+                    start = tbl.firstPosition() - 1
+                    end = tbl.lastPosition() + 1
+                    c.setPosition(start)
+                    c.setPosition(end, QtGui.QTextCursor.KeepAnchor)
+                    c.removeSelectedText()
+                else:
+                    # Fallback for non-table structure
+                    c.select(QtGui.QTextCursor.BlockUnderCursor)
+                    c.removeSelectedText()
+                
+                self.current_quote = None
+                
+                # Reset formatting to ensure clean state for next input/quote
+                bf = QtGui.QTextBlockFormat()
+                c.setBlockFormat(bf)
+                cf = QtGui.QTextCharFormat()
+                c.setCharFormat(cf)
+                
+                # Remove the newline before this block if it exists (merge with previous line)
+                if c.block().blockNumber() > 0:
+                    c.deletePreviousChar()
+                return
+        except Exception:
+            pass
+        super().mouseReleaseEvent(ev)
+
+    def insert_quote_chip(self, sender: str, text: str):
+        try:
+            import html as _html
+            esc_sender = _html.escape(sender or "")
+            # Truncate text for display
+            display_text = text.replace("\n", " ")
+            if len(display_text) > 50:
+                display_text = display_text[:50] + "..."
+            esc_text = _html.escape(display_text)
+            
+            # Load remove icon
+            remove_icon_url = ""
+            try:
+                icon_path = os.path.join(os.getcwd(), "icons", "ui", "remove.png")
+                if os.path.isfile(icon_path):
+                    remove_icon_url = QtCore.QUrl.fromLocalFile(icon_path).toString()
+            except Exception:
+                pass
+            
+            img_tag = (
+                f"<a href='remove_quote'><img src='{remove_icon_url}' width='16' height='16' style='vertical-align:middle;border:none;opacity:0.85;'/></a>"
+                if remove_icon_url
+                else "<a href='remove_quote' style='text-decoration:none;color:#666;'>×</a>"
+            )
+
+            # Dark style chip with user requested format: [User: Message] Icon
+            # Using table to keep layout clean
+            html = (
+                "<div contenteditable='false' style='margin-top:6px;margin-left:20px;background-color:#f3f4f6;border:1px solid #d1d5db;border-radius:8px;"
+                "padding:6px 10px;display:inline-block;box-shadow:0 1px 2px rgba(0,0,0,0.06);'>"
+                "<table style='border-collapse:collapse;border:none;'>"
+                "<tr>"
+                "<td style='vertical-align:middle;padding-right:8px;'>"
+                f"<span style='color:#1f2937;font-weight:600;font-size:13px;'>{esc_sender}</span>"
+                f"<span style='color:#4b5563;font-weight:600;font-size:13px;'>: </span>"
+                f"<span style='color:#374151;font-size:13px;'>{esc_text}</span>"
+                "</td>"
+                f"<td style='vertical-align:middle;padding-left:8px;cursor:pointer;'>{img_tag}</td>"
+                "</tr>"
+                "</table>"
+                "</div>"
+            )
+            
+            # Store quote data
+            self.current_quote = {"sender": sender, "text": text}
+
+            cur = self.textCursor()
+            cur.movePosition(QtGui.QTextCursor.End)
+            
+            # Ensure new line for the quote
+            if not self.toPlainText().endswith("\n"):
+                cur.insertText("\n")
+
+            cur.insertHtml(html)
+            
+            # Move cursor to start for user input
+            cur.movePosition(QtGui.QTextCursor.Start)
+            self.setTextCursor(cur)
+            self.ensureCursorVisible()
+            self.setFocus()
+        except Exception:
+            pass
 
     def _preview_target_width(self) -> int:
         try:
@@ -4779,8 +5060,19 @@ class ChatWindow(QtWidgets.QWidget):
     def on_send(self):
         if not self.current_conv:
             return
-        text = self._sanitize_text(self.entry.toPlainText())
+        # Use get_clean_text() to avoid including quote text in the message body
+        text = self._sanitize_text(self.entry.get_clean_text())
         
+        # Check for quote
+        quote = self.entry.get_quote()
+        if quote:
+            import json
+            try:
+                quote_json = json.dumps(quote)
+                text = text + "\x1f" + quote_json
+            except Exception:
+                pass
+
         # Check if we have a pending pasted file/image
         if self.pending_image_bytes:
             name = self.pending_image_name or ("paste_" + str(int(QtCore.QDateTime.currentMSecsSinceEpoch())) + ".png")
@@ -5833,6 +6125,13 @@ class ChatWindow(QtWidgets.QWidget):
                 txt = index.data(ChatModel.TextRole) or ""
                 self._open_text_viewer(txt)
             act_view.triggered.connect(do_view)
+            act_quote = menu.addAction("引用")
+            def do_quote():
+                sender_name = index.data(ChatModel.SenderRole)
+                text = index.data(ChatModel.TextRole)
+                if sender_name and text:
+                    self.entry.insert_quote_chip(sender_name, text)
+            act_quote.triggered.connect(do_quote)
         act_del = menu.addAction("删除此消息")
         can_del = index.isValid() and kind in ("msg", "file")
         act_del.setEnabled(can_del)
@@ -6968,10 +7267,23 @@ class ChatWindow(QtWidgets.QWidget):
             it = QtGui.QTextDocument.Iterator(doc)
         except Exception:
             pass
+
+        # Get quote range to skip
+        quote_range = None
+        if hasattr(self.entry, "get_quote_range"):
+            quote_range = self.entry.get_quote_range()
+
         try:
             cursor = QtGui.QTextCursor(doc)
             cursor.movePosition(QtGui.QTextCursor.Start)
             while not cursor.atEnd():
+                # Check if cursor is in quote range and skip it
+                if quote_range:
+                    pos = cursor.position()
+                    if quote_range[0] <= pos < quote_range[1]:
+                        cursor.setPosition(quote_range[1])
+                        continue
+
                 fmt = cursor.charFormat()
                 if fmt.isImageFormat():
                     imgfmt = QtGui.QTextImageFormat(fmt)
