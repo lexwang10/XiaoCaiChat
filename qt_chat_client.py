@@ -15,9 +15,10 @@ import re
 import math
 import urllib.request
 import urllib.error
+import urllib.parse
 
 from PySide6 import QtCore, QtWidgets, QtGui
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 import threading
 try:
     import Cocoa
@@ -5752,7 +5753,8 @@ class ChatWindow(QtWidgets.QWidget):
 
     def _sync_room_from_server(self):
         try:
-            url = f"http://{self.host}:34568/api/status"
+            q = urllib.parse.quote(self.username or "")
+            url = f"http://{self.host}:34568/api/status?user={q}"
             with urllib.request.urlopen(url, timeout=2.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             rooms = data.get("rooms") or []

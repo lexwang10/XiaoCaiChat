@@ -13,6 +13,7 @@ import sys
 import uuid
 import cgi
 import io
+import urllib.parse
 SERVER_VERSION = "1.0.1"
 try:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -85,12 +86,19 @@ class Hub:
         self.avatars = {}
         self.avatar_data = {}
         self.room_names = {"世界": "世界"}
+        self.room_members = {}
         try:
             self._load_rooms()
         except Exception:
             pass
 
-    def add(self, conn: socket.socket, username: str, room: str):
+    def add(self, conn: socket.socket, username: str, room: str) -> bool:
+        # Check permissions
+        allowed = self.room_members.get(room)
+        if allowed is not None and username not in allowed:
+            # Not allowed in this room
+            return False
+
         with self.lock:
             room_map = self.rooms.setdefault(room, {})
             room_map[conn] = username
@@ -105,6 +113,7 @@ class Hub:
             self.broadcast_sys(room, f"[SYS] ROOM_NAME {room} {name}")
         except Exception:
             pass
+        return True
 
     def remove(self, conn: socket.socket):
         room = None
@@ -402,7 +411,7 @@ class Hub:
 
     def _load_rooms(self):
         try:
-            rooms, names = _load_rooms_json()
+            rooms, names, members = _load_rooms_json()
             if rooms:
                 with self.lock:
                     for r in rooms:
@@ -412,6 +421,10 @@ class Hub:
                 with self.lock:
                     for r, n in names.items():
                         self.room_names[r] = n
+            if members:
+                with self.lock:
+                    for r, m in members.items():
+                        self.room_members[r] = set(m)
         except Exception:
             pass
 
@@ -420,7 +433,8 @@ class Hub:
             with self.lock:
                 rooms = list(self.rooms.keys())
                 names = dict(self.room_names)
-            _save_rooms_json(rooms, names)
+                members = {r: list(m) for r, m in self.room_members.items()}
+            _save_rooms_json(rooms, names, members)
         except Exception:
             pass
 
@@ -705,7 +719,13 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                     _save_users()
                 except Exception:
                     pass
-            hub.add(conn, username, room)
+            if not hub.add(conn, username, room):
+                try:
+                    conn.sendall(f"[SYS] ERROR Permission denied for room {room}\n".encode("utf-8"))
+                    conn.close()
+                except Exception:
+                    pass
+                return
             print(f"joined {username}@{addr[0]}:{addr[1]} room={room}")
             if len(parts) >= 4 and parts[3]:
                 hub.set_avatar(room, username, parts[3])
@@ -727,7 +747,13 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
                     _save_users()
                 except Exception:
                     pass
-            hub.add(conn, username, room)
+            if not hub.add(conn, username, room):
+                try:
+                    conn.sendall(f"[SYS] ERROR Permission denied for room {room}\n".encode("utf-8"))
+                    conn.close()
+                except Exception:
+                    pass
+                return
             print(f"joined {username}@{addr[0]}:{addr[1]} room={room}")
             if text:
                 seq, body = parse_seq(text)
@@ -1112,7 +1138,26 @@ def start_server(host: str, port: int):
                                 return
                             if p == "/api/status":
                                 rooms = list(hub.rooms.keys())
-                                data = {"rooms": [{"id": r, "name": hub.room_names.get(r, r), "users": hub.users(r)} for r in rooms]}
+                                user_filter = None
+                                try:
+                                    qs = self.path.split("?", 1)
+                                    if len(qs) > 1:
+                                        for pair in qs[1].split("&"):
+                                            if pair.startswith("user="):
+                                                user_filter = pair.split("=", 1)[1]
+                                                break
+                                except Exception:
+                                    pass
+                                
+                                final_rooms = []
+                                for r in rooms:
+                                    members = hub.room_members.get(r)
+                                    if members is not None and user_filter:
+                                        if user_filter not in members:
+                                            continue
+                                    final_rooms.append(r)
+                                    
+                                data = {"rooms": [{"id": r, "name": hub.room_names.get(r, r), "users": hub.users(r)} for r in final_rooms]}
                                 b = json.dumps(data, ensure_ascii=False).encode("utf-8")
                                 self.send_response(200)
                                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1132,12 +1177,16 @@ def start_server(host: str, port: int):
                                         "<form method=\"post\" action=\"/api/quit\"><button type=\"submit\">关闭服务器</button></form>",
                                         f"<form method=\"post\" action=\"/api/set_retention\" style=\"border:1px solid #ddd;padding:10px;margin:10px 0;max_width:300px\"><div><b>系统设置</b></div><div style=\"margin-top:8px\"><label>文件保留天数: <input name=\"days\" type=\"number\" value=\"{SERVER_CONFIG.get('retention_days', 7)}\" style=\"width:60px\"></label> <button type=\"submit\">保存</button></div></form>",
                                         "<form method=\"post\" action=\"/api/add_room\"><input name=\"room\" placeholder=\"新房间ID\"><button type=\"submit\">添加房间</button></form>",
-                                        "<table><tr><th>房间ID</th><th>显示名称</th><th>在线用户</th><th>操作</th></tr>"]
+                                        "<table><tr><th>房间ID</th><th>显示名称</th><th>成员限制 (空为公开)</th><th>在线用户</th><th>操作</th></tr>"]
                                 for r in rooms:
                                     u = hub.users(r)
+                                    m = hub.room_members.get(r)
+                                    m_str = ",".join(m) if m else ""
                                     del_btn = "<button type=\"submit\" disabled>删除房间</button>" if len(u) > 0 else "<button type=\"submit\">删除房间</button>"
                                     html.append(
-                                        f"<tr><td>{r}</td><td>{name_map.get(r,r)}</td><td>{len(u)}</td><td>"
+                                        f"<tr><td>{r}</td><td>{name_map.get(r,r)}</td>"
+                                        f"<td><form method=\"post\" action=\"/api/set_room_members\" style=\"margin:0\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"members\" value=\"{m_str}\" placeholder=\"用户1,用户2...\" style=\"width:150px\"><button type=\"submit\">更新</button></form></td>"
+                                        f"<td>{len(u)}</td><td>"
                                         f"<form method=\"post\" action=\"/api/set_room_name\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"name\" placeholder=\"新的显示名称\"><button type=\"submit\">设置名称</button></form>"
                                         f"<form method=\"post\" action=\"/api/delete_room\"><input type=\"hidden\" name=\"room\" value=\"{r}\">{del_btn}</form>"
                                         f"</td></tr>"
@@ -1180,9 +1229,9 @@ def start_server(host: str, port: int):
                                 if not p:
                                     continue
                                 kv = p.split("=", 1)
-                                k = kv[0]
-                                v = kv[1] if len(kv) > 1 else ""
-                                d[k] = v.replace("+", " ")
+                                k = urllib.parse.unquote_plus(kv[0])
+                                v = urllib.parse.unquote_plus(kv[1]) if len(kv) > 1 else ""
+                                d[k] = v
                             return d
                         except Exception:
                             return {}
@@ -1376,6 +1425,26 @@ def start_server(host: str, port: int):
                                         hub.broadcast_sys(room, f"[SYS] ROOM_NAME {room} {name}")
                                     except Exception:
                                         pass
+                                    try:
+                                        hub._save_rooms()
+                                    except Exception:
+                                        pass
+                                self.send_response(302)
+                                self.send_header("Location", "/")
+                                self.end_headers()
+                                return
+                            if p == "/api/set_room_members":
+                                form = self._read_form()
+                                room = form.get("room") or ""
+                                members_str = form.get("members") or ""
+                                if room:
+                                    members_list = [x.strip() for x in members_str.replace("，", ",").split(",") if x.strip()]
+                                    with hub.lock:
+                                        if members_list:
+                                            hub.room_members[room] = set(members_list)
+                                        else:
+                                            if room in hub.room_members:
+                                                del hub.room_members[room]
                                     try:
                                         hub._save_rooms()
                                     except Exception:
