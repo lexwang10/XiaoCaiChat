@@ -13,6 +13,7 @@ import sys
 import uuid
 import cgi
 import io
+SERVER_VERSION = "1.0.1"
 try:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 except Exception:
@@ -148,14 +149,44 @@ class Hub:
             elif text.startswith("FILE_CHUNK "):
                 toks = text.split(" ", 2)
                 if len(toks) >= 3:
+                    off = 0
+                    b64 = ""
+                    is_old = False
                     try:
                         off = int(toks[1])
+                        b64 = toks[2]
+                        is_old = True
                     except Exception:
-                        off = 0
-                    b64 = toks[2]
-                    print(f"[srv] group FILE_CHUNK from={username} room={room} off={off} len={len(b64)}")
+                        is_old = False
+                    
+                    if is_old:
+                        print(f"[srv] group FILE_CHUNK from={username} room={room} off={off} len={len(b64)}")
+                    else:
+                        # New format: FILE_CHUNK filename offset b64
+                        filename = toks[1]
+                        rest = toks[2].split(" ", 1)
+                        if len(rest) >= 2:
+                            try:
+                                off = int(rest[0])
+                            except Exception:
+                                off = 0
+                            b64 = rest[1]
+                            print(f"[srv] group FILE_CHUNK from={username} room={room} name={filename} off={off} len={len(b64)}")
             elif text.startswith("FILE_END"):
                 print(f"[srv] group FILE_END from={username} room={room}")
+            elif text.startswith("FILE_ACK "):
+                toks = text.split(" ")
+                if len(toks) >= 4:
+                    md5 = toks[1]
+                    try:
+                        off = int(toks[2])
+                    except Exception:
+                        off = 0
+                    try:
+                        wrote = int(toks[3])
+                    except Exception:
+                        wrote = 0
+                    print(f"[srv] group FILE_ACK from={username} room={room} md5={md5} off={off} wrote={wrote}")
             elif text.startswith("FILE_HAVE "):
                 toks = text.split(" ", 3)
                 if len(toks) >= 4:
@@ -191,11 +222,26 @@ class Hub:
                 if c is origin:
                     continue
                 targets.append((c, u))
-        for c, u in targets:
+        if text.startswith("FILE_ACK "):
             try:
-                c.sendall(msg)
+                origin.sendall(msg)
+                print(f"[srv] group SENT_ACK to={username}")
             except Exception:
                 pass
+        else:
+            try:
+                print(f"[srv] group FWD room={room} from={username} targets={len(targets)} head={text[:80]}")
+            except Exception:
+                pass
+            for c, u in targets:
+                try:
+                    c.sendall(msg)
+                    try:
+                        print(f"[srv] group SENT to={u}")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
         save_message(conv_group(room), username, text)
         for _, u in targets:
             self.store.inc(u, conv_group(room))
@@ -261,14 +307,43 @@ class Hub:
             elif text.startswith("FILE_CHUNK "):
                 toks = text.split(" ", 2)
                 if len(toks) >= 3:
+                    off = 0
+                    b64 = ""
+                    is_old = False
                     try:
                         off = int(toks[1])
+                        b64 = toks[2]
+                        is_old = True
                     except Exception:
-                        off = 0
-                    b64 = toks[2]
-                    print(f"[srv] dm FILE_CHUNK from={origin_user} to={target_user} off={off} len={len(b64)}")
+                        is_old = False
+                    
+                    if is_old:
+                        print(f"[srv] dm FILE_CHUNK from={origin_user} to={target_user} off={off} len={len(b64)}")
+                    else:
+                        filename = toks[1]
+                        rest = toks[2].split(" ", 1)
+                        if len(rest) >= 2:
+                            try:
+                                off = int(rest[0])
+                            except Exception:
+                                off = 0
+                            b64 = rest[1]
+                            print(f"[srv] dm FILE_CHUNK from={origin_user} to={target_user} name={filename} off={off} len={len(b64)}")
             elif text.startswith("FILE_END"):
                 print(f"[srv] dm FILE_END from={origin_user} to={target_user}")
+            elif text.startswith("FILE_ACK "):
+                toks = text.split(" ")
+                if len(toks) >= 4:
+                    md5 = toks[1]
+                    try:
+                        off = int(toks[2])
+                    except Exception:
+                        off = 0
+                    try:
+                        wrote = int(toks[3])
+                    except Exception:
+                        wrote = 0
+                    print(f"[srv] dm FILE_ACK from={origin_user} to={target_user} md5={md5} off={off} wrote={wrote}")
             elif text.startswith("FILE_HAVE "):
                 toks = text.split(" ", 3)
                 if len(toks) >= 4:
@@ -301,11 +376,19 @@ class Hub:
             for c, u in self.rooms.get(room, {}).items():
                 if u == target_user:
                     targets.append(c)
+        try:
+            print(f"[srv] dm FWD room={room} from={origin_user} to={target_user} targets={len(targets)} head={text[:80]}")
+        except Exception:
+            pass
         payload_target = f"[DM] FROM {origin_user} {text}\n".encode("utf-8")
         payload_origin = f"[DM] TO {target_user} {text}\n".encode("utf-8")
         for c in targets:
             try:
                 c.sendall(payload_target)
+                try:
+                    print(f"[srv] dm SENT to={target_user}")
+                except Exception:
+                    pass
             except Exception:
                 pass
         # Reduce backpressure: do not echo giant payloads back to origin
@@ -419,7 +502,7 @@ def conv_dm(a: str, b: str):
 
 def save_message(conv: str, sender: str, text: str):
     try:
-        if text.startswith("FILE_CHUNK "):
+        if text.startswith("FILE_CHUNK ") or text.startswith("FILE_ACK "):
             return
         if len(text) >= 262144:
             return

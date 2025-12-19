@@ -8,6 +8,12 @@ ENV_NAME="${ENV_NAME:-xiaocaichat}"
 
 mkdir -p "$BUILD_DIR"
 
+# Extract app version from source to keep bundle version in sync
+# Fallback to 0.0.0 if not found
+APP_VERSION_STR="$(awk -F '\"' '/^[[:space:]]*APP_VERSION[[:space:]]*=/ {print $2; exit}' qt_chat_client.py)"
+if [ -z \"$APP_VERSION_STR\" ]; then APP_VERSION_STR=\"0.0.0\"; fi
+export APP_VERSION="$APP_VERSION_STR"
+
 if [ ! -f "$ICON_PNG" ]; then
   echo "Icon PNG not found at $ICON_PNG" >&2
   exit 1
@@ -25,9 +31,7 @@ done
 
 iconutil -c icns "$ICONSET" -o "$BUILD_DIR/xiaocaichat.icns"
 
-conda run -n "$ENV_NAME" python -m pip install -U --upgrade-strategy eager "pyinstaller>=6.17" "pyinstaller-hooks-contrib>=2025.10" >/dev/null 2>&1 || true
-conda run -n "$ENV_NAME" python -m pip install -U --upgrade-strategy eager "PySide6>=6.7" >/dev/null 2>&1 || true
-conda run -n "$ENV_NAME" python -m pip install -U --upgrade-strategy eager "pyobjc-core" "pyobjc-framework-Cocoa" "pyobjc-framework-UserNotifications" >/dev/null 2>&1 || true
+conda run -n "$ENV_NAME" python -m pip install -r requirements.txt >/dev/null 2>&1 || true
 
 # Build app
 ADD_DATA_ARGS=(--add-data "icons:icons" --add-data "themes:themes")
@@ -52,6 +56,13 @@ conda run -n "$ENV_NAME" python -m PyInstaller \
   qt_chat_client.py
 
 echo "App built at dist/$APP_NAME.app"
+echo "Embedding version into Info.plist: $APP_VERSION"
+if [ -f "dist/$APP_NAME.app/Contents/Info.plist" ]; then
+  /usr/bin/plutil -replace CFBundleShortVersionString -string "$APP_VERSION" "dist/$APP_NAME.app/Contents/Info.plist" || true
+  /usr/bin/plutil -replace CFBundleVersion -string "$APP_VERSION" "dist/$APP_NAME.app/Contents/Info.plist" || true
+else
+  echo "Warning: Info.plist not found at dist/$APP_NAME.app/Contents/Info.plist" >&2
+fi
 
 # Ad-hoc sign the app to satisfy macOS Gatekeeper in some environments
 if command -v codesign >/dev/null 2>&1; then
