@@ -562,7 +562,9 @@ class BubbleDelegate(QtWidgets.QStyledItemDelegate):
         painter.setPen(name_color)
         name_y = bubble_rect.top() - 4
         if not is_self:
-            painter.drawText(QtCore.QRect(bubble_x, name_y - fm.height(), bubble_w, fm.height()), QtCore.Qt.AlignLeft, sender)
+            # Fix: Allow username text to be wider than the bubble so it's not truncated
+            name_rect_w = r.width() - bubble_x - margin
+            painter.drawText(QtCore.QRect(bubble_x, name_y - fm.height(), name_rect_w, fm.height()), QtCore.Qt.AlignLeft, sender)
         # no per-bubble time; time separators handled by system rows
         avatar = index.data(ChatModel.AvatarRole)
         if is_self:
@@ -2525,12 +2527,7 @@ class ChatWindow(QtWidgets.QWidget):
         self.setting_item = SidebarItem(setting_icon_path, "设置")
         self.setting_item.clicked.connect(self.on_sidebar_setting)
         sb.addWidget(self.avatar_label, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
-        self.user_label = QtWidgets.QLabel(self.username)
-        try:
-            self.user_label.setAlignment(QtCore.Qt.AlignHCenter)
-        except Exception:
-            pass
-        sb.addWidget(self.user_label, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
+
         sb.addWidget(self.msg_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
         sb.addWidget(self.group_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
         sb.addWidget(self.setting_item, 0, alignment=QtCore.Qt.AlignTop | QtCore.Qt.AlignHCenter)
