@@ -515,6 +515,8 @@ except Exception:
     pass
 CONFIG_JSON = os.path.join(_data_dir, "config.json")
 SERVER_CONFIG = {"retention_days": 7}
+ADMIN_PASSWORD = "123!@#qwe"
+ADMIN_SESSIONS = set()
 USERS_JSON = os.path.join(_data_dir, "users.json")
 REGISTERED_USERS = set()
 
@@ -1120,6 +1122,46 @@ def start_server(host: str, port: int):
                             pass
                         return None, None, None
 
+                    def _check_auth(self):
+                        try:
+                            cookie_header = self.headers.get("Cookie")
+                            if not cookie_header:
+                                return False
+                            for cookie in cookie_header.split(";"):
+                                cookie = cookie.strip()
+                                if cookie.startswith("admin_session="):
+                                    token = cookie.split("=", 1)[1]
+                                    if token in ADMIN_SESSIONS:
+                                        return True
+                        except Exception:
+                            pass
+                        return False
+
+                    def _login_page(self, error=""):
+                        html = f"""
+                        <html><head><meta charset="utf-8"><title>XiaoCaiChat Server Login</title>
+                        <style>body{{font-family:-apple-system,Helvetica,Arial,sans-serif;padding:40px;display:flex;justify-content:center;align-items:center;height:100vh;background-color:#f5f5f5;margin:0}}.login-box{{background:white;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:300px}}h1{{font-size:20px;margin:0 0 20px;text-align:center}}input{{width:100%;padding:10px;margin-bottom:10px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}}button{{width:100%;padding:10px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer}}button:hover{{background:#0056b3}}.error{{color:red;font-size:14px;margin-bottom:10px;text-align:center}}</style>
+                        </head><body>
+                        <div class="login-box">
+                            <h1>管理员登录</h1>
+                            {f'<div class="error">{error}</div>' if error else ''}
+                            <form method="post" action="/api/admin_login">
+                                <input type="password" name="password" placeholder="请输入密码" required>
+                                <button type="submit">登录</button>
+                            </form>
+                        </div>
+                        </body></html>
+                        """
+                        b = html.encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.send_header("Content-Length", str(len(b)))
+                        self.end_headers()
+                        try:
+                            self.wfile.write(b)
+                        except Exception:
+                            pass
+
                     def do_HEAD(self):
                         try:
                             p = self.path.split("?", 1)[0]
@@ -1214,6 +1256,9 @@ def start_server(host: str, port: int):
                                 except Exception:
                                     pass
                             else:
+                                if not self._check_auth():
+                                    self._login_page()
+                                    return
                                 rooms = list(hub.rooms.keys())
                                 name_map = {r: hub.room_names.get(r, r) for r in rooms}
                                 msg_alert = ""
@@ -1328,6 +1373,27 @@ def start_server(host: str, port: int):
                     def do_POST(self):
                         try:
                             p = self.path
+                            if p == "/api/admin_login":
+                                form = self._read_form()
+                                pwd = form.get("password", [""])[-1]
+                                if pwd == ADMIN_PASSWORD:
+                                    token = str(uuid.uuid4())
+                                    ADMIN_SESSIONS.add(token)
+                                    self.send_response(302)
+                                    self.send_header("Location", "/")
+                                    self.send_header("Set-Cookie", f"admin_session={token}; Path=/; HttpOnly")
+                                    self.end_headers()
+                                else:
+                                    self._login_page(error="密码错误")
+                                return
+
+                            # Protect admin APIs
+                            if p in ["/api/add_room", "/api/set_room_name", "/api/set_room_members", "/api/delete_room", "/api/delete_user", "/api/set_retention", "/api/quit"]:
+                                if not self._check_auth():
+                                    self.send_response(403)
+                                    self.end_headers()
+                                    return
+
                             if p == "/api/upload_file":
                                 # read raw body first to allow robust parsing
                                 try:
