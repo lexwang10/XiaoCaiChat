@@ -3454,6 +3454,12 @@ class ChatWindow(QtWidgets.QWidget):
                 except Exception:
                     pass
                 return
+            if len(parts) >= 2 and parts[1] == "KICKED_LOGIN_CONFLICT":
+                try:
+                    QtWidgets.QMessageBox.warning(self, "下线通知", "您的账号已在别处登录，本机已下线。")
+                except Exception:
+                    pass
+                return
             if len(parts) >= 2 and parts[1] == "DISCONNECT":
                 try:
                     m = self.conv_models.get(self.current_conv) if self.current_conv else None
@@ -8434,6 +8440,14 @@ def _delete_profile(base_dir: str, username: str):
             del d[username]
             with open(p, "w", encoding="utf-8") as f:
                 json.dump(d, f, ensure_ascii=False, indent=2)
+        
+        # Also delete the user's directory if it exists
+        user_dir = os.path.join(base_dir, username)
+        if os.path.isdir(user_dir):
+            try:
+                shutil.rmtree(user_dir)
+            except Exception:
+                pass
     except Exception:
         pass
 

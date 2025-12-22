@@ -14,7 +14,7 @@ import uuid
 import cgi
 import io
 import urllib.parse
-SERVER_VERSION = "1.0.1"
+SERVER_VERSION = "1.0.2"
 try:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 except Exception:
@@ -127,6 +127,25 @@ class Hub:
         if room and username:
             self.broadcast_sys(room, f"[SYS] LEAVE {room} {username}")
             self.broadcast_users(room)
+
+    def kick(self, username: str):
+        to_remove = []
+        with self.lock:
+            for room_map in self.rooms.values():
+                for conn, user in room_map.items():
+                    if user == username:
+                        to_remove.append(conn)
+        for conn in to_remove:
+            self.remove(conn)
+            try:
+                conn.sendall(b"[SYS] KICKED_LOGIN_CONFLICT\n")
+            except Exception:
+                pass
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+                conn.close()
+            except Exception:
+                pass
 
     def users(self, room: str):
         with self.lock:
@@ -746,15 +765,7 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
             else:
                 username = first[len("HELLO ") :].rstrip("\n") or addr[0]
             if username in hub.users(room):
-                try:
-                    conn.sendall(f"[SYS] NAME_TAKEN {room} {username}\n".encode("utf-8"))
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                return
+                hub.kick(username)
             if username not in REGISTERED_USERS:
                 try:
                     REGISTERED_USERS.add(username)
@@ -774,15 +785,7 @@ def handle_client(conn: socket.socket, addr, hub: Hub):
         else:
             text = first.rstrip("\n")
             if username in hub.users(room):
-                try:
-                    conn.sendall(f"[SYS] NAME_TAKEN {room} {username}\n".encode("utf-8"))
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                return
+                hub.kick(username)
             if username not in REGISTERED_USERS:
                 try:
                     REGISTERED_USERS.add(username)
@@ -1213,14 +1216,31 @@ def start_server(host: str, port: int):
                             else:
                                 rooms = list(hub.rooms.keys())
                                 name_map = {r: hub.room_names.get(r, r) for r in rooms}
+                                msg_alert = ""
+                                try:
+                                    qs = self.path.split("?", 1)
+                                    if len(qs) > 1:
+                                        for pair in qs[1].split("&"):
+                                            if pair == "msg=updated":
+                                                msg_alert = "<script>alert('更新成功');window.location.href='/';</script>"
+                                                break
+                                            if pair == "msg=retention_updated":
+                                                msg_alert = "<script>alert('设置保存成功');window.location.href='/';</script>"
+                                                break
+                                            if pair == "msg=name_updated":
+                                                msg_alert = "<script>alert('设置房间名称成功');window.location.href='/';</script>"
+                                                break
+                                except Exception:
+                                    pass
                                 html = ["<html><head><meta charset=\"utf-8\"><title>XiaoCaiChat Server</title>",
                                         "<style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;padding:20px}h1{font-size:20px;margin:0 0 14px}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 10px}input,button{font-size:14px;padding:6px 10px;margin:4px}form{margin:12px 0}</style>",
                                         "</head><body>",
+                                        msg_alert,
                                         "<h1>群聊后台管理</h1>",
                                         "<form method=\"post\" action=\"/api/quit\"><button type=\"submit\">关闭服务器</button></form>",
                                         f"<form method=\"post\" action=\"/api/set_retention\" style=\"border:1px solid #ddd;padding:10px;margin:10px 0;max_width:300px\"><div><b>系统设置</b></div><div style=\"margin-top:8px\"><label>文件保留天数: <input name=\"days\" type=\"number\" value=\"{SERVER_CONFIG.get('retention_days', 7)}\" style=\"width:60px\"></label> <button type=\"submit\">保存</button></div></form>",
                                         "<form method=\"post\" action=\"/api/add_room\"><input name=\"room\" placeholder=\"新房间ID\"><button type=\"submit\">添加房间</button></form>",
-                                        "<table><tr><th>房间ID</th><th>显示名称</th><th>成员限制 (空为公开)</th><th>在线用户</th><th>操作</th></tr>"]
+                                        "<table><tr><th>房间ID</th><th>显示名称</th><th>成员限制</th><th>在线用户</th><th>操作</th></tr>"]
                                 for r in rooms:
                                     u = hub.users(r)
                                     m = hub.room_members.get(r)
@@ -1228,21 +1248,34 @@ def start_server(host: str, port: int):
                                     current_m = m if m else set()
                                     reg_users = sorted(list(REGISTERED_USERS))
                                     checks = []
+                                    is_world = (r == "世界")
+                                    
                                     for user in reg_users:
-                                        checked = " checked" if user in current_m else ""
-                                        checks.append(f'<label style="display:block;margin:2px 0"><input type="checkbox" name="members" value="{user}"{checked}> {user}</label>')
-                                    for user in current_m:
-                                        if user not in REGISTERED_USERS:
-                                            checks.append(f'<label style="display:block;margin:2px 0"><input type="checkbox" name="members" value="{user}" checked> {user} (未注册)</label>')
+                                        if is_world:
+                                            checks.append(f'<label style="display:block;margin:2px 0"><input type="checkbox" name="members" value="{user}" checked disabled> {user}</label>')
+                                        else:
+                                            checked = " checked" if user in current_m else ""
+                                            checks.append(f'<label style="display:block;margin:2px 0"><input type="checkbox" name="members" value="{user}"{checked}> {user}</label>')
+                                    
+                                    if not is_world:
+                                        for user in current_m:
+                                            if user not in REGISTERED_USERS:
+                                                checks.append(f'<label style="display:block;margin:2px 0"><input type="checkbox" name="members" value="{user}" checked> {user} (未注册)</label>')
+                                    
                                     checks_html = "".join(checks) if checks else "<div style='color:#999'>无用户</div>"
-
-                                    del_btn = "<button type=\"submit\" disabled>删除房间</button>" if len(u) > 0 else "<button type=\"submit\">删除房间</button>"
+                                    
+                                    update_btn = "<button type=\"submit\" disabled>更新</button>" if is_world else "<button type=\"submit\">更新</button>"
+                                    set_name_html = "<div style='color:#999;padding:6px 0;font-size:13px'>默认房间不可更改名称</div>" if is_world else f"<form method=\"post\" action=\"/api/set_room_name\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"name\" placeholder=\"新的显示名称\"><button type=\"submit\">设置名称</button></form>"
+                                    
+                                    del_btn = "<button type=\"submit\" disabled>删除房间</button>" if len(u) > 0 else "<button type=\"submit\" onclick=\"return confirm('确定要删除该房间吗？');\">删除房间</button>"
+                                    del_form_html = "" if is_world else f"<form method=\"post\" action=\"/api/delete_room\"><input type=\"hidden\" name=\"room\" value=\"{r}\">{del_btn}</form>"
+                                    
                                     html.append(
                                         f"<tr><td>{r}</td><td>{name_map.get(r,r)}</td>"
-                                        f"<td><form method=\"post\" action=\"/api/set_room_members\" style=\"margin:0\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><div style=\"max-height:150px;overflow-y:auto;border:1px solid #ddd;padding:5px;margin-bottom:5px;font-size:13px\">{checks_html}</div><button type=\"submit\">更新</button></form></td>"
+                                        f"<td><form method=\"post\" action=\"/api/set_room_members\" style=\"margin:0\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><div style=\"max-height:150px;overflow-y:auto;border:1px solid #ddd;padding:5px;margin-bottom:5px;font-size:13px\">{checks_html}</div>{update_btn}</form></td>"
                                         f"<td>{len(u)}</td><td>"
-                                        f"<form method=\"post\" action=\"/api/set_room_name\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"name\" placeholder=\"新的显示名称\"><button type=\"submit\">设置名称</button></form>"
-                                        f"<form method=\"post\" action=\"/api/delete_room\"><input type=\"hidden\" name=\"room\" value=\"{r}\">{del_btn}</form>"
+                                        f"{set_name_html}"
+                                        f"{del_form_html}"
                                         f"</td></tr>"
                                     )
                                 html.append("</table>")
@@ -1475,7 +1508,7 @@ def start_server(host: str, port: int):
                                 form = self._read_form()
                                 room = form.get("room", [""])[-1]
                                 name = form.get("name", [""])[-1]
-                                if room and name:
+                                if room and name and room != "世界":
                                     with hub.lock:
                                         hub.room_names[room] = name
                                     try:
@@ -1487,7 +1520,7 @@ def start_server(host: str, port: int):
                                     except Exception:
                                         pass
                                 self.send_response(302)
-                                self.send_header("Location", "/")
+                                self.send_header("Location", "/?msg=name_updated")
                                 self.end_headers()
                                 return
                             if p == "/api/set_room_members":
@@ -1495,25 +1528,35 @@ def start_server(host: str, port: int):
                                 room = form.get("room", [""])[-1]
                                 members_list = form.get("members", [])
                                 if room:
-                                    members_list = [x.strip() for x in members_list if x.strip()]
-                                    with hub.lock:
-                                        if members_list:
-                                            hub.room_members[room] = set(members_list)
-                                        else:
+                                    # World room is always open to everyone
+                                    if room == "世界":
+                                        with hub.lock:
                                             if room in hub.room_members:
                                                 del hub.room_members[room]
-                                    try:
-                                        hub._save_rooms()
-                                    except Exception:
-                                        pass
+                                        try:
+                                            hub._save_rooms()
+                                        except Exception:
+                                            pass
+                                    else:
+                                        members_list = [x.strip() for x in members_list if x.strip()]
+                                        with hub.lock:
+                                            if members_list:
+                                                hub.room_members[room] = set(members_list)
+                                            else:
+                                                if room in hub.room_members:
+                                                    del hub.room_members[room]
+                                        try:
+                                            hub._save_rooms()
+                                        except Exception:
+                                            pass
                                 self.send_response(302)
-                                self.send_header("Location", "/")
+                                self.send_header("Location", "/?msg=updated")
                                 self.end_headers()
                                 return
                             if p == "/api/delete_room":
                                 form = self._read_form()
                                 room = form.get("room", [""])[-1]
-                                if room:
+                                if room and room != "世界":
                                     with hub.lock:
                                         users = hub.rooms.get(room, {})
                                         if room in hub.rooms and len(users) == 0:
@@ -1558,7 +1601,7 @@ def start_server(host: str, port: int):
                                 except Exception:
                                     pass
                                 self.send_response(302)
-                                self.send_header("Location", "/")
+                                self.send_header("Location", "/?msg=retention_updated")
                                 self.end_headers()
                                 return
                             if p == "/api/quit":
