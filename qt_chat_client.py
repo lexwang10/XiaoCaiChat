@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 
 from PySide6 import QtCore, QtWidgets, QtGui
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 import threading
 try:
     import Cocoa
@@ -28,7 +28,7 @@ from chat_utils import ChatLogger
 from chat_local_store import LocalStore
 
 
-class Receiver(QtCore.QObject):
+class Receiver(QtCore.QThread):
     received = QtCore.Signal(str)
 
     def __init__(self, sock: socket.socket):
@@ -36,59 +36,45 @@ class Receiver(QtCore.QObject):
         self.sock = sock
         self.running = False
         self.f = None
-        self._thread: Optional[threading.Thread] = None
 
-    @QtCore.Slot(str)
-    def _emit_line(self, s: str):
-        self.received.emit(s)
-
-    def _loop(self):
+    def run(self):
+        self.running = True
         try:
             self.f = self.sock.makefile("r", encoding="utf-8", newline="\n")
         except Exception:
             self.f = None
+        
         try:
             while self.running:
                 if not self.f:
                     break
-                line = self.f.readline()
+                try:
+                    line = self.f.readline()
+                except Exception as e:
+                    print(f"[Receiver] readline error: {e}")
+                    break
                 if not line:
+                    print("[Receiver] readline empty (EOF)")
                     break
                 t = line.rstrip("\n")
                 if t:
                     try:
-                        QtCore.QMetaObject.invokeMethod(self, "_emit_line", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, t))
+                        self.received.emit(t)
                     except Exception:
                         pass
+        except Exception as e:
+            print(f"[Receiver] Loop exception: {e}")
+        finally:
+            print("[Receiver] Loop finished, emitting DISCONNECT")
             try:
-                QtCore.QMetaObject.invokeMethod(self, "_emit_line", QtCore.Qt.QueuedConnection, QtCore.Q_ARG(str, "[SYS] DISCONNECT"))
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    def start(self):
-        if self.running:
-            return
-        self.running = True
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def wait(self, msecs: int = 0):
-        try:
-            if self._thread:
-                self._thread.join(timeout=(msecs/1000.0 if msecs and msecs > 0 else None))
-        except Exception:
-            pass
+                self.received.emit("[SYS] DISCONNECT")
+            except Exception as e:
+                print(f"[Receiver] Emit DISCONNECT failed: {e}")
+            self.running = False
 
     def stop(self):
         self.running = False
         try:
-            if self.f:
-                try:
-                    self.f.close()
-                except Exception:
-                    pass
             if self.sock:
                 try:
                     self.sock.shutdown(socket.SHUT_RDWR)
@@ -96,6 +82,11 @@ class Receiver(QtCore.QObject):
                     pass
                 try:
                     self.sock.close()
+                except Exception:
+                    pass
+            if self.f:
+                try:
+                    self.f.close()
                 except Exception:
                     pass
         except Exception:
@@ -2621,18 +2612,6 @@ class EmojiPicker(QtWidgets.QDialog):
         except Exception:
             pass
         return False
-    
-    def closeEvent(self, e: QtGui.QCloseEvent):
-        try:
-            app = QtWidgets.QApplication.instance()
-            if app:
-                app.removeEventFilter(self)
-        except Exception:
-            pass
-        try:
-            super().closeEvent(e)
-        except Exception:
-            pass
 
 class ChatWindow(QtWidgets.QWidget):
     def __init__(self, host: str, port: int, username: str, log_dir: str, room: str, avatar_path: Optional[str] = None):
@@ -2739,7 +2718,12 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
         self.conv_models = {}
+        self.conv_name_labels = {}
         self.current_model = None
+        self.reconnect_timer = QtCore.QTimer(self)
+        self.reconnect_timer.setInterval(5000)
+        self.reconnect_timer.timeout.connect(self._auto_reconnect)
+        self.is_connected = False
         self.view.setItemDelegate(BubbleDelegate())
         self.view.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self.on_view_context_menu)
@@ -3222,7 +3206,7 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
         self.rx = Receiver(self.sock)
-        self.rx.received.connect(self.on_received)
+        self.rx.received.connect(self.on_received, QtCore.Qt.QueuedConnection)
         self.rx.start()
         try:
             if hasattr(self, 'status_left') and self.status_left:
@@ -3259,6 +3243,12 @@ class ChatWindow(QtWidgets.QWidget):
                     self._send_seq(f"AUTH {self.username} {ts} {mac}")
                 except Exception:
                     pass
+        try:
+            if hasattr(self, 'status_left') and self.status_left:
+                self._set_status_text(f"已连接 {self.host}:{self.port}", True)
+            self.is_connected = True
+        except Exception:
+            pass
         # 不自动请求未读，避免清空本地后服务端推送历史
         if self.avatar_filename:
             try:
@@ -3300,9 +3290,10 @@ class ChatWindow(QtWidgets.QWidget):
             pass
         rx = Receiver(s)
         try:
-            rx.received.connect(lambda t, _rid=rid: self.on_received_room(_rid, t))
+            # Use Qt.QueuedConnection to ensure cross-thread signal delivery
+            rx.received.connect(lambda t, _rid=rid: self.on_received_room(_rid, t), QtCore.Qt.QueuedConnection)
         except Exception:
-            rx.received.connect(self.on_received)
+            rx.received.connect(self.on_received, QtCore.Qt.QueuedConnection)
         rx.start()
         self.socks[rid] = s
         self.receivers[rid] = rx
@@ -3317,7 +3308,7 @@ class ChatWindow(QtWidgets.QWidget):
             pass
         return True
 
-    def _connect_all_rooms(self) -> bool:
+    def _connect_all_rooms(self, auto_retry: bool = False) -> bool:
         try:
             if not self.rooms_info:
                 self._sync_room_from_server()
@@ -3325,30 +3316,68 @@ class ChatWindow(QtWidgets.QWidget):
             if not rooms:
                 ok = self._connect()
                 if not ok:
-                    try:
-                        self._show_connect_error(self.host, self.port, "网络或服务器不可用")
-                    except Exception:
-                        pass
+                    if not auto_retry:
+                        try:
+                            self._show_connect_error(self.host, self.port, "网络或服务器不可用")
+                        except Exception:
+                            pass
+                else:
+                    self._update_sidebar_closed_status(False)
+                    self.reconnect_timer.stop()
                 return ok
             # init view model once
-            self.current_conv = None
-            self.current_model = ChatModel()
-            self.view.setModel(self.current_model)
+            if not self.current_model:
+                self.current_conv = None
+                self.current_model = ChatModel()
+                self.view.setModel(self.current_model)
             # heartbeat timer
             self.hb = QtCore.QTimer(self)
             self.hb.setInterval(30000)
             self.hb.timeout.connect(self._send_ping)
             self.hb.start()
+            any_connected = False
             for r in rooms:
                 rid = str(r.get("id"))
-                if not self._connect_room(rid):
-                    try:
-                        self._show_connect_error(self.host, self.port, f"房间 {rid} 连接失败")
-                    except Exception:
-                        pass
-            return True
+                if self._connect_room(rid):
+                    any_connected = True
+                    # Immediately mark as connected if any room connects
+                    self.is_connected = True
+                else:
+                    if not auto_retry:
+                        try:
+                            self._show_connect_error(self.host, self.port, f"房间 {rid} 连接失败")
+                        except Exception:
+                            pass
+            
+            if any_connected:
+                self._update_sidebar_closed_status(False)
+                self.reconnect_timer.stop()
+                return True
+            else:
+                self._update_sidebar_closed_status(True)
+                return False
         except Exception:
+            self._update_sidebar_closed_status(True)
             return False
+
+    def _auto_reconnect(self):
+        print(f"[Client] _auto_reconnect triggered")
+        try:
+            if self._connect_all_rooms(auto_retry=True):
+                print(f"[Client] Reconnect success")
+                self.reconnect_timer.stop()
+                self._set_status_text(f"已连接 {self.host}:{self.port}", True)
+                # Show reconnected message in current view
+                m = self.conv_models.get(self.current_conv) if self.current_conv else None
+                if m:
+                    m.add("sys", "", "服务器连接已恢复", False, None)
+                    self.view.scrollToBottom()
+            else:
+                print(f"[Client] Reconnect failed")
+                self._set_status_text(f"重连中... {self.host}:{self.port}", False)
+        except Exception as e:
+            print(f"[Client] Reconnect exception: {e}")
+
     def _show_connect_error(self, host: str, port: int, detail: str = ""):
         try:
             m = QtWidgets.QMessageBox(self)
@@ -3461,18 +3490,31 @@ class ChatWindow(QtWidgets.QWidget):
                     pass
                 return
             if len(parts) >= 2 and parts[1] == "DISCONNECT":
+                print(f"[Client] Received DISCONNECT")
                 try:
+                    print("[Client] Starting reconnect timer")
+                    self.reconnect_timer.start()
+                    # Handled in on_received_room now to avoid duplicates if possible, 
+                    # but if current_conv is not a room (e.g. DM), we might still want to show it.
+                    # However, on_received is called by on_received_room, so we might duplicate if both add.
+                    # Let's check here too.
                     m = self.conv_models.get(self.current_conv) if self.current_conv else None
                     if m:
-                        m.add("sys", "", "服务器连接已断开", False, None)
-                        self.view.scrollToBottom()
+                        last_msg = m.items[-1] if m.items else None
+                        should_show = True
+                        if last_msg and last_msg.get("text") == "服务器连接已断开" and last_msg.get("type") == "sys":
+                             should_show = False
+                        if should_show:
+                            m.add("sys", "", "服务器连接已断开", False, None)
+                            self.view.scrollToBottom()
                     if hasattr(self, 'status_left') and self.status_left:
                         try:
                             self._set_status_text(f"已断开 {self.host}:{self.port}", False)
                         except Exception:
                             pass
-                except Exception:
-                    pass
+                    self._update_sidebar_closed_status(True)
+                except Exception as e:
+                    print(f"[Client] Error handling DISCONNECT: {e}")
                 return
             if len(parts) >= 4 and parts[1] == "LEAVE":
                 room = parts[2]
@@ -3518,8 +3560,16 @@ class ChatWindow(QtWidgets.QWidget):
                     for key in list(self.conv_models.keys()):
                         if key.startswith("dm:"):
                             name = key.split(":",1)[1]
+                            # Only set offline if not in current_peers AND not self
                             if name != self.username and name not in current_peers:
                                 self._set_online(name, False)
+                    # Also check online_users set for any that should be removed
+                    for name in list(self.online_users):
+                        if name != self.username and name not in current_peers:
+                            self._set_online(name, False)
+                    # Force refresh all icons after sync
+                    for name in list(self.online_users):
+                        self._refresh_conv_icon(name)
                 return
             if len(parts) >= 4 and parts[1] == "ROOM_NAME":
                 room = parts[2]
@@ -4151,20 +4201,30 @@ class ChatWindow(QtWidgets.QWidget):
                         pass
                 return
             if len(parts) >= 2 and parts[1] == "DISCONNECT":
+                # Only handle DISCONNECT if we are currently connected to avoid duplicates
+                # Or check if we already showed it recently? 
+                # Better: let on_received handle the global state, here just show in room if not already shown
+                # But on_received calls this too? No, on_received_room calls on_received.
+                
+                # Check if we already displayed disconnect message recently to avoid duplicates
+                # We can check the last message in the model
                 try:
                     key = f"group:{rid}"
                     self._ensure_conv(key)
                     m = self.conv_models.get(key)
                     if m:
-                        m.add("sys", "", "服务器连接已断开", False, None)
-                        self.view.scrollToBottom()
-                    if hasattr(self, 'status_left') and self.status_left:
-                        try:
-                            self._set_status_text(f"已断开 {self.host}:{self.port}", False)
-                        except Exception:
-                            pass
+                        last_msg = m.items[-1] if m.items else None
+                        should_show = True
+                        if last_msg and last_msg.get("text") == "服务器连接已断开" and last_msg.get("type") == "sys":
+                             # Check timestamp if needed, but for now exact text match is enough
+                             should_show = False
+                        
+                        if should_show:
+                            m.add("sys", "", "服务器连接已断开", False, None)
+                            self.view.scrollToBottom()
                 except Exception:
                     pass
+                self.on_received(text)
                 return
             if len(parts) >= 4 and parts[1] == "LEAVE":
                 room = parts[2]
@@ -4210,11 +4270,28 @@ class ChatWindow(QtWidgets.QWidget):
                             except Exception:
                                 pass
                             current_peers.add(uname)
-                    for key in list(self.conv_models.keys()):
-                        if key.startswith("dm:"):
-                            name = key.split(":",1)[1]
+                    # Clear online status for users not in the list
+                    # But be careful: if we are in multiple rooms, USERS from one room shouldn't clear
+                    # users from another room if they are not in the current room list.
+                    # However, in this simple client, USERS usually lists everyone in the room.
+                    # If we treat online_users as "global online", this might be problematic if users are only in other rooms.
+                    # Assuming USERS list is comprehensive for the context we care about.
+                    # If we only care about DM targets being online:
+                    # Users usually are global. If server sends USERS for a room, does it include everyone?
+                    # The server implementation sends "USERS {room} {user_list}" on join.
+                    # If this is the main room/lobby, it's fine.
+                    
+                    # Instead of clearing everyone not in current_peers, we should only clear
+                    # those that we *expect* to be in this room but aren't.
+                    # Or simpler: trust the USERS list fully for the "online" set if this is the main room.
+                    if rid == self.room: # Only sync full online list from main room
+                        for name in list(self.online_users):
                             if name != self.username and name not in current_peers:
                                 self._set_online(name, False)
+                    
+                    # Force refresh all icons after sync
+                    for name in list(self.online_users):
+                        self._refresh_conv_icon(name)
                 return
             if len(parts) >= 4 and parts[1] == "ROOM_NAME":
                 room = parts[2]
@@ -5581,6 +5658,7 @@ class ChatWindow(QtWidgets.QWidget):
             w.setLayout(hl)
             self.conv_list.setItemWidget(it, w)
         self.conv_badges[f"dm:{name}"] = badge_lbl
+        self.conv_name_labels[f"dm:{name}"] = name_lbl
         self.conv_avatar_labels[f"dm:{name}"] = avatar_lbl
         self._ensure_unread_key(f"dm:{name}")
         self._ensure_conv(f"dm:{name}")
@@ -5604,6 +5682,10 @@ class ChatWindow(QtWidgets.QWidget):
             del self.conv_unread[key]
         if key in self.conv_models:
             del self.conv_models[key]
+        if key in self.conv_name_labels:
+            del self.conv_name_labels[key]
+        if key in self.conv_badges:
+            del self.conv_badges[key]
         if key in self.conv_avatar_labels:
             del self.conv_avatar_labels[key]
 
@@ -5679,6 +5761,40 @@ class ChatWindow(QtWidgets.QWidget):
             self._apply_conv_filter()
         except Exception:
             pass
+
+    def _update_sidebar_closed_status(self, closed: bool):
+        suffix = " (已断开)"
+        for key, lbl in self.conv_name_labels.items():
+            try:
+                text = lbl.text()
+                if closed:
+                    # if not text.endswith(suffix):
+                    #    lbl.setText(text + suffix)
+                    lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';color:gray;}")
+                else:
+                    if text.endswith(suffix):
+                        lbl.setText(text[:-len(suffix)])
+                    lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';color:black;}")
+            except Exception:
+                pass
+        
+        # Force refresh icons when disconnected/reconnected to update saturation
+        if closed:
+            # If closed, all avatars should be desaturated
+            self.is_connected = False
+            for name in list(self.online_users):
+                self._refresh_conv_icon(name)
+        else:
+            # If reconnected, online users should be saturated
+            self.is_connected = True
+            for name in list(self.online_users):
+                self._refresh_conv_icon(name)
+            # Add delayed refresh to ensure stability
+            def _refresh_all():
+                for name in list(self.online_users):
+                    self._refresh_conv_icon(name)
+            QtCore.QTimer.singleShot(500, _refresh_all)
+
     def _update_sidebar_badge(self):
         try:
             total_dm = sum(v for k,v in self.conv_unread.items() if k.startswith("dm:"))
@@ -5726,6 +5842,7 @@ class ChatWindow(QtWidgets.QWidget):
         try:
             self.conv_list.clear()
             self.conv_badges = {}
+            self.conv_name_labels = {}
             try:
                 self.conv_avatar_labels = {}
             except Exception:
@@ -5929,6 +6046,32 @@ class ChatWindow(QtWidgets.QWidget):
                 lbl = self.conv_avatar_labels.get(f"dm:{name}")
                 if lbl:
                     lbl.setPixmap(self._status_pixmap_for_name(name, 24))
+                    lbl.repaint()  # Force repaint of avatar label
+                
+                # Force update text color based on online status if sidebar is not in "disconnected" mode
+                # This ensures if a user comes online/offline, their text color is correct
+                # Note: "disconnected" mode (all gray) is handled by _update_sidebar_closed_status
+                # But here we might be in connected state, so we should ensure individual items are black
+                try:
+                    name_lbl = self.conv_name_labels.get(f"dm:{name}")
+                    if name_lbl:
+                        # If we are connected (assuming we are if receiving updates), 
+                        # text should be black unless we are globally disconnected
+                        # We can check reconnect_timer state or just assume black if this is called
+                        # However, _update_sidebar_closed_status sets color:gray.
+                        # If we are here, likely we are connected or updating status.
+                        # Let's reset color to black if not explicitly disconnected
+                        if hasattr(self, "is_connected") and self.is_connected:
+                             name_lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';color:black;}")
+                             name_lbl.repaint() # Force repaint of name label
+                except Exception:
+                    pass
+                
+                # Force repaint of list item
+                try:
+                    self.conv_list.update(self.conv_list.visualItemRect(item))
+                except Exception:
+                    pass
                 break
 
     def _set_peer_avatar(self, name: str, filename: str):
@@ -6036,24 +6179,44 @@ class ChatWindow(QtWidgets.QWidget):
 
     def _status_pixmap_for_name(self, name: str, size: int = 24) -> QtGui.QPixmap:
         base = self._base_avatar_pixmap(name, size)
+        # Check if connected
+        if hasattr(self, "is_connected") and not self.is_connected:
+            return self._desaturate_pixmap(base, size)
+        
         if name in self.online_users:
             return base
         return self._desaturate_pixmap(base, size)
 
     def _desaturate_pixmap(self, pm: QtGui.QPixmap, size: int) -> QtGui.QPixmap:
-        img = pm.toImage().convertToFormat(QtGui.QImage.Format_ARGB32)
+        if pm.isNull():
+            return pm
+        img = pm.toImage()
+        if img.format() != QtGui.QImage.Format_ARGB32:
+            img = img.convertToFormat(QtGui.QImage.Format_ARGB32)
+        
         w = img.width()
         h = img.height()
+        
+        # Create a new image for the grayscale version to avoid modifying shared data if implicit sharing is used
+        out_img = QtGui.QImage(w, h, QtGui.QImage.Format_ARGB32)
+        out_img.fill(QtCore.Qt.transparent)
+        
         for y in range(h):
             for x in range(w):
                 c = img.pixel(x, y)
                 a = (c >> 24) & 0xFF
+                if a == 0:
+                    continue
                 r = (c >> 16) & 0xFF
                 g = (c >> 8) & 0xFF
                 b = c & 0xFF
+                # Standard grayscale conversion
                 gray = int(0.299 * r + 0.587 * g + 0.114 * b)
-                img.setPixel(x, y, (a << 24) | (gray << 16) | (gray << 8) | gray)
-        out = QtGui.QPixmap.fromImage(img)
+                # Reconstruct pixel with original alpha
+                new_c = (a << 24) | (gray << 16) | (gray << 8) | gray
+                out_img.setPixel(x, y, new_c)
+                
+        out = QtGui.QPixmap.fromImage(out_img)
         return out.scaled(size, size, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
 
     def switch_conv(self, key: str):
@@ -6991,6 +7154,7 @@ class ChatWindow(QtWidgets.QWidget):
                 w.setLayout(hl)
                 self.conv_list.setItemWidget(it, w)
                 self.conv_badges[f"group:{rid}"] = badge_lbl
+                self.conv_name_labels[f"group:{rid}"] = name_lbl
             try:
                 self._ensure_unread_key(f"group:{rid}")
             except Exception:
@@ -7949,6 +8113,54 @@ class ChatWindow(QtWidgets.QWidget):
         bubble_rect = QtCore.QRect(bubble_x, bubble_y, bubble_w, bubble_h)
         return bubble_rect.contains(vp_pos)
 
+    def cleanup(self):
+        try:
+            if hasattr(self, 'reconnect_timer'):
+                try:
+                    self.reconnect_timer.stop()
+                except Exception:
+                    pass
+            if hasattr(self, 'hb'):
+                try:
+                    self.hb.stop()
+                except Exception:
+                    pass
+            
+            threads = []
+            # Stop main receiver
+            if hasattr(self, 'rx') and self.rx:
+                try:
+                    if self.rx.isRunning():
+                        self.rx.stop()
+                        threads.append(self.rx)
+                except Exception:
+                    pass
+            
+            # Stop room receivers
+            if hasattr(self, 'receivers'):
+                for rx in self.receivers.values():
+                    try:
+                        if rx and rx.isRunning():
+                            rx.stop()
+                            threads.append(rx)
+                    except Exception:
+                        pass
+            
+            # Wait for all threads
+            for t in threads:
+                try:
+                    if t.isRunning():
+                        t.wait(100)
+                    if t.isRunning():
+                        t.terminate()
+                        t.wait(50)
+                except Exception:
+                    pass
+            
+            self._on_app_quit()
+        except Exception:
+            pass
+
     def closeEvent(self, e: QtGui.QCloseEvent):
         try:
             e.ignore()
@@ -8334,7 +8546,9 @@ def main():
         pass
     win.resize(700, 500)
     win.show()
-    app.exec()
+    ret = app.exec()
+    win.cleanup()
+    return ret
 
 def _load_profiles(base_dir: str):
     try:
@@ -8473,4 +8687,4 @@ def _apply_theme(app: QtWidgets.QApplication, name: str):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

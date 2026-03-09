@@ -1139,11 +1139,11 @@ def start_server(host: str, port: int):
 
                     def _login_page(self, error=""):
                         html = f"""
-                        <html><head><meta charset="utf-8"><title>XiaoCaiChat Server Login</title>
+                        <html><head><meta charset="utf-8"><title>XiaoCaiChat Server Login v{SERVER_VERSION}</title>
                         <style>body{{font-family:-apple-system,Helvetica,Arial,sans-serif;padding:40px;display:flex;justify-content:center;align-items:center;height:100vh;background-color:#f5f5f5;margin:0}}.login-box{{background:white;padding:30px;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,0.1);width:300px}}h1{{font-size:20px;margin:0 0 20px;text-align:center}}input{{width:100%;padding:10px;margin-bottom:10px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}}button{{width:100%;padding:10px;background:#007bff;color:white;border:none;border-radius:4px;cursor:pointer}}button:hover{{background:#0056b3}}.error{{color:red;font-size:14px;margin-bottom:10px;text-align:center}}</style>
                         </head><body>
                         <div class="login-box">
-                            <h1>管理员登录</h1>
+                            <h1>管理员登录 (v{SERVER_VERSION})</h1>
                             {f'<div class="error">{error}</div>' if error else ''}
                             <form method="post" action="/api/admin_login">
                                 <input type="password" name="password" placeholder="请输入密码" required>
@@ -1277,11 +1277,11 @@ def start_server(host: str, port: int):
                                                 break
                                 except Exception:
                                     pass
-                                html = ["<html><head><meta charset=\"utf-8\"><title>XiaoCaiChat Server</title>",
+                                html = [f"<html><head><meta charset=\"utf-8\"><title>XiaoCaiChat Server v{SERVER_VERSION}</title>",
                                         "<style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;padding:20px}h1{font-size:20px;margin:0 0 14px}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 10px}input,button{font-size:14px;padding:6px 10px;margin:4px}form{margin:12px 0}</style>",
                                         "</head><body>",
                                         msg_alert,
-                                        "<h1>群聊后台管理</h1>",
+                                        f"<h1>群聊后台管理 (v{SERVER_VERSION})</h1>",
                                         "<form method=\"post\" action=\"/api/quit\"><button type=\"submit\">关闭服务器</button></form>",
                                         f"<form method=\"post\" action=\"/api/set_retention\" style=\"border:1px solid #ddd;padding:10px;margin:10px 0;max_width:300px\"><div><b>系统设置</b></div><div style=\"margin-top:8px\"><label>文件保留天数: <input name=\"days\" type=\"number\" value=\"{SERVER_CONFIG.get('retention_days', 7)}\" style=\"width:60px\"></label> <button type=\"submit\">保存</button></div></form>",
                                         "<form method=\"post\" action=\"/api/add_room\"><input name=\"room\" placeholder=\"新房间ID\"><button type=\"submit\">添加房间</button></form>",
