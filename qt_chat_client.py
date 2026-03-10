@@ -5201,6 +5201,13 @@ class ChatWindow(QtWidgets.QWidget):
     def on_send(self):
         if not self.current_conv:
             return
+        try:
+            if self.current_conv.startswith("group:"):
+                rid = self.current_conv.split(":",1)[1]
+                if rid in getattr(self, "closed_rooms", set()):
+                    return
+        except Exception:
+            pass
         # Use get_clean_text() to avoid including quote text in the message body
         text = self._sanitize_text(self.entry.get_clean_text())
         
@@ -5818,6 +5825,13 @@ class ChatWindow(QtWidgets.QWidget):
             del self.conv_avatar_labels[key]
 
     def on_send_file(self):
+        try:
+            if self.current_conv and self.current_conv.startswith("group:"):
+                rid = self.current_conv.split(":",1)[1]
+                if rid in getattr(self, "closed_rooms", set()):
+                    return
+        except Exception:
+            pass
         dlg = QtWidgets.QFileDialog(self)
         dlg.setFileMode(QtWidgets.QFileDialog.ExistingFile)
         if dlg.exec():
@@ -6380,6 +6394,20 @@ class ChatWindow(QtWidgets.QWidget):
         self.current_model = self.conv_models[key]
         self.view.setModel(self.current_model)
         self._reset_unread(key)
+        try:
+            editable = True
+            if key.startswith("group:"):
+                rid = key.split(":",1)[1]
+                if rid in getattr(self, "closed_rooms", set()):
+                    editable = False
+            self.entry.setReadOnly(not editable)
+            self.entry.setEnabled(editable)
+            if editable:
+                self.entry.setPlaceholderText("")
+            else:
+                self.entry.setPlaceholderText("该房间已解散，无法发送新消息")
+        except Exception:
+            pass
         try:
             self.view.scrollToBottom()
         except Exception:
