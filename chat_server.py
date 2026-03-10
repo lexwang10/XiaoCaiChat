@@ -14,7 +14,7 @@ import uuid
 import cgi
 import io
 import urllib.parse
-SERVER_VERSION = "1.0.2"
+SERVER_VERSION = "1.0.3"
 try:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 except Exception:

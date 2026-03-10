@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 
 from PySide6 import QtCore, QtWidgets, QtGui
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 import threading
 try:
     import Cocoa
