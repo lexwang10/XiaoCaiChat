@@ -3413,6 +3413,30 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _handle_disconnect(self):
+        # Debounce: if timer is already active, we are already disconnected/handling
+        if self.reconnect_timer.isActive():
+            return
+            
+        print("[Client] Handling global DISCONNECT")
+        try:
+            self.reconnect_timer.start()
+            self._update_sidebar_closed_status(True)
+            if hasattr(self, 'status_left') and self.status_left:
+                self._set_status_text(f"已断开 {self.host}:{self.port}", False)
+                
+            # Show in current conversation only
+            if self.current_conv:
+                m = self.conv_models.get(self.current_conv)
+                if m:
+                    # Optional: check if last message is already disconnect
+                    last_msg = m.items[-1] if m.items else None
+                    if not (last_msg and last_msg.get("text") == "服务器连接已断开" and last_msg.get("type") == "sys"):
+                        m.add("sys", "", "服务器连接已断开", False, None)
+                        self.view.scrollToBottom()
+        except Exception as e:
+            print(f"[Client] Error in _handle_disconnect: {e}")
+
     def on_received(self, text: str):
         self.logger.write("recv", self.host, text)
         if text.startswith("PONG "):
@@ -3492,27 +3516,7 @@ class ChatWindow(QtWidgets.QWidget):
             if len(parts) >= 2 and parts[1] == "DISCONNECT":
                 print(f"[Client] Received DISCONNECT")
                 try:
-                    print("[Client] Starting reconnect timer")
-                    self.reconnect_timer.start()
-                    # Handled in on_received_room now to avoid duplicates if possible, 
-                    # but if current_conv is not a room (e.g. DM), we might still want to show it.
-                    # However, on_received is called by on_received_room, so we might duplicate if both add.
-                    # Let's check here too.
-                    m = self.conv_models.get(self.current_conv) if self.current_conv else None
-                    if m:
-                        last_msg = m.items[-1] if m.items else None
-                        should_show = True
-                        if last_msg and last_msg.get("text") == "服务器连接已断开" and last_msg.get("type") == "sys":
-                             should_show = False
-                        if should_show:
-                            m.add("sys", "", "服务器连接已断开", False, None)
-                            self.view.scrollToBottom()
-                    if hasattr(self, 'status_left') and self.status_left:
-                        try:
-                            self._set_status_text(f"已断开 {self.host}:{self.port}", False)
-                        except Exception:
-                            pass
-                    self._update_sidebar_closed_status(True)
+                    self._handle_disconnect()
                 except Exception as e:
                     print(f"[Client] Error handling DISCONNECT: {e}")
                 return
@@ -4201,30 +4205,11 @@ class ChatWindow(QtWidgets.QWidget):
                         pass
                 return
             if len(parts) >= 2 and parts[1] == "DISCONNECT":
-                # Only handle DISCONNECT if we are currently connected to avoid duplicates
-                # Or check if we already showed it recently? 
-                # Better: let on_received handle the global state, here just show in room if not already shown
-                # But on_received calls this too? No, on_received_room calls on_received.
-                
-                # Check if we already displayed disconnect message recently to avoid duplicates
-                # We can check the last message in the model
+                # Handle disconnect globally with debounce
                 try:
-                    key = f"group:{rid}"
-                    self._ensure_conv(key)
-                    m = self.conv_models.get(key)
-                    if m:
-                        last_msg = m.items[-1] if m.items else None
-                        should_show = True
-                        if last_msg and last_msg.get("text") == "服务器连接已断开" and last_msg.get("type") == "sys":
-                             # Check timestamp if needed, but for now exact text match is enough
-                             should_show = False
-                        
-                        if should_show:
-                            m.add("sys", "", "服务器连接已断开", False, None)
-                            self.view.scrollToBottom()
+                    self._handle_disconnect()
                 except Exception:
                     pass
-                self.on_received(text)
                 return
             if len(parts) >= 4 and parts[1] == "LEAVE":
                 room = parts[2]
