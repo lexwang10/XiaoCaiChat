@@ -1312,31 +1312,26 @@ def start_server(host: str, port: int):
                                     update_btn = "<button type=\"submit\" disabled>更新</button>" if is_world else "<button type=\"submit\">更新</button>"
                                     set_name_html = "<div style='color:#999;padding:6px 0;font-size:13px'>默认房间不可更改名称</div>" if is_world else f"<form method=\"post\" action=\"/api/set_room_name\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"name\" placeholder=\"新的显示名称\"><button type=\"submit\">设置名称</button></form>"
                                     
-                                    # Modified delete button logic
                                     if is_world:
                                         del_btn = "<button type=\"submit\" disabled>删除房间</button>"
                                     else:
                                         has_users = (len(u) > 0)
-                                        if has_users:
-                                            # If users are present, button triggers a confirm, then posts with force=1 if confirmed
-                                            # We need a small JS script to handle this or just a simple form with onsubmit
-                                            # Using a slightly complex onsubmit to ask for double confirmation if needed
-                                            onclick = "event.preventDefault(); if(confirm('该房间仍有在线用户，强制删除将踢出所有用户。确定要强制删除吗？')) { var f=this.form; var i=document.createElement('input');i.type='hidden';i.name='force';i.value='1';f.appendChild(i); f.submit(); }"
-                                            del_btn = f"<button type=\"submit\" onclick=\"{onclick}\" style=\"color:red\">强制删除</button>"
-                                        else:
-                                            del_btn = "<button type=\"submit\" onclick=\"return confirm('确定要删除该房间吗？');\">删除房间</button>"
+                                        btn_text = "强制删除" if has_users else "删除房间"
+                                        btn_style = " style=\"color:red\"" if has_users else ""
+                                        del_btn = f"<button type=\"submit\" class=\"delete-room-btn\" data-room=\"{r}\" onclick=\"return window.__deleteRoomConfirm(this);\"{btn_style}>{btn_text}</button>"
 
-                                    del_form_html = "" if is_world else f"<form method=\"post\" action=\"/api/delete_room\" style=\"margin-top:5px\"><input type=\"hidden\" name=\"room\" value=\"{r}\">{del_btn}</form>"
+                                    del_form_html = "" if is_world else f"<form method=\"post\" action=\"/api/delete_room\" data-room-deleteform=\"{r}\" style=\"margin-top:5px\"><input type=\"hidden\" name=\"room\" value=\"{r}\">{del_btn}</form>"
                                     
                                     html.append(
                                         f"<tr><td>{r}</td><td>{name_map.get(r,r)}</td>"
                                         f"<td><form method=\"post\" action=\"/api/set_room_members\" style=\"margin:0\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><div style=\"max-height:150px;overflow-y:auto;border:1px solid #ddd;padding:5px;margin-bottom:5px;font-size:13px\">{checks_html}</div>{update_btn}</form></td>"
-                                        f"<td>{len(u)}</td><td>"
+                                        f"<td data-room=\"{r}\">{len(u)}</td><td>"
                                         f"{set_name_html}"
                                         f"{del_form_html}"
                                         f"</td></tr>"
                                     )
                                 html.append("</table>")
+                                html.append("<script>(function(){window.__deleteRoomConfirm=function(btn){try{const f=btn&&btn.form?btn.form:null;if(!f)return false;const room=f.getAttribute('data-room-deleteform')||'';const td=document.querySelector('td[data-room=\"'+room+'\"]');const n=td?(parseInt(td.textContent||'0',10)||0):0;if(n>0){if(confirm('该房间仍有在线用户，强制删除将踢出所有用户。确定要强制删除吗？')){let i=f.querySelector('input[name=\"force\"]');if(!i){i=document.createElement('input');i.type='hidden';i.name='force';f.appendChild(i);}i.value='1';return true;}return false;}const i=f.querySelector('input[name=\"force\"]');if(i)i.remove();return confirm('确定要删除该房间吗？');}catch(e){return false;}};async function r(){try{const x=await fetch('/api/status',{cache:'no-store'});if(!x.ok)return;const d=await x.json();const m={};(d.rooms||[]).forEach(function(it){m[String(it.id)]=Array.isArray(it.users)?it.users:[];});document.querySelectorAll('td[data-room]').forEach(function(td){const id=td.getAttribute('data-room');const us=m[id]||[];td.textContent=String(us.length);td.title=us.join(', ');});document.querySelectorAll('form[data-room-deleteform]').forEach(function(f){const id=f.getAttribute('data-room-deleteform');const us=m[id]||[];const b=f.querySelector('button.delete-room-btn');if(!b)return;if(us.length>0){b.textContent='强制删除';b.style.color='red';}else{b.textContent='删除房间';b.style.color='';const i=f.querySelector('input[name=\"force\"]');if(i)i.remove();}});}catch(e){}}r();setInterval(r,2000);})();</script>")
                                 html.append("</body></html>")
                                 b = "".join(html).encode("utf-8")
                                 self.send_response(200)
