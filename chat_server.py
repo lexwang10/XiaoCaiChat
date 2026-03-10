@@ -1312,8 +1312,21 @@ def start_server(host: str, port: int):
                                     update_btn = "<button type=\"submit\" disabled>更新</button>" if is_world else "<button type=\"submit\">更新</button>"
                                     set_name_html = "<div style='color:#999;padding:6px 0;font-size:13px'>默认房间不可更改名称</div>" if is_world else f"<form method=\"post\" action=\"/api/set_room_name\"><input type=\"hidden\" name=\"room\" value=\"{r}\"><input name=\"name\" placeholder=\"新的显示名称\"><button type=\"submit\">设置名称</button></form>"
                                     
-                                    del_btn = "<button type=\"submit\" disabled>删除房间</button>" if len(u) > 0 else "<button type=\"submit\" onclick=\"return confirm('确定要删除该房间吗？');\">删除房间</button>"
-                                    del_form_html = "" if is_world else f"<form method=\"post\" action=\"/api/delete_room\"><input type=\"hidden\" name=\"room\" value=\"{r}\">{del_btn}</form>"
+                                    # Modified delete button logic
+                                    if is_world:
+                                        del_btn = "<button type=\"submit\" disabled>删除房间</button>"
+                                    else:
+                                        has_users = (len(u) > 0)
+                                        if has_users:
+                                            # If users are present, button triggers a confirm, then posts with force=1 if confirmed
+                                            # We need a small JS script to handle this or just a simple form with onsubmit
+                                            # Using a slightly complex onsubmit to ask for double confirmation if needed
+                                            onclick = "event.preventDefault(); if(confirm('该房间仍有在线用户，强制删除将踢出所有用户。确定要强制删除吗？')) { var f=this.form; var i=document.createElement('input');i.type='hidden';i.name='force';i.value='1';f.appendChild(i); f.submit(); }"
+                                            del_btn = f"<button type=\"submit\" onclick=\"{onclick}\" style=\"color:red\">强制删除</button>"
+                                        else:
+                                            del_btn = "<button type=\"submit\" onclick=\"return confirm('确定要删除该房间吗？');\">删除房间</button>"
+
+                                    del_form_html = "" if is_world else f"<form method=\"post\" action=\"/api/delete_room\" style=\"margin-top:5px\"><input type=\"hidden\" name=\"room\" value=\"{r}\">{del_btn}</form>"
                                     
                                     html.append(
                                         f"<tr><td>{r}</td><td>{name_map.get(r,r)}</td>"
@@ -1622,10 +1635,27 @@ def start_server(host: str, port: int):
                             if p == "/api/delete_room":
                                 form = self._read_form()
                                 room = form.get("room", [""])[-1]
+                                force = form.get("force", ["0"])[-1]
                                 if room and room != "世界":
+                                    users_to_kick = []
                                     with hub.lock:
                                         users = hub.rooms.get(room, {})
-                                        if room in hub.rooms and len(users) == 0:
+                                        has_users = (len(users) > 0)
+                                        
+                                        if has_users and force != "1":
+                                            # Return error indicating users are present
+                                            self.send_response(400)
+                                            self.send_header("Content-Type", "application/json")
+                                            self.end_headers()
+                                            self.wfile.write(b'{"error": "room_not_empty"}')
+                                            return
+
+                                        if room in hub.rooms:
+                                            # If force delete, prepare to kick all users first
+                                            # Don't do blocking send/close inside lock to avoid deadlock
+                                            if has_users:
+                                                users_to_kick = list(users.values())
+
                                             try:
                                                 del hub.rooms[room]
                                             except Exception:
@@ -1635,6 +1665,29 @@ def start_server(host: str, port: int):
                                                 del hub.room_names[room]
                                             except Exception:
                                                 pass
+                                        if room in hub.room_members:
+                                            try:
+                                                del hub.room_members[room]
+                                            except Exception:
+                                                pass
+                                    
+                                    # Perform kick actions outside the lock
+                                    for u in users_to_kick:
+                                        try:
+                                            u.send(f"[SYS] ROOM_CLOSED {room}")
+                                            u.send(f"[SYS] DISCONNECT")
+                                            u.close() 
+                                        except Exception:
+                                            pass
+                                    
+                                    # Broadcast ROOM_CLOSED to the main '世界' room so clients can update their lists
+                                    # This helps clients who are online but not in that room to remove it from list if empty
+                                    # broadcast_sys acquires lock internally, so call it outside lock
+                                    try:
+                                        hub.broadcast_sys("世界", f"[SYS] ROOM_CLOSED {room}")
+                                    except Exception:
+                                        pass
+
                                     try:
                                         hub._save_rooms()
                                     except Exception:

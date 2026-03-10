@@ -2749,6 +2749,23 @@ class ChatWindow(QtWidgets.QWidget):
             self.screenshot_shortcut.activated.connect(self.do_screenshot)
         except Exception:
             pass
+        
+        # Load closed rooms from local storage
+        self.closed_rooms = set()
+        try:
+            p = os.path.join(self.logger.log_dir, f"{self.username}_closed_rooms.json")
+            if os.path.exists(p):
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        self.closed_rooms = set(data)
+                    else:
+                        # Handle case where file might be corrupted or empty list
+                        self.closed_rooms = set()
+        except Exception as e:
+            print(f"Error loading closed rooms: {e}")
+            pass
+
         self.conv_list = QtWidgets.QListWidget()
         self.conv_list.setIconSize(QtCore.QSize(24, 24))
         try:
@@ -3104,6 +3121,10 @@ class ChatWindow(QtWidgets.QWidget):
             pass
         # 屏蔽群聊入口
         self._bootstrap_local()
+        try:
+            QtCore.QTimer.singleShot(0, self.on_sidebar_message)
+        except Exception:
+            pass
         self._last_find_text = ""
         self._last_find_row = -1
 
@@ -4221,6 +4242,57 @@ class ChatWindow(QtWidgets.QWidget):
                         self.view.scrollToBottom()
                     except Exception:
                         pass
+                return
+            if len(parts) >= 3 and parts[1] == "ROOM_CLOSED":
+                room = parts[2]
+                try:
+                    key = f"group:{room}"
+                    # Check if we have history
+                    # We need to check if the model has real messages, not just sys messages
+                    # But simpler check: rowCount > 0
+                    has_history = False
+                    if key in self.conv_models and self.conv_models[key].rowCount() > 0:
+                        has_history = True
+                    
+                    if not has_history:
+                        # Remove from conv list data structures
+                        if key in self.conv_models:
+                            del self.conv_models[key]
+                        if key in self.conv_name_labels:
+                            del self.conv_name_labels[key]
+                        if key in self.conv_avatar_labels:
+                            del self.conv_avatar_labels[key]
+                        # Remove from UI list
+                        for i in range(self.conv_list.count()):
+                            item = self.conv_list.item(i)
+                            if item.data(QtCore.Qt.UserRole) == key:
+                                self.conv_list.takeItem(i)
+                                break
+                    else:
+                        # Keep it but mark as closed/deleted
+                        m = self.conv_models.get(key)
+                        if m:
+                            m.add("sys", "", "该房间已被解散", False, None)
+                            self.view.scrollToBottom()
+                            
+                        # Update name in list to indicate closed
+                        if key in self.conv_name_labels:
+                            lbl = self.conv_name_labels[key]
+                            txt = lbl.text()
+                            if "(已解散)" not in txt:
+                                lbl.setText(txt + " (已解散)")
+                                lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';color:red;}")
+                        
+                        # Persist closed room state
+                        try:
+                            self.closed_rooms.add(room)
+                            p = os.path.join(self.logger.log_dir, f"{self.username}_closed_rooms.json")
+                            with open(p, "w", encoding="utf-8") as f:
+                                json.dump(list(self.closed_rooms), f)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 return
             if len(parts) >= 4 and parts[1] == "USERS":
                 room = parts[2]
@@ -5657,6 +5729,77 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _add_conv_group(self, rid: str, title: str, closed: bool = False):
+        key = f"group:{rid}"
+        exists = False
+        for i in range(self.conv_list.count()):
+            it0 = self.conv_list.item(i)
+            data0 = it0.data(QtCore.Qt.UserRole) if it0 else None
+            if data0 == key:
+                exists = True
+                break
+        if not exists:
+            it = QtWidgets.QListWidgetItem(title)
+            it.setSizeHint(QtCore.QSize(200, 56))
+            try:
+                it.setIcon(QtGui.QIcon())
+            except Exception:
+                pass
+            try:
+                it.setData(QtCore.Qt.UserRole, key)
+            except Exception:
+                pass
+            self.conv_list.addItem(it)
+            w = QtWidgets.QWidget()
+            hl = QtWidgets.QHBoxLayout()
+            try:
+                hl.setContentsMargins(12, 6, 12, 6)
+                hl.setSpacing(8)
+            except Exception:
+                pass
+            icon_lbl = QtWidgets.QLabel()
+            icon_lbl.setFixedSize(28, 28)
+            try:
+                pm = QtGui.QIcon(os.path.join(os.getcwd(), "icons", "user", "group.png")).pixmap(28, 28)
+                icon_lbl.setPixmap(pm)
+            except Exception:
+                pass
+            name_lbl = QtWidgets.QLabel(title)
+            try:
+                name_lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';}")
+            except Exception:
+                pass
+            badge_lbl = QtWidgets.QLabel()
+            badge_lbl.setVisible(False)
+            try:
+                badge_lbl.setStyleSheet("QLabel{background:#F44336;color:#fff;border-radius:8px;padding:0 6px;font:11px 'Helvetica Neue';}")
+            except Exception:
+                pass
+            hl.addWidget(icon_lbl)
+            hl.addWidget(name_lbl, 1)
+            hl.addWidget(badge_lbl)
+            w.setLayout(hl)
+            self.conv_list.setItemWidget(it, w)
+            self.conv_badges[key] = badge_lbl
+            self.conv_name_labels[key] = name_lbl
+        try:
+            self._ensure_unread_key(key)
+            self._ensure_conv(key)
+            self._update_conv_title(key)
+            self._update_sidebar_badge()
+            if closed and key in self.conv_name_labels:
+                lbl = self.conv_name_labels[key]
+                txt = lbl.text()
+                if "(已解散)" not in txt:
+                    lbl.setText(txt + " (已解散)")
+                lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';color:red;}")
+        except Exception:
+            pass
+        try:
+            self._apply_conv_filter()
+        except Exception:
+            pass
+
     def _remove_conv_dm(self, name: str):
         for i in range(self.conv_list.count()):
             if self.conv_list.item(i).text() == name:
@@ -5887,6 +6030,27 @@ class ChatWindow(QtWidgets.QWidget):
                     self.room_name_map[self.room] = self.room_name
                 except Exception:
                     pass
+            
+            try:
+                active = set([str(r.get("id")) for r in rooms])
+                cur = self.store.db.execute("SELECT DISTINCT conv FROM messages WHERE conv LIKE 'group:%'")
+                for (conv_key,) in cur.fetchall():
+                    if not isinstance(conv_key, str) or ":" not in conv_key:
+                        continue
+                    rid = conv_key.split(":", 1)[1]
+                    if not rid or rid in active:
+                        continue
+                    self.closed_rooms.add(rid)
+                    rname = self.room_name_map.get(rid, rid)
+                    self._add_conv_group(rid, rname, closed=True)
+                try:
+                    p = os.path.join(self.logger.log_dir, f"{self.username}_closed_rooms.json")
+                    with open(p, "w", encoding="utf-8") as f:
+                        json.dump(sorted(list(self.closed_rooms)), f)
+                except Exception:
+                    pass
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -7084,8 +7248,14 @@ class ChatWindow(QtWidgets.QWidget):
                 return
             except Exception:
                 return
-        rooms = self.rooms_info or []
-        # build items for all rooms
+        rooms = list(self.rooms_info or [])
+        active_ids = set([str(r.get("id")) for r in rooms])
+        try:
+            for rid in sorted(list(self.closed_rooms)):
+                if rid not in active_ids:
+                    rooms.append({"id": rid, "name": self.room_name_map.get(rid, rid), "_closed": True})
+        except Exception:
+            pass
         for r in rooms:
             rid = str(r.get("id"))
             title = str(r.get("name") or rid)
@@ -7142,6 +7312,15 @@ class ChatWindow(QtWidgets.QWidget):
                 self.conv_name_labels[f"group:{rid}"] = name_lbl
             try:
                 self._ensure_unread_key(f"group:{rid}")
+            except Exception:
+                pass
+            try:
+                if r.get("_closed") and f"group:{rid}" in self.conv_name_labels:
+                    lbl = self.conv_name_labels[f"group:{rid}"]
+                    txt = lbl.text()
+                    if "(已解散)" not in txt:
+                        lbl.setText(txt + " (已解散)")
+                    lbl.setStyleSheet("QLabel{font:14px 'Helvetica Neue';color:red;}")
             except Exception:
                 pass
         try:
