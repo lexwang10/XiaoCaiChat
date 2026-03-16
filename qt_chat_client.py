@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 
 from PySide6 import QtCore, QtWidgets, QtGui
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 import threading
 try:
     import Cocoa
@@ -3067,13 +3067,20 @@ class ChatWindow(QtWidgets.QWidget):
             pass
         self.status_left = QtWidgets.QLabel(f"未连接 {self.host}:{self.port}")
         self.status_right = QtWidgets.QLabel(f"XiaoCaiChat {APP_VERSION}")
+        self.status_update_btn = QtWidgets.QPushButton("")
         try:
             self.status_left.setStyleSheet("QLabel{color:#757575;font:12px 'Helvetica Neue';}")
             self.status_right.setStyleSheet("QLabel{color:#9e9e9e;font:12px 'Helvetica Neue';}")
+            self.status_update_btn.setFlat(True)
+            self.status_update_btn.setCursor(QtCore.Qt.PointingHandCursor)
+            self.status_update_btn.setVisible(False)
+            self.status_update_btn.setStyleSheet("QPushButton{border:none;background:transparent;color:#e53935;font:12px 'Helvetica Neue';padding:0 6px;}QPushButton:hover{text-decoration:underline;}")
+            self.status_update_btn.clicked.connect(self._show_version_update_dialog)
         except Exception:
             pass
         sbot.addWidget(self.status_icon, 0, QtCore.Qt.AlignLeft)
         sbot.addWidget(self.status_left, 0, QtCore.Qt.AlignLeft)
+        sbot.addWidget(self.status_update_btn, 0, QtCore.Qt.AlignLeft)
         sbot.addStretch(1)
         sbot.addWidget(self.status_right, 0, QtCore.Qt.AlignRight)
         self.status_bar.setLayout(sbot)
@@ -3104,6 +3111,19 @@ class ChatWindow(QtWidgets.QWidget):
         self.conv_list.itemDoubleClicked.connect(self.on_pick_conv)
         self.conv_list.itemClicked.connect(self.on_pick_conv)
         self.view_mode = "message"
+        self._version_prompted = False
+        self._version_alerted_for = ""
+        self._latest_version = ""
+        self._latest_download_url = ""
+        self._latest_release_notes = ""
+        self.version_check_timer = QtCore.QTimer(self)
+        self.version_check_timer.setInterval(15000)
+        self.version_check_timer.timeout.connect(self._check_server_version_update)
+        self.version_check_timer.start()
+        try:
+            QtCore.QTimer.singleShot(0, self._check_server_version_update)
+        except Exception:
+            pass
         try:
             self._sync_room_from_server()
         except Exception:
@@ -6013,6 +6033,75 @@ class ChatWindow(QtWidgets.QWidget):
                             self.conv_list.setCurrentRow(i)
                             break
             self._apply_conv_filter()
+        except Exception:
+            pass
+
+    def _version_is_newer(self, remote: str, local: str) -> bool:
+        try:
+            def _parts(s: str):
+                out = []
+                for x in str(s).strip().split("."):
+                    m = re.match(r"^(\d+)", x)
+                    out.append(int(m.group(1)) if m else 0)
+                while len(out) < 4:
+                    out.append(0)
+                return out[:4]
+            return _parts(remote) > _parts(local)
+        except Exception:
+            return False
+
+    def _check_server_version_update(self):
+        try:
+            url = f"http://{self.host}:34568/api/version"
+            with urllib.request.urlopen(url, timeout=2.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            latest = str(data.get("latest_client_version") or "").strip()
+            dl = str(data.get("latest_client_download_url") or "").strip()
+            notes = str(data.get("latest_client_release_notes") or "").strip()
+            if latest and self._version_is_newer(latest, APP_VERSION):
+                self._version_prompted = True
+                self._latest_version = latest
+                self._latest_download_url = dl
+                self._latest_release_notes = notes
+                try:
+                    if hasattr(self, "status_update_btn") and self.status_update_btn:
+                        self.status_update_btn.setText(f"🎉  新版本 {latest}")
+                        self.status_update_btn.setVisible(True)
+                except Exception:
+                    pass
+                try:
+                    if getattr(self, "_version_alerted_for", "") != latest:
+                        self._version_alerted_for = latest
+                        self._show_version_update_dialog()
+                except Exception:
+                    pass
+            else:
+                self._version_prompted = False
+                self._version_alerted_for = ""
+                self._latest_version = ""
+                self._latest_download_url = ""
+                self._latest_release_notes = ""
+                try:
+                    if hasattr(self, "status_update_btn") and self.status_update_btn:
+                        self.status_update_btn.setVisible(False)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _show_version_update_dialog(self):
+        try:
+            latest = str(getattr(self, "_latest_version", "") or "").strip()
+            if not latest:
+                return
+            dl = str(getattr(self, "_latest_download_url", "") or "").strip()
+            notes = str(getattr(self, "_latest_release_notes", "") or "").strip()
+            msg = f"检测到新版本：{latest}\n当前版本：{APP_VERSION}"
+            if dl:
+                msg += f"\n下载地址：{dl}"
+            if notes:
+                msg += f"\n\n更新内容：\n{notes}"
+            QtWidgets.QMessageBox.information(self, "版本更新", msg)
         except Exception:
             pass
 

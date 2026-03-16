@@ -41,9 +41,16 @@ ADD_DATA_ARGS=(--add-data "icons:icons")
 PLIST="dist/$APP_NAME.app/Contents/Info.plist"
 if [ -f "$PLIST" ]; then
   /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" "$PLIST" 2>/dev/null || /usr/libexec/PlistBuddy -c "Set :LSUIElement true" "$PLIST" || true
-  # Set version to 1.0.0
-  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString 1.0.0" "$PLIST" || true
-  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion 1.0.0" "$PLIST" || true
+  
+  # Extract version from chat_server.py
+  VERSION=$(grep 'SERVER_VERSION =' chat_server.py | cut -d '"' -f 2)
+  if [ -z "$VERSION" ]; then
+    VERSION="1.0.2"
+  fi
+  
+  # Set version
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST" || true
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" "$PLIST" || true
 fi
 
 if command -v codesign >/dev/null 2>&1; then

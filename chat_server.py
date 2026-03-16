@@ -14,7 +14,7 @@ import uuid
 import cgi
 import io
 import urllib.parse
-SERVER_VERSION = "1.0.3"
+SERVER_VERSION = "1.0.4"
 try:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 except Exception:
@@ -514,7 +514,7 @@ try:
 except Exception:
     pass
 CONFIG_JSON = os.path.join(_data_dir, "config.json")
-SERVER_CONFIG = {"retention_days": 7}
+SERVER_CONFIG = {"retention_days": 7, "latest_client_version": "1.0.4", "latest_client_download_url": "", "latest_client_release_notes": ""}
 ADMIN_PASSWORD = "123!@#qwe"
 ADMIN_SESSIONS = set()
 USERS_JSON = os.path.join(_data_dir, "users.json")
@@ -1245,7 +1245,13 @@ def start_server(host: str, port: int):
                                             continue
                                     final_rooms.append(r)
                                     
-                                data = {"rooms": [{"id": r, "name": hub.room_names.get(r, r), "users": hub.users(r)} for r in final_rooms]}
+                                data = {
+                                    "rooms": [{"id": r, "name": hub.room_names.get(r, r), "users": hub.users(r)} for r in final_rooms],
+                                    "latest_client_version": SERVER_CONFIG.get("latest_client_version", ""),
+                                    "latest_client_download_url": SERVER_CONFIG.get("latest_client_download_url", ""),
+                                    "latest_client_release_notes": SERVER_CONFIG.get("latest_client_release_notes", ""),
+                                    "server_version": SERVER_VERSION,
+                                }
                                 b = json.dumps(data, ensure_ascii=False).encode("utf-8")
                                 self.send_response(200)
                                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -1255,6 +1261,24 @@ def start_server(host: str, port: int):
                                     self.wfile.write(b)
                                 except Exception:
                                     pass
+                                return
+                            if p == "/api/version":
+                                data = {
+                                    "latest_client_version": SERVER_CONFIG.get("latest_client_version", ""),
+                                    "latest_client_download_url": SERVER_CONFIG.get("latest_client_download_url", ""),
+                                    "latest_client_release_notes": SERVER_CONFIG.get("latest_client_release_notes", ""),
+                                    "server_version": SERVER_VERSION,
+                                }
+                                b = json.dumps(data, ensure_ascii=False).encode("utf-8")
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/json; charset=utf-8")
+                                self.send_header("Content-Length", str(len(b)))
+                                self.end_headers()
+                                try:
+                                    self.wfile.write(b)
+                                except Exception:
+                                    pass
+                                return
                             else:
                                 if not self._check_auth():
                                     self._login_page()
@@ -1275,6 +1299,9 @@ def start_server(host: str, port: int):
                                             if pair == "msg=name_updated":
                                                 msg_alert = "<script>alert('设置房间名称成功');window.location.href='/';</script>"
                                                 break
+                                            if pair == "msg=version_updated":
+                                                msg_alert = "<script>alert('客户端版本设置成功');window.location.href='/';</script>"
+                                                break
                                 except Exception:
                                     pass
                                 html = [f"<html><head><meta charset=\"utf-8\"><title>XiaoCaiChat Server v{SERVER_VERSION}</title>",
@@ -1284,6 +1311,7 @@ def start_server(host: str, port: int):
                                         f"<h1>群聊后台管理 (v{SERVER_VERSION})</h1>",
                                         "<form method=\"post\" action=\"/api/quit\"><button type=\"submit\">关闭服务器</button></form>",
                                         f"<form method=\"post\" action=\"/api/set_retention\" style=\"border:1px solid #ddd;padding:10px;margin:10px 0;max_width:300px\"><div><b>系统设置</b></div><div style=\"margin-top:8px\"><label>文件保留天数: <input name=\"days\" type=\"number\" value=\"{SERVER_CONFIG.get('retention_days', 7)}\" style=\"width:60px\"></label> <button type=\"submit\">保存</button></div></form>",
+                                        f"<form method=\"post\" action=\"/api/set_client_version\" style=\"border:1px solid #ddd;padding:10px;margin:10px 0;max_width:600px\"><div><b>客户端版本设置</b></div><div style=\"margin-top:8px\"><label>最新版本: <input name=\"latest_client_version\" value=\"{SERVER_CONFIG.get('latest_client_version', '')}\" style=\"width:140px\"></label> <label style=\"margin-left:8px\">下载链接: <input name=\"latest_client_download_url\" value=\"{SERVER_CONFIG.get('latest_client_download_url', '')}\" style=\"width:280px\"></label> <button type=\"submit\">保存</button></div><div style=\"margin-top:8px\"><label>更新内容:</label><br><textarea name=\"latest_client_release_notes\" style=\"width:520px;height:80px\">{SERVER_CONFIG.get('latest_client_release_notes', '')}</textarea></div></form>",
                                         "<form method=\"post\" action=\"/api/add_room\"><input name=\"room\" placeholder=\"新房间ID\"><button type=\"submit\">添加房间</button></form>",
                                         "<table><tr><th>房间ID</th><th>显示名称</th><th>成员限制</th><th>在线用户</th><th>操作</th></tr>"]
                                 for r in rooms:
@@ -1396,7 +1424,7 @@ def start_server(host: str, port: int):
                                 return
 
                             # Protect admin APIs
-                            if p in ["/api/add_room", "/api/set_room_name", "/api/set_room_members", "/api/delete_room", "/api/delete_user", "/api/set_retention", "/api/quit"]:
+                            if p in ["/api/add_room", "/api/set_room_name", "/api/set_room_members", "/api/delete_room", "/api/delete_user", "/api/set_retention", "/api/set_client_version", "/api/quit"]:
                                 if not self._check_auth():
                                     self.send_response(403)
                                     self.end_headers()
@@ -1716,6 +1744,22 @@ def start_server(host: str, port: int):
                                     pass
                                 self.send_response(302)
                                 self.send_header("Location", "/?msg=retention_updated")
+                                self.end_headers()
+                                return
+                            if p == "/api/set_client_version":
+                                form = self._read_form()
+                                try:
+                                    latest = (form.get("latest_client_version", [""])[-1] or "").strip()
+                                    download_url = (form.get("latest_client_download_url", [""])[-1] or "").strip()
+                                    release_notes = (form.get("latest_client_release_notes", [""])[-1] or "").strip()
+                                    SERVER_CONFIG["latest_client_version"] = latest
+                                    SERVER_CONFIG["latest_client_download_url"] = download_url
+                                    SERVER_CONFIG["latest_client_release_notes"] = release_notes
+                                    _save_config()
+                                except Exception:
+                                    pass
+                                self.send_response(302)
+                                self.send_header("Location", "/?msg=version_updated")
                                 self.end_headers()
                                 return
                             if p == "/api/quit":
