@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 
 from PySide6 import QtCore, QtWidgets, QtGui
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 import threading
 try:
     import Cocoa
@@ -6089,6 +6089,20 @@ class ChatWindow(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _resolve_update_download_url(self, raw_url: str) -> str:
+        try:
+            u = str(raw_url or "").strip()
+            if not u:
+                return ""
+            parsed = urllib.parse.urlparse(u)
+            if parsed.scheme and parsed.netloc:
+                return u
+            if u.startswith("/"):
+                return f"http://{self.host}:34568{u}"
+            return f"http://{self.host}:34568/{u}"
+        except Exception:
+            return ""
+
     def _show_version_update_dialog(self):
         try:
             latest = str(getattr(self, "_latest_version", "") or "").strip()
@@ -6101,7 +6115,22 @@ class ChatWindow(QtWidgets.QWidget):
                 msg += f"\n下载地址：{dl}"
             if notes:
                 msg += f"\n\n更新内容：\n{notes}"
-            QtWidgets.QMessageBox.information(self, "版本更新", msg)
+            final_url = self._resolve_update_download_url(dl)
+            if not final_url:
+                QtWidgets.QMessageBox.information(self, "版本更新", msg)
+                return
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Information)
+            box.setWindowTitle("版本更新")
+            box.setText(msg)
+            download_btn = box.addButton("下载更新", QtWidgets.QMessageBox.AcceptRole)
+            box.addButton("稍后", QtWidgets.QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() == download_btn:
+                try:
+                    QtGui.QDesktopServices.openUrl(QtCore.QUrl(final_url))
+                except Exception:
+                    pass
         except Exception:
             pass
 

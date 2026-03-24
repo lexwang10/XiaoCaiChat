@@ -14,7 +14,8 @@ import uuid
 import cgi
 import io
 import urllib.parse
-SERVER_VERSION = "1.0.4"
+import html as html_module
+SERVER_VERSION = "1.0.5"
 try:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 except Exception:
@@ -514,7 +515,7 @@ try:
 except Exception:
     pass
 CONFIG_JSON = os.path.join(_data_dir, "config.json")
-SERVER_CONFIG = {"retention_days": 7, "latest_client_version": "1.0.4", "latest_client_download_url": "", "latest_client_release_notes": ""}
+SERVER_CONFIG = {"retention_days": 7, "latest_client_version": "1.0.4", "latest_client_download_url": "", "latest_client_release_notes": "", "latest_client_download_file_path": ""}
 ADMIN_PASSWORD = "123!@#qwe"
 ADMIN_SESSIONS = set()
 USERS_JSON = os.path.join(_data_dir, "users.json")
@@ -541,6 +542,11 @@ _load_config()
 FILES_DIR = os.path.join(_data_dir, "files")
 try:
     os.makedirs(FILES_DIR, exist_ok=True)
+except Exception:
+    pass
+CLIENT_RELEASES_DIR = os.path.join(_data_dir, "client_releases")
+try:
+    os.makedirs(CLIENT_RELEASES_DIR, exist_ok=True)
 except Exception:
     pass
 DB_PATH = os.path.join(_data_dir, "chat_history.db")
@@ -575,6 +581,31 @@ def conv_group(room: str):
 def conv_dm(a: str, b: str):
     x, y = sorted([a, b])
     return f"dm:{x}&{y}"
+
+def _build_external_url(headers, path: str):
+    try:
+        host_hdr = headers.get("Host") if headers else ""
+    except Exception:
+        host_hdr = ""
+    return f"http://{host_hdr}{path}" if host_hdr else path
+
+def _latest_client_download_url(headers=None):
+    try:
+        fpath = str(SERVER_CONFIG.get("latest_client_download_file_path", "") or "").strip()
+        if fpath and os.path.isfile(fpath):
+            return _build_external_url(headers, "/api/client/download/latest")
+        return ""
+    except Exception:
+        return ""
+
+def _latest_client_download_file():
+    try:
+        fpath = str(SERVER_CONFIG.get("latest_client_download_file_path", "") or "").strip()
+        if fpath and os.path.isfile(fpath):
+            return fpath
+    except Exception:
+        pass
+    return ""
 
 def save_message(conv: str, sender: str, text: str):
     try:
@@ -1165,6 +1196,25 @@ def start_server(host: str, port: int):
                     def do_HEAD(self):
                         try:
                             p = self.path.split("?", 1)[0]
+                            if p == "/api/client/download/latest":
+                                fpath = _latest_client_download_file()
+                                if not fpath:
+                                    self.send_response(404)
+                                    self.end_headers()
+                                    return
+                                try:
+                                    sz = os.path.getsize(fpath)
+                                except Exception:
+                                    sz = 0
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/octet-stream")
+                                self.send_header("Content-Length", str(sz))
+                                try:
+                                    self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(fpath)}"')
+                                except Exception:
+                                    pass
+                                self.end_headers()
+                                return
                             if p.startswith("/files/"):
                                 fid, fname, fpath = self._get_file_info()
                                 if not (fname and fpath and os.path.isfile(fpath)):
@@ -1192,6 +1242,30 @@ def start_server(host: str, port: int):
                     def do_GET(self):
                         try:
                             p = self.path.split("?", 1)[0]
+                            if p == "/api/client/download/latest":
+                                fpath = _latest_client_download_file()
+                                if not fpath:
+                                    self.send_response(404)
+                                    self.end_headers()
+                                    return
+                                try:
+                                    with open(fpath, "rb") as f:
+                                        data = f.read()
+                                except Exception:
+                                    data = b""
+                                self.send_response(200)
+                                self.send_header("Content-Type", "application/octet-stream")
+                                self.send_header("Content-Length", str(len(data)))
+                                try:
+                                    self.send_header("Content-Disposition", f'attachment; filename="{os.path.basename(fpath)}"')
+                                except Exception:
+                                    pass
+                                self.end_headers()
+                                try:
+                                    self.wfile.write(data)
+                                except Exception:
+                                    pass
+                                return
                             if p.startswith("/files/"):
                                 fid, fname, fpath = self._get_file_info()
                                 if not (fname and fpath and os.path.isfile(fpath)):
@@ -1248,7 +1322,7 @@ def start_server(host: str, port: int):
                                 data = {
                                     "rooms": [{"id": r, "name": hub.room_names.get(r, r), "users": hub.users(r)} for r in final_rooms],
                                     "latest_client_version": SERVER_CONFIG.get("latest_client_version", ""),
-                                    "latest_client_download_url": SERVER_CONFIG.get("latest_client_download_url", ""),
+                                    "latest_client_download_url": _latest_client_download_url(self.headers),
                                     "latest_client_release_notes": SERVER_CONFIG.get("latest_client_release_notes", ""),
                                     "server_version": SERVER_VERSION,
                                 }
@@ -1265,7 +1339,7 @@ def start_server(host: str, port: int):
                             if p == "/api/version":
                                 data = {
                                     "latest_client_version": SERVER_CONFIG.get("latest_client_version", ""),
-                                    "latest_client_download_url": SERVER_CONFIG.get("latest_client_download_url", ""),
+                                    "latest_client_download_url": _latest_client_download_url(self.headers),
                                     "latest_client_release_notes": SERVER_CONFIG.get("latest_client_release_notes", ""),
                                     "server_version": SERVER_VERSION,
                                 }
@@ -1286,6 +1360,13 @@ def start_server(host: str, port: int):
                                 rooms = list(hub.rooms.keys())
                                 name_map = {r: hub.room_names.get(r, r) for r in rooms}
                                 msg_alert = ""
+                                download_file_path = str(SERVER_CONFIG.get("latest_client_download_file_path", "") or "").strip()
+                                current_release_name = ""
+                                try:
+                                    if download_file_path and os.path.isfile(download_file_path):
+                                        current_release_name = os.path.basename(download_file_path)
+                                except Exception:
+                                    current_release_name = ""
                                 try:
                                     qs = self.path.split("?", 1)
                                     if len(qs) > 1:
@@ -1299,19 +1380,22 @@ def start_server(host: str, port: int):
                                             if pair == "msg=name_updated":
                                                 msg_alert = "<script>alert('设置房间名称成功');window.location.href='/';</script>"
                                                 break
-                                            if pair == "msg=version_updated":
-                                                msg_alert = "<script>alert('客户端版本设置成功');window.location.href='/';</script>"
+                                            if pair == "msg=client_release_updated":
+                                                msg_alert = "<script>alert('客户端发布设置已保存');window.location.href='/';</script>"
+                                                break
+                                            if pair == "msg=client_release_file_missing":
+                                                msg_alert = "<script>alert('未读取到有效安装包文件，请重新选择后保存');window.location.href='/';</script>"
                                                 break
                                 except Exception:
                                     pass
                                 html = [f"<html><head><meta charset=\"utf-8\"><title>XiaoCaiChat Server v{SERVER_VERSION}</title>",
-                                        "<style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;padding:20px}h1{font-size:20px;margin:0 0 14px}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 10px}input,button{font-size:14px;padding:6px 10px;margin:4px}form{margin:12px 0}</style>",
+                                        "<style>body{font-family:-apple-system,Helvetica,Arial,sans-serif;padding:20px}h1{font-size:20px;margin:0 0 14px}table{border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px 10px}input,button{font-size:14px;padding:6px 10px;margin:4px}form{margin:12px 0}#uploadMask{position:fixed;inset:0;background:rgba(255,255,255,.92);display:none;align-items:center;justify-content:center;z-index:9999}#uploadCard{width:360px;border:1px solid #ddd;border-radius:8px;background:#fff;padding:16px}#uploadTitle{font-size:14px;margin:0 0 10px}#uploadBar{height:6px;background:#eee;border-radius:999px;overflow:hidden}#uploadBar i{display:block;height:100%;width:40%;background:#2f6fed;animation:uploadMove 1.2s linear infinite}@keyframes uploadMove{0%{transform:translateX(-120%)}100%{transform:translateX(320%)}}</style>",
                                         "</head><body>",
                                         msg_alert,
                                         f"<h1>群聊后台管理 (v{SERVER_VERSION})</h1>",
                                         "<form method=\"post\" action=\"/api/quit\"><button type=\"submit\">关闭服务器</button></form>",
                                         f"<form method=\"post\" action=\"/api/set_retention\" style=\"border:1px solid #ddd;padding:10px;margin:10px 0;max_width:300px\"><div><b>系统设置</b></div><div style=\"margin-top:8px\"><label>文件保留天数: <input name=\"days\" type=\"number\" value=\"{SERVER_CONFIG.get('retention_days', 7)}\" style=\"width:60px\"></label> <button type=\"submit\">保存</button></div></form>",
-                                        f"<form method=\"post\" action=\"/api/set_client_version\" style=\"border:1px solid #ddd;padding:10px;margin:10px 0;max_width:600px\"><div><b>客户端版本设置</b></div><div style=\"margin-top:8px\"><label>最新版本: <input name=\"latest_client_version\" value=\"{SERVER_CONFIG.get('latest_client_version', '')}\" style=\"width:140px\"></label> <label style=\"margin-left:8px\">下载链接: <input name=\"latest_client_download_url\" value=\"{SERVER_CONFIG.get('latest_client_download_url', '')}\" style=\"width:280px\"></label> <button type=\"submit\">保存</button></div><div style=\"margin-top:8px\"><label>更新内容:</label><br><textarea name=\"latest_client_release_notes\" style=\"width:520px;height:80px\">{SERVER_CONFIG.get('latest_client_release_notes', '')}</textarea></div></form>",
+                                        f"<form id=\"releaseForm\" method=\"post\" action=\"/api/set_client_release\" enctype=\"multipart/form-data\" style=\"border:1px solid #ddd;padding:10px;margin:10px 0;max_width:740px\"><div><b>客户端发布设置</b></div><div style=\"margin-top:8px\"><label>最新版本: <input name=\"latest_client_version\" value=\"{SERVER_CONFIG.get('latest_client_version', '')}\" style=\"width:140px\"></label></div><div style=\"margin-top:8px\"><label>安装包文件: <input id=\"latestClientFile\" type=\"file\" name=\"latest_client_file\"></label></div><div style=\"margin-top:8px;color:#666;font-size:12px\">当前文件: <span id=\"currentReleaseName\">{html_module.escape(current_release_name or '未选择')}</span></div><div style=\"margin-top:8px\"><label>更新内容:</label><br><textarea name=\"latest_client_release_notes\" style=\"width:680px;height:80px\">{SERVER_CONFIG.get('latest_client_release_notes', '')}</textarea></div><div style=\"margin-top:8px\"><button id=\"releaseSubmitBtn\" type=\"submit\">保存</button></div><div style=\"margin-top:6px;color:#666;font-size:12px\">当前生效下载地址: {_latest_client_download_url(self.headers) or '未配置'}</div></form>",
                                         "<form method=\"post\" action=\"/api/add_room\"><input name=\"room\" placeholder=\"新房间ID\"><button type=\"submit\">添加房间</button></form>",
                                         "<table><tr><th>房间ID</th><th>显示名称</th><th>成员限制</th><th>在线用户</th><th>操作</th></tr>"]
                                 for r in rooms:
@@ -1359,6 +1443,8 @@ def start_server(host: str, port: int):
                                         f"</td></tr>"
                                     )
                                 html.append("</table>")
+                                html.append("<div id=\"uploadMask\"><div id=\"uploadCard\"><div id=\"uploadTitle\">安装包上传中，请稍候…</div><div id=\"uploadBar\"><i></i></div></div></div>")
+                                html.append("<script>(function(){try{const f=document.getElementById('releaseForm');const m=document.getElementById('uploadMask');const fi=document.getElementById('latestClientFile');const n=document.getElementById('currentReleaseName');const b=document.getElementById('releaseSubmitBtn');if(fi&&n){fi.addEventListener('change',function(){try{const x=fi.files&&fi.files.length>0?fi.files[0].name:'未选择';n.textContent=x||'未选择';}catch(e){}});}if(f&&m){f.addEventListener('submit',function(){try{if(b)b.disabled=true;m.style.display='flex';}catch(e){}});}}catch(e){}})();</script>")
                                 html.append("<script>(function(){window.__deleteRoomConfirm=function(btn){try{const f=btn&&btn.form?btn.form:null;if(!f)return false;const room=f.getAttribute('data-room-deleteform')||'';const td=document.querySelector('td[data-room=\"'+room+'\"]');const n=td?(parseInt(td.textContent||'0',10)||0):0;if(n>0){if(confirm('该房间仍有在线用户，强制删除将踢出所有用户。确定要强制删除吗？')){let i=f.querySelector('input[name=\"force\"]');if(!i){i=document.createElement('input');i.type='hidden';i.name='force';f.appendChild(i);}i.value='1';return true;}return false;}const i=f.querySelector('input[name=\"force\"]');if(i)i.remove();return confirm('确定要删除该房间吗？');}catch(e){return false;}};async function r(){try{const x=await fetch('/api/status',{cache:'no-store'});if(!x.ok)return;const d=await x.json();const m={};(d.rooms||[]).forEach(function(it){m[String(it.id)]=Array.isArray(it.users)?it.users:[];});document.querySelectorAll('td[data-room]').forEach(function(td){const id=td.getAttribute('data-room');const us=m[id]||[];td.textContent=String(us.length);td.title=us.join(', ');});document.querySelectorAll('form[data-room-deleteform]').forEach(function(f){const id=f.getAttribute('data-room-deleteform');const us=m[id]||[];const b=f.querySelector('button.delete-room-btn');if(!b)return;if(us.length>0){b.textContent='强制删除';b.style.color='red';}else{b.textContent='删除房间';b.style.color='';const i=f.querySelector('input[name=\"force\"]');if(i)i.remove();}});}catch(e){}}r();setInterval(r,2000);})();</script>")
                                 html.append("</body></html>")
                                 b = "".join(html).encode("utf-8")
@@ -1424,7 +1510,7 @@ def start_server(host: str, port: int):
                                 return
 
                             # Protect admin APIs
-                            if p in ["/api/add_room", "/api/set_room_name", "/api/set_room_members", "/api/delete_room", "/api/delete_user", "/api/set_retention", "/api/set_client_version", "/api/quit"]:
+                            if p in ["/api/add_room", "/api/set_room_name", "/api/set_room_members", "/api/delete_room", "/api/delete_user", "/api/set_retention", "/api/set_client_version", "/api/set_client_release", "/api/quit"]:
                                 if not self._check_auth():
                                     self.send_response(403)
                                     self.end_headers()
@@ -1589,6 +1675,105 @@ def start_server(host: str, port: int):
                                 except Exception:
                                     pass
                                 return
+                            if p == "/api/set_client_release":
+                                try:
+                                    n = int(self.headers.get("Content-Length") or "0")
+                                except Exception:
+                                    n = 0
+                                try:
+                                    raw = self.rfile.read(n) if n > 0 else b""
+                                except Exception:
+                                    raw = b""
+                                try:
+                                    form = cgi.FieldStorage(
+                                        fp=io.BytesIO(raw),
+                                        headers=self.headers,
+                                        environ={
+                                            'REQUEST_METHOD': 'POST',
+                                            'CONTENT_TYPE': self.headers.get('Content-Type') or '',
+                                            'CONTENT_LENGTH': str(len(raw)),
+                                        }
+                                    )
+                                except Exception:
+                                    form = None
+                                try:
+                                    latest = str(form.getvalue("latest_client_version") or "").strip()
+                                except Exception:
+                                    latest = ""
+                                try:
+                                    release_notes = str(form.getvalue("latest_client_release_notes") or "").strip()
+                                except Exception:
+                                    release_notes = ""
+                                try:
+                                    fileitem = form["latest_client_file"] if form and "latest_client_file" in form else None
+                                except Exception:
+                                    fileitem = None
+                                try:
+                                    upload_name = (fileitem.filename if fileitem and getattr(fileitem, "filename", None) else "") or ""
+                                except Exception:
+                                    upload_name = ""
+                                try:
+                                    upload_data = (fileitem.file.read() if fileitem and hasattr(fileitem, "file") else b"")
+                                except Exception:
+                                    upload_data = b""
+                                if (not upload_data) and raw:
+                                    try:
+                                        ct = self.headers.get("Content-Type") or ""
+                                        bmark = "boundary="
+                                        bpos = ct.find(bmark)
+                                        boundary = ct[bpos+len(bmark):].strip() if bpos >= 0 else ""
+                                        if boundary:
+                                            sep = ("--" + boundary).encode("utf-8")
+                                            for part in raw.split(sep):
+                                                part = part.strip(b"\r\n")
+                                                if not part or part == b"--":
+                                                    continue
+                                                try:
+                                                    head, body = part.split(b"\r\n\r\n", 1)
+                                                except Exception:
+                                                    continue
+                                                hs = head.decode("utf-8", errors="ignore")
+                                                if "name=\"latest_client_file\"" in hs:
+                                                    if not upload_name:
+                                                        try:
+                                                            mk = "filename=\""
+                                                            mp = hs.find(mk)
+                                                            if mp >= 0:
+                                                                me = hs.find("\"", mp + len(mk))
+                                                                if me > mp:
+                                                                    upload_name = hs[mp + len(mk):me]
+                                                        except Exception:
+                                                            pass
+                                                    upload_data = body.rstrip(b"\r\n")
+                                                    break
+                                    except Exception:
+                                        pass
+                                try:
+                                    SERVER_CONFIG["latest_client_version"] = latest
+                                    SERVER_CONFIG["latest_client_release_notes"] = release_notes
+                                    SERVER_CONFIG["latest_client_download_url"] = ""
+                                    if upload_data and upload_name:
+                                        try:
+                                            os.makedirs(CLIENT_RELEASES_DIR, exist_ok=True)
+                                        except Exception:
+                                            pass
+                                        save_name = f"{int(time.time())}__{os.path.basename(upload_name)}"
+                                        save_path = os.path.join(CLIENT_RELEASES_DIR, save_name)
+                                        with open(save_path, "wb") as f:
+                                            f.write(upload_data)
+                                        SERVER_CONFIG["latest_client_download_file_path"] = save_path
+                                    elif not str(SERVER_CONFIG.get("latest_client_download_file_path", "") or "").strip():
+                                        self.send_response(302)
+                                        self.send_header("Location", "/?msg=client_release_file_missing")
+                                        self.end_headers()
+                                        return
+                                    _save_config()
+                                except Exception:
+                                    pass
+                                self.send_response(302)
+                                self.send_header("Location", "/?msg=client_release_updated")
+                                self.end_headers()
+                                return
                             if p == "/api/add_room":
                                 form = self._read_form()
                                 room = form.get("room", [""])[-1]
@@ -1750,16 +1935,14 @@ def start_server(host: str, port: int):
                                 form = self._read_form()
                                 try:
                                     latest = (form.get("latest_client_version", [""])[-1] or "").strip()
-                                    download_url = (form.get("latest_client_download_url", [""])[-1] or "").strip()
                                     release_notes = (form.get("latest_client_release_notes", [""])[-1] or "").strip()
                                     SERVER_CONFIG["latest_client_version"] = latest
-                                    SERVER_CONFIG["latest_client_download_url"] = download_url
                                     SERVER_CONFIG["latest_client_release_notes"] = release_notes
                                     _save_config()
                                 except Exception:
                                     pass
                                 self.send_response(302)
-                                self.send_header("Location", "/?msg=version_updated")
+                                self.send_header("Location", "/?msg=client_release_updated")
                                 self.end_headers()
                                 return
                             if p == "/api/quit":

@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="XiaoCaiChatServer"
 ICON_PNG="icons/ui/server.png"
 BUILD_DIR="packaging/mac/build_server"
+ENV_NAME="${ENV_NAME:-xiaocaichat}"
 
 mkdir -p "$BUILD_DIR"
 
@@ -23,13 +24,18 @@ done
 
 iconutil -c icns "$ICONSET" -o "$BUILD_DIR/server.icns"
 
-conda install -n xiaocaichat -c conda-forge -y pyobjc-core pyobjc-framework-Cocoa >/dev/null 2>&1 || true
+PY_CMD=(python)
+if command -v conda >/dev/null 2>&1; then
+  if conda run -n "$ENV_NAME" python -V >/dev/null 2>&1; then
+    PY_CMD=(conda run -n "$ENV_NAME" python)
+  fi
+fi
 
-PYENV_PY="/opt/anaconda3/envs/xiaocaichat/bin/python"
-"$PYENV_PY" -m pip show pyinstaller >/dev/null 2>&1 || conda install -n xiaocaichat -c conda-forge -y pyinstaller
+"${PY_CMD[@]}" -m pip install pyobjc-core pyobjc-framework-Cocoa >/dev/null 2>&1 || true
+"${PY_CMD[@]}" -m pip show pyinstaller >/dev/null 2>&1 || "${PY_CMD[@]}" -m pip install pyinstaller
 
 ADD_DATA_ARGS=(--add-data "icons:icons")
-"$PYENV_PY" -m PyInstaller \
+"${PY_CMD[@]}" -m PyInstaller \
   --noconfirm \
   --windowed \
   --name "$APP_NAME" \

@@ -31,7 +31,14 @@ done
 
 iconutil -c icns "$ICONSET" -o "$BUILD_DIR/xiaocaichat.icns"
 
-conda run -n "$ENV_NAME" python -m pip install -r requirements.txt >/dev/null 2>&1 || true
+PY_CMD=(python)
+if command -v conda >/dev/null 2>&1; then
+  if conda run -n "$ENV_NAME" python -V >/dev/null 2>&1; then
+    PY_CMD=(conda run -n "$ENV_NAME" python)
+  fi
+fi
+
+"${PY_CMD[@]}" -m pip install -r requirements.txt >/dev/null 2>&1 || true
 
 # Build app
 ADD_DATA_ARGS=(--add-data "icons:icons" --add-data "themes:themes")
@@ -39,7 +46,7 @@ if [ -f client_config.json ]; then
   ADD_DATA_ARGS+=(--add-data "client_config.json:.")
 fi
 
-conda run -n "$ENV_NAME" python -m PyInstaller \
+"${PY_CMD[@]}" -m PyInstaller \
   --noconfirm \
   --windowed \
   --name "$APP_NAME" \
